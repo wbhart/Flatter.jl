@@ -478,3 +478,177 @@ end
         end
     end
 end
+
+# Testset for apply_Qt!, to add to test/test_householder.jl.
+#
+# Assumes `using Test` and `using Random` from runtests.jl. Everything from the
+# package is called qualified as `Flatter.<name>`, and no other imports are
+# needed: matrix multiplication and `permutedims` come from Base, and the
+# oracles below avoid `LinearAlgebra.I` and `LinearAlgebra.norm` so that this
+# file adds no dependency of its own.
+
+# Rebuild V explicitly from the packed factors: column j is zero above row j,
+# one at row j, and the stored tail below.
+function apply_qt_explicit_V(factors::AbstractMatrix{S}, k::Integer) where {S}
+    m = size(factors, 1)
+    V = zeros(S, m, k)
+    for j in 1:k
+        V[j, j] = one(S)
+        for i in (j + 1):m
+            V[i, j] = factors[i, j]
+        end
+    end
+    return V
+end
+
+function apply_qt_identity(::Type{S}, n::Integer) where {S}
+    M = zeros(S, n, n)
+    for i in 1:n
+        M[i, i] = one(S)
+    end
+    return M
+end
+
+# Q' = I - V*T'*V', built independently of the routine under test.
+function apply_qt_explicit_Qt(factors::AbstractMatrix{S},
+                              compact_T::AbstractMatrix{S},
+                              k::Integer) where {S}
+    m = size(factors, 1)
+    V = apply_qt_explicit_V(factors, k)
+    return apply_qt_identity(S, m) -
+           V * permutedims(compact_T[1:k, 1:k]) * permutedims(V)
+end
+
+apply_qt_maxabs(A) = isempty(A) ? zero(eltype(A)) : maximum(abs, A)
+
+@testset "apply_Qt!" begin
+
+    @testset "reproduces R, $m x $n" for (m, n) in ((8, 5), (40, 40), (64, 17), (5, 5))
+        rng = MersenneTwister(hash((m, n)))
+        A = randn(rng, m, n)
+        F, T = Flatter.householder_block(A)
+
+        C = copy(A)
+        Flatter.apply_Qt!(C, F, T)
+
+        k = min(m, n)
+        scale = max(1.0, apply_qt_maxabs(A))
+
+        # The upper trapezoid must match the R stored in the packed factors,
+        # and everything below the diagonal must have been annihilated.
+        for j in 1:n, i in 1:min(j, k)
+            @test abs(C[i, j] - F[i, j]) <= 1e-9 * scale
+        end
+        for j in 1:n, i in (min(j, k) + 1):m
+            @test abs(C[i, j]) <= 1e-9 * scale
+        end
+    end
+
+    @testset "matches the explicit Q', $m x $n" for (m, n) in ((9, 4), (48, 30), (33, 33))
+        rng = MersenneTwister(hash((m, n, :explicit)))
+        A = randn(rng, m, n)
+        F, T = Flatter.householder_block(A)
+        k = min(m, n)
+        Qt = apply_qt_explicit_Qt(F, T, k)
+
+        for n2 in (1, 3, n, 2n)
+            C = randn(rng, m, n2)
+            expected = Qt * C
+            got = Flatter.apply_Qt!(copy(C), F, T)
+            @test apply_qt_maxabs(got - expected) <=
+                  1e-9 * max(1.0, apply_qt_maxabs(expected))
+        end
+    end
+
+    @testset "partial application" begin
+        rng = MersenneTwister(0xA11)
+        m, n = 20, 12
+        A = randn(rng, m, n)
+        F, T = Flatter.householder_block(A)
+
+        for k in (0, 1, 5, n)
+            C = randn(rng, m, 7)
+            expected = k == 0 ? copy(C) : apply_qt_explicit_Qt(F, T, k) * C
+            got = Flatter.apply_Qt!(copy(C), F, T; reflectors = k)
+            @test apply_qt_maxabs(got - expected) <=
+                  1e-9 * max(1.0, apply_qt_maxabs(expected))
+        end
+    end
+
+    @testset "Q' is orthogonal" begin
+        rng = MersenneTwister(0x0B7)
+        m, n = 30, 18
+        A = randn(rng, m, n)
+        F, T = Flatter.householder_block(A)
+
+        identity_m = apply_qt_identity(Float64, m)
+        Qt = Flatter.apply_Qt!(copy(identity_m), F, T)
+
+        @test apply_qt_maxabs(Qt * permutedims(Qt) - identity_m) <= 1e-9
+
+        # Q'A = R, so applying Q back must recover A.
+        @test apply_qt_maxabs(permutedims(Qt) * (Qt * A) - A) <=
+              1e-9 * max(1.0, apply_qt_maxabs(A))
+    end
+
+    @testset "agrees with the unblocked factorization" begin
+        rng = MersenneTwister(0x11B)
+        m, n = 25, 14
+        A = randn(rng, m, n)
+        C = randn(rng, m, 6)
+
+        Fb, Tb = Flatter.householder_block(A)
+        Fu, Tu = Flatter.householder(A)
+
+        blocked = Flatter.apply_Qt!(copy(C), Fb, Tb)
+        unblocked = Flatter.apply_Qt!(copy(C), Fu, Tu)
+        @test apply_qt_maxabs(blocked - unblocked) <=
+              1e-9 * max(1.0, apply_qt_maxabs(unblocked))
+    end
+
+    @testset "strassen_cutoff does not change the result" begin
+        rng = MersenneTwister(0x57A)
+        m, n = 70, 40
+        A = randn(rng, m, n)
+        F, T = Flatter.householder_block(A)
+        C = randn(rng, m, 50)
+
+        reference = Flatter.apply_Qt!(copy(C), F, T; strassen_cutoff = 4096)
+        scale = max(1.0, apply_qt_maxabs(reference))
+        for cutoff in (2, 8, 32)
+            got = Flatter.apply_Qt!(copy(C), F, T; strassen_cutoff = cutoff)
+            @test apply_qt_maxabs(got - reference) <= 1e-8 * scale
+        end
+    end
+
+    @testset "BigFloat at fixed precision" begin
+        setprecision(BigFloat, 128) do
+            rng = MersenneTwister(0xB16)
+            m, n = 18, 11
+            A = BigFloat.(randn(rng, m, n))
+            F, T = Flatter.householder_block(A)
+            k = min(m, n)
+
+            C = BigFloat.(randn(rng, m, 5))
+            expected = apply_qt_explicit_Qt(F, T, k) * C
+            got = Flatter.apply_Qt!(copy(C), F, T)
+
+            tolerance = BigFloat(2)^(-100) * max(one(BigFloat), apply_qt_maxabs(A))
+            @test apply_qt_maxabs(got - expected) < tolerance
+
+            # The routine must not have widened the output. Under Julia's
+            # rebinding semantics this is the failure to watch for.
+            @test Flatter.uniform_precision(got) == 128
+        end
+    end
+
+    @testset "argument checking" begin
+        A = randn(MersenneTwister(1), 10, 6)
+        F, T = Flatter.householder_block(A)
+        @test_throws DimensionMismatch Flatter.apply_Qt!(randn(9, 3), F, T)
+        @test_throws DimensionMismatch Flatter.apply_Qt!(randn(10, 3), F, T;
+                                                         reflectors = 7)
+    end
+
+end
+

@@ -625,6 +625,160 @@ function _householder_block_apply_left!(
     return nothing
 end
 
+# This is the same five-step compact-WY application as
+# _householder_block_apply_left!, but targeting a matrix separate from the one
+# that stores the reflectors, so that Q' can be applied to an unrelated block.
+
+"""
+    apply_Qt!(C, factors, compact_T;
+        reflectors = min(size(factors)...),
+        strassen_cutoff = DEFAULT_STRASSEN_CUTOFF)
+
+Overwrite `C` with `transpose(Q) * C`, where
+
+    Q = I - V*T*transpose(V)
+
+is the orthogonal factor of the packed compact-WY factorization returned by
+[`householder`](@ref) or [`householder_block`](@ref).  `V` is read from
+`factors`: column `j` is zero above row `j`, one at row `j`, and `factors[i, j]`
+below.  Only the leading `reflectors` columns of `V` and the leading
+`reflectors`-by-`reflectors` block of `compact_T` are used, so a partial
+application is obtained by passing a smaller `reflectors`.
+
+`C` must have as many rows as `factors`.  Neither `factors` nor `compact_T` is
+modified.
+
+Since `transpose(Q) = I - V*transpose(T)*transpose(V)`, the application is
+
+    W <- transpose(V) * C
+    W <- transpose(T) * W
+    C <- C - V * W
+
+with the two `V` products split into their triangular top and dense bottom
+parts, the latter going through [`strassen!`](@ref) via the same blocked
+multiplication the QR recursion uses.
+
+    apply_Qt!(C, factors, compact_T, reflectors, work, multiply_work, strassen_cutoff)
+
+Workspace-controlled form.  `work` must be at least `reflectors`-by-`size(C, 2)`,
+and `multiply_work` must have order at least
+`min(reflectors, size(C, 1) - reflectors, size(C, 2))`.
+"""
+function apply_Qt!(
+    C::AbstractMatrix{S},
+    factors::AbstractMatrix{S},
+    compact_T::AbstractMatrix{S};
+    reflectors::Integer = min(size(factors)...),
+    strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF,
+) where {S<:AbstractFloat}
+    k = Int(reflectors)
+    m, n = size(C)
+
+    work = Matrix{S}(undef, k, n)
+    order = max(0, min(k, m - k, n))
+    multiply_work = _householder_block_multiply_workspace(
+        S, order, Int(strassen_cutoff),
+    )
+
+    return apply_Qt!(
+        C, factors, compact_T, k, work, multiply_work, Int(strassen_cutoff),
+    )
+end
+
+function apply_Qt!(
+    C::AbstractMatrix{S},
+    factors::AbstractMatrix{S},
+    compact_T::AbstractMatrix{S},
+    reflectors::Int,
+    work::AbstractMatrix{S},
+    multiply_work::_HouseholderBlockMultiplyWorkspace{S},
+    strassen_cutoff::Int,
+) where {S<:AbstractFloat}
+    Base.require_one_based_indexing(C, factors, compact_T, work)
+
+    m, n = size(C)
+    k = reflectors
+
+    size(factors, 1) == m || throw(DimensionMismatch(
+        "C has $m rows, but factors has $(size(factors, 1))",
+    ))
+    0 <= k <= min(size(factors)...) || throw(DimensionMismatch(
+        "cannot apply $k reflectors from a $(size(factors)) factorization",
+    ))
+    size(compact_T, 1) >= k || throw(DimensionMismatch("compact_T has too few rows"))
+    size(compact_T, 2) >= k || throw(DimensionMismatch("compact_T has too few columns"))
+
+    (iszero(k) || iszero(n)) && return C
+
+    size(work, 1) >= k || throw(DimensionMismatch("work has too few rows"))
+    size(work, 2) >= n || throw(DimensionMismatch("work has too few columns"))
+
+    W = view(work, 1:k, 1:n)
+
+    # W <- transpose(L) * C_top, where L is the unit lower triangular top block
+    # of V.  Its implicit unit diagonal supplies the leading term.
+    for j in 1:n
+        for i in 1:k
+            value = C[i, j]
+            for row in i + 1:k
+                value += factors[row, i] * C[row, j]
+            end
+            W[i, j] = value
+        end
+    end
+
+    V_bottom = view(factors, k + 1:m, 1:k)
+    C_bottom = view(C, k + 1:m, 1:n)
+
+    # W <- W + transpose(V_bottom) * C_bottom.
+    _householder_block_mul!(
+        W,
+        transpose(V_bottom),
+        C_bottom,
+        one(S),
+        one(S),
+        multiply_work,
+        strassen_cutoff,
+    )
+
+    # W <- transpose(T) * W.  transpose(T) is lower triangular, so descending
+    # rows makes the in-place multiplication safe: row i is written only after
+    # every row that still needs to read it has been consumed.
+    for j in 1:n
+        for i in k:-1:1
+            value = zero(S)
+            for row in 1:i
+                value += compact_T[row, i] * W[row, j]
+            end
+            W[i, j] = value
+        end
+    end
+
+    # C_bottom <- C_bottom - V_bottom * W.
+    _householder_block_mul!(
+        C_bottom,
+        V_bottom,
+        W,
+        -one(S),
+        one(S),
+        multiply_work,
+        strassen_cutoff,
+    )
+
+    # C_top <- C_top - L * W, again with L's unit diagonal implicit.
+    for j in 1:n
+        for i in k:-1:1
+            value = W[i, j]
+            for column in 1:i - 1
+                value += factors[i, column] * W[column, j]
+            end
+            C[i, j] -= value
+        end
+    end
+
+    return C
+end
+
 # Combine
 #
 #     Q_left = I - V_left*T_left*V_left'

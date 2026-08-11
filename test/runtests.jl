@@ -7,4 +7,5 @@ using Flatter
     include("test_schoenhage.jl")
     include("test_smsv.jl")
     include("test_size_reduction_triu.jl")
+    include("test_relative_size_reduction.jl")
 end

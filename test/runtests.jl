@@ -9,4 +9,5 @@ using Flatter
     include("test_size_reduction_triu.jl")
     include("test_relative_size_reduction.jl")
     include("test_fused_qr_size_reduction.jl")
+    include("test_goal.jl")
 end

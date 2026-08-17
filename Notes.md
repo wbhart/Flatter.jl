@@ -29,3 +29,16 @@
 * **`blocked` size reduction is not a reordering of the elementary one.** `diag_above` multiplies the *original* tile by `U(j,j)`, where the elementary sweep would use the already-reduced columns. Different valid reduced representative — agrees with `:zz` on only ~2/3 of inputs. Test the contract, not equality.
 
 * **Relative size reduction's precision requirement is set by the block magnitude ratio, not just conditioning.** Coordinates are known only to `max|B2| * 2^-p`, so reducing to the deadband needs `p > log2(max|B2| / min|R_jj|)` with margin. The `max|B2|` is the magnitude *after* reduction — only the component of `B2` in `B1`'s span can shrink, so a large orthogonal component sets a floor that no number of refinement passes can lower. Under-provisioning isn't an error: the convergence guard stops, `U` stays exact and unimodular, and only reduction quality suffers.
+
+* **`fused_qr_size_reduction.jl` ports only flatter's `Columnwise`.** `ColumnwiseDouble` (same algorithm on doubles, plus a global power-of-two exponent shift to stop R overflowing) is not ported — BigFloat's exponent range makes the shifting unnecessary, and the `Float64` path here throws rather than silently producing `Inf`. `LazyRefine` needs a driver supplying prereduced prefixes; `Iterated` and `SeysenRefine` are unreachable from flatter's own dispatcher.
+
+* **The fused stagnation guard diverges from flatter.** flatter compares multiplier *magnitudes* against an absolute slack of `prec/2`, which is dimensionally odd: for large multipliers the slack vanishes (so it means "stopped shrinking") and for small ones `mu_max - prec/2` goes negative so it always fires. We compare exponents instead, matching `relative_size_reduction.jl`. Verified: ≤2 passes per column on random, wide-profile and scrambled bases.
+
+* **The fused three-tier reduction test compares in `S`, not `double`.** flatter converts both operands out of MPFR and compares the quotient in `double` to save a division. We compare in the working float type. Differs only for entries within a double's rounding error of the threshold, where either answer is fine — a spurious reduction is a valid transvection, a missed one is caught next pass.
+
+* **Fused QR returns `tau`, not compact-WY `T`.** Reflectors are generated one at a time, so `T` doesn't exist naturally; use `compact_wy_from_reflectors` to convert before handing the factorization to `apply_Qt!` or the relative size reduction kernels. Note flatter zeroes `tau[n-1]` at the end (its `Columnwise` discards Q anyway); we keep it, so the returned factorization is genuine and `Q'B = R` is testable.
+
+* **Fused QR returns R packed, subdiagonal not cleared.** Matches `householder_block`'s convention: upper trapezoid is R, below-diagonal column `j` holds `v_j`'s tail. flatter clears the subdiagonal because its `Columnwise` asserts `tau` empty. Use `triu(R)` if you want R alone.
+
+* **`U` from fused QR is unimodular but not triangular.** Columns are processed left to right, but each is reduced against *all* its predecessors, so `U` is unit upper triangular only when no reduction crosses a column boundary. Test `abs(det(U)) == 1` (Bareiss), not the triangular structure.
+

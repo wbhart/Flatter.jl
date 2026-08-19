@@ -59,3 +59,25 @@
 * **`_goal_shape(1) == 0`**, so a one-dimensional goal has no budget to scale and `from_slope` would divide by zero. Guarded — dimension-one goals get `quality = 0` and are accepted unconditionally by `goal_check` anyway.
 
 * **The heuristic `goal_check` has three conditions and all three do work.** Total drop, half-mean separation, and middle-span drop. Verified: a profile flat in both halves with a step between them at 95% of the budget is rejected despite its total drop fitting; and the middle-span condition alone rejects profiles the other two accept (696 of 200k random cases). Don't simplify it to the drop condition — that's the *proved* goal's test, and it would let the recursion settle for a basis still improvable across the half boundary.
+
+* **`recursive_reduction.jl` ports `RecursiveGeneric` with `Proved3`'s hardcoded window schedule**, not the `SublatticeSplit` tree. `Proved2`/`Proved3` reference no split object, so this is the shortest route to a working end-to-end reducer. Swapping in the split tree later changes `_reduction_window` and nothing else in that file.                                                                                                                                                            
+
+* **Compression acts on the R factor, never on the basis product.** `B_next = B * U_window` is *not* triangular — the window transform mixes columns whose support reaches below their own row — so it must be re-factored by the fused QR first, and the resulting R is what gets compressed and rounded back to the integer working basis. Compressing `B_next` directly produces a singular basis within a couple of iterations.
+
+* **`collect_U` pairing is off-by-one by design.** The compression stack holds one more entry than the transform stack, because the initial compression happens before the first iteration. The last compression is discarded, then transform *k* pairs with compression *k−1* — the scaling in force when that transform was computed. Getting this wrong throws inside `conjugate_transform`'s block-structure check rather than silently corrupting the result, which is worth keeping.
+
+* **`compression_shifts`' truncation depends linearly on the precision argument**, and the precision we want comes from the spread, which isn't known until after the call. Calling with `precision = 0` recovers the constant, so one call suffices: `truncation = offset - lll_precision(spread, n)`.
+
+* **Compression only fires on profiles that jump *upward*.** The gap test needs the right block higher than the left, which never happens on a descending profile — so on a normal lattice profile the shifts are all zero and only the uniform truncation applies. That's still the main win (it bounds entry sizes to the working precision); the per-block shifts matter on irregular intermediate profiles.
+
+* **Compression cannot vanish a diagonal entry**, given the precision policy: the smallest column retains about `spread + 30 + 2n` bits, since precision is `2*spread + 30 + 2n` and the compressed profile spans `spread`. If a diagonal ever does hit zero, suspect the precision policy, not the shifts.
+
+* **Input is upper triangular; output is a general basis.** The transform is unimodular but not triangular, so `B_out = B_in * U` has a meaningless diagonal that may contain zeros — reading it as a profile gives `-Inf`. The profile is in `info.profile`, from the R factor. flatter is the same: `fini_solver` leaves `M` general and reports the profile separately. Re-triangularise (fused QR, round R to integers) before feeding a result back in.
+
+* **The exact invariants hold unconditionally.** `B_out == B_in * U` and `|det U| == 1` are true regardless of working precision, of whether the goal was met, and of the iteration cap. Only *quality* depends on those. When something looks wrong, check the exact invariants first: if they hold, it's a precision or goal problem, not an algorithmic one.
+
+* **flatter's reduction loop has no iteration cap** (`for(iterations=0;;iterations++)`) — it relies on the goal being reachable. We add `max_iterations` so an unreachable goal terminates. Hitting it is not an error; the basis is still valid, just less reduced, and `info.goal_met` reports which happened.
+
+* **The two-column base case splits between Lagrange and Schoenhage at `schoenhage_threshold` (512 bits).** Both give a Gauss-reduced basis, so the crossover is a pure cost trade: Lagrange is quadratic in the bit size, Schoenhage quasi-linear, but Schoenhage pays for forming the Gram matrix and entering its recursion. flatter splits the same way at `prec < 1400`. Neither involves a precision policy — Lagrange works on exact integer squared lengths and inner products, and `schoenhage` on the exact integer Gram.
+
+* **`schoenhage` takes a Gram matrix, not a basis.** It returns `R == transpose(U) * G * U`; the driver forms `G = Bᵀ B` exactly and applies the returned `U` to the columns. Its reduction condition (`R[1,1] <= R[2,2]`, `2|R[1,2]| <= R[1,1]`) is exactly Gauss-reduced, i.e. what Lagrange produces — which is what makes the two cross-checkable.

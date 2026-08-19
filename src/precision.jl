@@ -41,6 +41,39 @@
 # 5. None of this applies to the Float64 kernels.
 
 """
+    with_precision(f, bits)
+
+Run `f()` with the `BigFloat` default precision set to `bits`, restoring the
+previous value afterwards, including on exception.
+
+Use this rather than `setprecision(BigFloat, bits) do ... end` anywhere
+performance matters. The block form installs a `ScopedValue`, and every
+subsequent `BigFloat` allocation then resolves the current precision through a
+`PersistentDict` lookup. Profiling the reduction driver found that lookup
+accounting for **60-64% of total runtime** — more than every matrix product,
+factorisation and compression combined — because the inner loops of the fused
+QR allocate temporaries constantly.
+
+Setting the default directly and restoring it in a `finally` gives identical
+semantics for single-threaded code at a fraction of the cost.
+
+!!! warning "Not task-safe"
+    Unlike the block form, this sets a global default rather than a
+    task-local one. Two tasks running this concurrently at different precisions
+    would interfere. This package is single-threaded by design; if that ever
+    changes, revisit every call site.
+"""
+function with_precision(f, bits::Integer)
+    previous = precision(BigFloat)
+    setprecision(BigFloat, Int(bits))
+    try
+        return f()
+    finally
+        setprecision(BigFloat, previous)
+    end
+end
+
+"""
     uniform_precision(A) -> Union{Int, Nothing}
 
 The common precision of every entry of `A`, or `nothing` if the entries
@@ -157,4 +190,3 @@ The refinement loops compare multiplier magnitudes by exponent, and a multiplier
 of exactly zero is an ordinary outcome there, not an error.
 """
 safe_exponent(x::AbstractFloat) = iszero(x) ? typemin(Int) : exponent(x)
-

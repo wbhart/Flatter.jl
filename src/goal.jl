@@ -333,41 +333,69 @@ the two halves would pass conditions 1 and 2 while still being improvable by
 further reduction across that gap.
 """
 function goal_check(goal::ReductionGoal, prof::AbstractVector{<:Real})
+    return goal_report(goal, prof).met
+end
+
+"""
+    goal_report(goal, prof) -> NamedTuple
+
+The same test as [`goal_check`](@ref), but reporting every quantity it computes
+and which of the conditions passed.
+
+For diagnosing a reduction that will not terminate: when `goal_check` keeps
+returning false it is rarely obvious which of the three heuristic conditions is
+refusing, and the drop condition failing means something quite different from
+the middle-span condition failing.
+
+Fields: `met`, and for the heuristic case `drop`, `max_drop`, `drop_ok`,
+`mean_gap`, `mu_sep`, `separation_ok`, `mid_drop`, `mid_budget`, `middle_ok`.
+"""
+function goal_report(goal::ReductionGoal, prof::AbstractVector{<:Real})
     goal.n != 0 || throw(ArgumentError("cannot check an empty goal"))
     length(prof) == goal.n || throw(DimensionMismatch(
         "goal has dimension $(goal.n) but the profile has $(length(prof)) entries"))
 
-    goal.n == 1 && return true
-
     n = goal.n
     max_drop = goal_max_drop(goal)
+    drop = profile_drop(prof)
 
-    if goal.proved
-        return profile_drop(prof) < max_drop
+    if n == 1
+        return (met = true, drop = drop, max_drop = max_drop, drop_ok = true,
+                mean_gap = 0.0, mu_sep = Inf, separation_ok = true,
+                mid_drop = 0.0, mid_budget = Inf, middle_ok = true)
     end
 
-    gamma = goal.quality * Float64(n)^log2(3.0)      # quality * 3^log2(n)
+    if goal.proved
+        return (met = drop < max_drop, drop = drop, max_drop = max_drop,
+                drop_ok = drop < max_drop, mean_gap = 0.0, mu_sep = Inf,
+                separation_ok = true, mid_drop = 0.0, mid_budget = Inf,
+                middle_ok = true)
+    end
+
+    gamma = goal.quality * Float64(n)^log2(3.0)
     mu_sep = (max_drop - gamma) / 2 + gamma
 
-    # The halves. Three is split as 2 + 1 rather than 1 + 2.
     n_L = n == 3 ? 2 : div(n, 2)
     n_R = n - n_L
 
     l_drop = goal.best_slope * n_L + goal.quality * _goal_shape(n_L)
     r_drop = goal.best_slope * n_R + goal.quality * _goal_shape(n_R)
 
-    # The middle span: from the midpoint of the left half to the midpoint of the
-    # right half, so it straddles the boundary the halves were split at.
     n1 = n_L == 3 ? 2 : div(n_L, 2)
     n3 = n_R == 3 ? 2 : div(n_R, 2)
     mid_drop = profile_drop(view(prof, (n1 + 1):(n_L + n3)))
+    mid_budget = l_drop + (max_drop - l_drop - r_drop)
 
     mu_L = sum(Float64, view(prof, 1:n_L)) / n_L
     mu_R = sum(Float64, view(prof, (n_L + 1):n)) / n_R
+    mean_gap = mu_L - mu_R
 
-    # The third condition is written as flatter writes it; it reduces to
-    # mid_drop <= max_drop - r_drop, but the original form shows the intent.
-    return profile_drop(prof) < max_drop &&
-           mu_L - mu_R < mu_sep &&
-           mid_drop <= l_drop + (max_drop - l_drop - r_drop)
+    drop_ok = drop < max_drop
+    separation_ok = mean_gap < mu_sep
+    middle_ok = mid_drop <= mid_budget
+
+    return (met = drop_ok && separation_ok && middle_ok,
+            drop = drop, max_drop = max_drop, drop_ok = drop_ok,
+            mean_gap = mean_gap, mu_sep = mu_sep, separation_ok = separation_ok,
+            mid_drop = mid_drop, mid_budget = mid_budget, middle_ok = middle_ok)
 end

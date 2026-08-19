@@ -374,7 +374,7 @@ function fused_qr_size_reduction!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         # BigFloat arithmetic takes its result precision from the global
         # default, not from the operands, so the whole computation has to run
         # inside the block, not just the allocations. See Notes.md.
-        return setprecision(BigFloat, bits) do
+        return with_precision(bits) do
             R = Matrix{BigFloat}(undef, m, n)
             tau = Vector{BigFloat}(undef, n)
             _fused_columnwise!(B, U, R, tau;

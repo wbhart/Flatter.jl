@@ -257,6 +257,52 @@ end
         end
     end
 
+    # The driver never materialises the embedded window transform; it uses
+    # block-aware products instead. These must agree with the full products
+    # exactly, or every transform the driver accumulates is wrong.
+    @testset "block-aware window products" begin
+        @testset "n = $n, window = $wstart:$wstop" for (n, wstart, wstop) in
+                ((6, 2, 4), (8, 1, 4), (8, 5, 8), (12, 4, 9), (5, 3, 3))
+            rng = MersenneTwister(hash((n, wstart, wstop, :block)))
+            window = wstart:wstop
+            w = length(window)
+
+            A = BigInt[rand(rng, -50:50) for _ in 1:n, _ in 1:n]
+            W = BigInt[rand(rng, -50:50) for _ in 1:w, _ in 1:w]
+
+            embedded = zeros(BigInt, n, n)
+            for i in 1:n
+                embedded[i, i] = big(1)
+            end
+            embedded[window, window] = W
+
+            @test Flatter._apply_window_right(A, W, window) == A * embedded
+            @test Flatter._apply_window_left(W, A, window) == embedded * A
+        end
+
+        @testset "a full-width window is a plain product" begin
+            rng = MersenneTwister(0xF011)
+            n = 6
+            A = BigInt[rand(rng, -30:30) for _ in 1:n, _ in 1:n]
+            W = BigInt[rand(rng, -30:30) for _ in 1:n, _ in 1:n]
+            @test Flatter._apply_window_right(A, W, 1:n) == A * W
+            @test Flatter._apply_window_left(W, A, 1:n) == W * A
+        end
+    end
+
+    # The product tree reorders the associativity of a matrix product. Matrix
+    # multiplication is associative so this is safe, but the ORDER of factors
+    # must be preserved, and a pairing bug would silently transpose two of them.
+    @testset "product tree preserves factor order" begin
+        rng = MersenneTwister(0x9204)
+        for count in 1:9, n in (3, 5)
+            factors = [BigInt[rand(rng, -9:9) for _ in 1:n, _ in 1:n] for _ in 1:count]
+            expected = reduce(*, factors)
+            @test Flatter._product_tree(copy(factors)) == expected
+        end
+        @test_throws ArgumentError Flatter._product_tree(Matrix{BigInt}[])
+    end
+
     @testset "exact invariants" begin
         @testset "n = $n, spread = $spread" for n in (3, 4, 5, 6, 8), spread in (20, 60)
             rng = MersenneTwister(hash((n, spread, :exact)))

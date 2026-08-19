@@ -1,0 +1,90 @@
+================================================================================
+JULIA BigFloat PRECISION SEMANTICS (not a divergence -- a hazard)
+================================================================================
+
+Summary
+-------
+Julia's BigFloat is MPFR, but Julia does not use MPFR's destination-driven
+rounding rule.  A `Matrix{BigFloat}` has no single precision as a matter of type
+or structure -- only as a matter of discipline.  Every computation on BigFloat
+data must be wrapped in `setprecision(BigFloat, p) do ... end`, around the whole
+computation and not merely around the allocations.
+
+Measured behaviour (Julia 1.12.6)
+---------------------------------
+    x, y at 64 bits; global default set to 256
+
+    precision(x + y)                  256      <- the default, not the operands
+    precision(x * y)                  256
+    precision(x / y)                  256
+    precision(sqrt(x))                256
+    precision(ldexp(x, 5))            256
+    precision(x * BigInt(3))          256
+    precision(-x)                     256
+    precision(x + y) inside 64        64       <- wrapping does work
+
+    A[1,1] built at 64 bits            64
+    A[1,1] = (a 256-bit product)      256      <- setindex! rebinds
+    A[2,1] (untouched sibling)         64      <- so the matrix is now mixed
+
+    precision((A*A)[1,1])             256
+    precision(mul!(C, A, A)[1,1])     256      <- C is widened, not preserved
+
+Summary: arith=default, setindex=rebind, mul!=widened.
+
+What follows from this
+----------------------
+  * Wrapping allocations is not sufficient.  `Matrix{BigFloat}(undef, ...)` and
+    `zeros(BigFloat, ...)` pin nothing: an array of BigFloat is an array of
+    references, and each entry takes its precision from whenever it was assigned.
+    It is the arithmetic that reads the global default, so the block must span
+    the arithmetic.
+
+  * `precision(A[1,1])` does not describe the matrix.  Use `uniform_precision`
+    from `precision.jl`, which checks every entry, and `assert_precision` at the
+    entry of routines that need uniformity.  This is the Julia counterpart of
+    flatter's
+
+        assert(R.prec() == r_col.prec() && R.prec() == tau.prec());
+
+  * Any routine that writes into a BigFloat matrix will widen it if called
+    outside a block.  That includes `apply_Qt!`, every kernel here, and
+    `householder`/`householder_block`, whose internal temporaries are filled by
+    arithmetic.  `smsv.jl` already observes this in `float_matrix` and
+    `profile`; the convention is established, not new.
+
+  * Returning a BigFloat matrix out of a block is safe.  Precision travels with
+    the object, so entries keep their bits.  What is unsafe is doing further
+    arithmetic on that matrix outside a matching block.  Across a recursion
+    boundary, convert explicitly with `at_precision` rather than assuming the
+    incoming matrix matches the level's working precision.
+
+  * Accuracy is not the issue.  Probe item 4 confirmed that a widened value
+    retains exactly the bits it had -- a 64-bit value widened to 256 bits agrees
+    with the true value to about 2^-67, as its 64 bits warrant.  The extra bits
+    are noise, not corruption.  The costs are (a) MPFR arithmetic scaling with
+    precision, so a silently widened working set is slower without being better,
+    and (b) the refinement loops' "precision exhausted" guard being calibrated
+    against a precision that is no longer the real one.
+
+  * Use `with_precision(f, bits)` from precision.jl, NOT the `do`-block form,
+    anywhere performance matters.  The block form installs a ScopedValue, and
+    every subsequent BigFloat allocation then resolves the precision through a
+    PersistentDict lookup.  Profiling the reduction driver found that lookup at
+    60-64% of total runtime -- more than every matrix product, factorisation and
+    compression combined -- because the fused QR's inner loops allocate BigFloat
+    temporaries constantly.  `with_precision` sets the default directly and
+    restores it in a `finally`, giving identical semantics for single-threaded
+    code at a fraction of the cost.  It is NOT task-safe; revisit every call
+    site if this package ever threads.  The bare `setprecision(BigFloat, p)`
+    with no restoration remains wrong -- it leaks the precision to the caller.
+
+Relation to flatter
+-------------------
+flatter sets precision per object at construction (`mpfr_init2`, via
+`Matrix(ElementType::MPFR, rows, cols, prec)` and the WorkspaceBuffer) and never
+changes the precision of a live variable.  Precision varies across the recursion
+because the driver chooses it per level, never within a call.  The scoped-block
+convention here reproduces that: one precision, fixed for the duration of a
+call, uniform across all MPFR operands.  The difference is only in the mechanism
+-- MPFR carries it on the destination, Julia on the dynamic scope.

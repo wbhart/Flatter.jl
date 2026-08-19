@@ -451,7 +451,7 @@ function relative_size_reduction!(B1::AbstractMatrix{T}, B2::AbstractMatrix{T},
     elseif chosen === :generic
         bits = precision === nothing ? relative_size_reduction_precision(B1) :
                                        Int(precision)
-        return setprecision(BigFloat, bits) do
+        return with_precision(bits) do
             reference = bigfloat_matrix(B1, bits)
             packed, wy = householder_block(reference; strassen_cutoff = Int(strassen_cutoff))
             R2 = coordinates ? Matrix{BigFloat}(undef, m, n2) : nothing
@@ -477,7 +477,7 @@ function _run_orthogonal!(B1, B2, U, factors::AbstractMatrix{BigFloat},
         "to outside a setprecision block"))
     assert_precision(bits, compact_T; names = ("compact_T",))
 
-    return setprecision(BigFloat, bits) do
+    return with_precision(bits) do
         _relative_orthogonal!(B1, B2, U, factors, compact_T, R2;
                               deadband = deadband,
                               strassen_cutoff = strassen_cutoff,

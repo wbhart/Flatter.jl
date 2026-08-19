@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "68274a3b5919131837bc000761f9705e47259cef"
+project_hash = "83e2dfa625b788b8f787a42e2bede86b052db37f"
 
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
@@ -24,7 +24,7 @@ uuid = "03c0f9b8-8f98-4d15-83bb-8707f2d8d9c2"
 version = "0.1.0"
 
 [[deps.Flatter]]
-deps = ["FPLLL", "LinearAlgebra", "Test"]
+deps = ["FPLLL", "LinearAlgebra", "Random", "Test"]
 path = "."
 uuid = "8397d03e-6623-47ed-877e-29371302c0d4"
 version = "0.1.0"
@@ -62,6 +62,11 @@ deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
 uuid = "4536629a-c528-5b80-bd46-f80d51c5b363"
 version = "0.3.29+0"
 
+[[deps.Printf]]
+deps = ["Unicode"]
+uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+version = "1.11.0"
+
 [[deps.Random]]
 deps = ["SHA"]
 uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
@@ -82,6 +87,10 @@ version = "1.11.0"
 [[deps.Test]]
 deps = ["InteractiveUtils", "Logging", "Random", "Serialization"]
 uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+version = "1.11.0"
+
+[[deps.Unicode]]
+uuid = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
 version = "1.11.0"
 
 [[deps.libblastrampoline_jll]]

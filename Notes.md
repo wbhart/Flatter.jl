@@ -10,16 +10,6 @@
 
 * **The second convergence guard is load-bearing.** `max_mu >= prev_max` (precision exhausted) is what stops a badly conditioned input at 53 bits looping forever. It is not redundant with the unit-magnitude test.
 
-* **Julia BigFloat arithmetic uses the global default precision, not the operands'.** Measured on 1.12.6: `arith=default`, `setindex=rebind`, `mul!=widened`. So a `Matrix{BigFloat}` has no precision as a matter of type — only of discipline.
-
-* **Wrap whole computations in `setprecision(BigFloat, p) do ... end`, not just allocations.** `Matrix{BigFloat}(undef, ...)` pins nothing; it's the arithmetic that reads the default. Applies to `householder_block`, `apply_Qt!` and every BigFloat kernel — none of them establish their own block. Use the `do` form; the bare call doesn't restore.
-
-* **`precision(A[1,1])` does not describe the matrix.** Entries can differ after a stray write. Use `uniform_precision` / `assert_precision` (in `precision.jl`) — the counterpart of flatter's `assert(R.prec() == r_col.prec() == tau.prec())`.
-
-* **Widening costs speed, not accuracy.** Extra bits are noise on an already-correct value. But MPFR cost scales with precision, and the "precision exhausted" guard is calibrated against the precision you think you're at.
-
-* **Convert BigFloat matrices explicitly across recursion boundaries** with `at_precision`. Returning one from a `setprecision` block is safe (precision travels with the object); doing further arithmetic on it outside a matching block is not.
-
 * **`Float64(::BigInt)` overflows to `Inf` on lattice-sized entries.** Use `float64_matrix`, which pulls out a common power-of-two scale. Common, not per-column — per-column would distort the ratios the multipliers depend on.
 
 * **Size-reduction bound isn't 1/2 on the orthogonal kernels.** flatter uses a 0.51 deadband (stops entries oscillating on rounding noise) and terminates on a unit-magnitude test, so expect ~0.51 plus float error. Only `Triangular` achieves a strict 1/2. The exactly testable invariant on every path is `B2_new == B2_old + B1*U` over `BigInt`.
@@ -60,7 +50,7 @@
 
 * **The heuristic `goal_check` has three conditions and all three do work.** Total drop, half-mean separation, and middle-span drop. Verified: a profile flat in both halves with a step between them at 95% of the budget is rejected despite its total drop fitting; and the middle-span condition alone rejects profiles the other two accept (696 of 200k random cases). Don't simplify it to the drop condition — that's the *proved* goal's test, and it would let the recursion settle for a basis still improvable across the half boundary.
 
-* **`recursive_reduction.jl` ports `RecursiveGeneric` with `Proved3`'s hardcoded window schedule**, not the `SublatticeSplit` tree. `Proved2`/`Proved3` reference no split object, so this is the shortest route to a working end-to-end reducer. Swapping in the split tree later changes `_reduction_window` and nothing else in that file.                                                                                                                                                            
+* **`recursive_reduction.jl` ports `RecursiveGeneric` with `Proved3`'s hardcoded window schedule**, not the `SublatticeSplit` tree. `Proved2`/`Proved3` reference no split object, so this is the shortest route to a working end-to-end reducer. Swapping in the split tree later changes `_reduction_window` and nothing else in that file.
 
 * **Compression acts on the R factor, never on the basis product.** `B_next = B * U_window` is *not* triangular — the window transform mixes columns whose support reaches below their own row — so it must be re-factored by the fused QR first, and the resulting R is what gets compressed and rounded back to the integer working basis. Compressing `B_next` directly produces a singular basis within a couple of iterations.
 
@@ -76,8 +66,17 @@
 
 * **The exact invariants hold unconditionally.** `B_out == B_in * U` and `|det U| == 1` are true regardless of working precision, of whether the goal was met, and of the iteration cap. Only *quality* depends on those. When something looks wrong, check the exact invariants first: if they hold, it's a precision or goal problem, not an algorithmic one.
 
+* **The stagnation exit is ours; flatter has it commented out.** `Proved3::is_reduced` contains `if (iterations % 3 == 0 && !lattice_changed) { //return true; }` — the test is written but disabled, and nothing else consumes `lattice_changed`. Without it the loop grinds indefinitely at a goal it cannot quite reach: benchmarking found a q-ary dim-64 case that spent 120 iterations missing a drop target of 3.66 by 0.05 bits, while finding a *shorter* vector than fplll. We enable it: if a full cycle of windows leaves the true-scale profile unmoved, stop. `info.stopped` reports `:goal`, `:stagnated`, `:cap` or `:base_case`.
+
+* **Never materialise the embedded window transform.** It is the identity outside one `w x w` block, so a general product costs `O(n^3)` to compute something touching `O(n*w^2)` entries — four times the necessary work at half width. `_apply_window_right`/`_apply_window_left` do the block product and copy the rest. Benchmarking showed these products at 21–84% of runtime before the change.
+
+* **Benchmark findings (dims 48–96, before the block-product fix).** `finalise` 45–47% on several families — `collect_U` plus applying the transform to the original uncompressed basis, all at full scale — `matmul` 21–84%, `fusedQR` only 1–29%. Tiling the fused QR, the obvious-looking optimisation and what flatter's `Heuristic3` does, would have targeted the *smallest* of the three. Measure before optimising here.
+
+* **Compare profiles at true scale, not compressed.** Compression shifts the profile every iteration, so consecutive compressed profiles are not comparable; the stagnation test uses `profile .+ offsets`.
+
 * **flatter's reduction loop has no iteration cap** (`for(iterations=0;;iterations++)`) — it relies on the goal being reachable. We add `max_iterations` so an unreachable goal terminates. Hitting it is not an error; the basis is still valid, just less reduced, and `info.goal_met` reports which happened.
 
 * **The two-column base case splits between Lagrange and Schoenhage at `schoenhage_threshold` (512 bits).** Both give a Gauss-reduced basis, so the crossover is a pure cost trade: Lagrange is quadratic in the bit size, Schoenhage quasi-linear, but Schoenhage pays for forming the Gram matrix and entering its recursion. flatter splits the same way at `prec < 1400`. Neither involves a precision policy — Lagrange works on exact integer squared lengths and inner products, and `schoenhage` on the exact integer Gram.
 
 * **`schoenhage` takes a Gram matrix, not a basis.** It returns `R == transpose(U) * G * U`; the driver forms `G = Bᵀ B` exactly and applies the returned `U` to the columns. Its reduction condition (`R[1,1] <= R[2,2]`, `2|R[1,2]| <= R[1,1]`) is exactly Gauss-reduced, i.e. what Lagrange produces — which is what makes the two cross-checkable.
+

@@ -303,6 +303,60 @@ end
         @test_throws ArgumentError Flatter._product_tree(Matrix{BigInt}[])
     end
 
+    # The transform stack folds factors together as they arrive rather than
+    # collecting them all. It must produce exactly the ordered product, and it
+    # must leave only O(log k) partial products live -- that bound is the whole
+    # point, so it is asserted rather than assumed.
+    @testset "transform stack" begin
+        @testset "reproduces the ordered product, k = $count" for count in 1:17
+            rng = MersenneTwister(hash((count, :stack)))
+            n = 4
+            factors = [BigInt[rand(rng, -9:9) for _ in 1:n, _ in 1:n] for _ in 1:count]
+
+            stack = Flatter._TransformStack{BigInt}()
+            for factor in factors
+                Flatter._push_transform!(stack, factor)
+            end
+
+            @test Flatter._drain_transform(stack, n) == reduce(*, factors)
+        end
+
+        @testset "holds O(log k) partial products" begin
+            n = 3
+            for pushes in (1, 2, 7, 8, 31, 32, 100, 1000)
+                stack = Flatter._TransformStack{BigInt}()
+                for _ in 1:pushes
+                    Flatter._push_transform!(stack,
+                        BigInt[i == j ? 1 : 0 for i in 1:n, j in 1:n])
+                end
+                # A binary counter over `pushes` items leaves exactly as many
+                # partial products as `pushes` has set bits.
+                @test length(stack.factors) == sum(digits(pushes; base = 2))
+                @test length(stack.factors) <= floor(Int, log2(pushes)) + 1
+            end
+        end
+
+        @testset "an empty stack drains to the identity" begin
+            result = Flatter._drain_transform(Flatter._TransformStack{BigInt}(), 4)
+            @test result == BigInt[i == j ? 1 : 0 for i in 1:4, j in 1:4]
+        end
+
+        @testset "lifting matches conjugate_transform" begin
+            rng = MersenneTwister(0x11F7)
+            n = 5
+            shifts = [0, 0, 3, 3, 7]
+            U = zeros(BigInt, n, n)
+            for j in 1:n, i in 1:j
+                U[i, j] = rand(rng, -6:6)
+                shifts[i] > shifts[j] && (U[i, j] = 0)
+            end
+            for i in 1:n
+                U[i, i] = 1
+            end
+            @test Flatter._lift_transform(U, shifts) == conjugate_transform(U, shifts)
+        end
+    end
+
     @testset "exact invariants" begin
         @testset "n = $n, spread = $spread" for n in (3, 4, 5, 6, 8), spread in (20, 60)
             rng = MersenneTwister(hash((n, spread, :exact)))

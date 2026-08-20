@@ -395,43 +395,58 @@ function _product_tree(factors::Vector{Matrix{T}}) where {T}
     return current[1]
 end
 
-# flatter's `collect_U`. Each iteration's transform was computed against a
-# compressed basis, so before it can be composed with the others it has to be
+# flatter's `collect_U`. Each iteration's transform is computed against a
+# COMPRESSED basis, so before it can be composed with the others it has to be
 # conjugated by the scaling that was in force at the time -- the D^-1 U D of
 # Saruchi-Morel-Stehle-Villard, which `conjugate_transform` performs.
 #
-# The pairing matters and is easy to get wrong: `compressions` holds one entry
-# more than `transforms`, because the initial compression happens before the
-# first iteration. The last compression is discarded (nothing was computed
-# against it yet), and thereafter transform k pairs with compression k-1, the
-# scaling that produced the basis it was computed against.
-function _collect_transform(transforms::Vector{Matrix{T}},
-                            compressions::Vector{Vector{Int}},
-                            n::Int) where {T<:Integer}
-    length(compressions) == length(transforms) + 1 || throw(ErrorException(
-        "compression and transform stacks are out of step: " *
-        "$(length(compressions)) vs $(length(transforms))"))
+# The scaling a transform needs is the one already in force when that transform
+# is produced, so both steps happen inside the reduction loop and neither the
+# raw transforms nor the compression history is ever retained. What is kept is a
+# small stack of partial products, combined in the manner of a binary counter:
+# pushing a factor merges it with the top of the stack for as long as the top
+# represents the same number of original factors. That leaves O(log k) live
+# matrices instead of k, which matters because these are the widest matrices in
+# the run -- conjugation shifts their entries up by the compression amounts.
+#
+# The merge order is the natural one, so the product stays correctly ordered and
+# balanced: it performs exactly the pairings a product tree over all k factors
+# would, without needing all k at once.
 
-    pop!(compressions)
+mutable struct _TransformStack{T}
+    factors::Vector{Matrix{T}}   # partial products, oldest first
+    widths::Vector{Int}          # how many original factors each represents
+end
 
-    if isempty(transforms)
-        identity_matrix = Matrix{T}(undef, n, n)
-        _set_identity!(identity_matrix)
-        return identity_matrix
+_TransformStack{T}() where {T} = _TransformStack{T}(Matrix{T}[], Int[])
+
+function _push_transform!(stack::_TransformStack{T}, factor::Matrix{T}) where {T}
+    width = 1
+    while !isempty(stack.widths) && stack.widths[end] == width
+        factor = _reduction_mul(pop!(stack.factors), factor)
+        pop!(stack.widths)
+        width *= 2
     end
+    push!(stack.factors, factor)
+    push!(stack.widths, width)
+    return stack
+end
 
-    # Lift each transform out of the scaling it was computed under. Conjugation
-    # shifts entries up by the compression amounts, so these are the widest
-    # matrices in the whole run.
-    lifted = Vector{Matrix{T}}(undef, length(transforms))
-    for index in length(transforms):-1:1
-        conjugated = conjugate_transform(pop!(transforms), pop!(compressions))
-        # `conjugate_transform` already returns integer entries; converting
-        # again would copy every entry for nothing.
-        lifted[index] = conjugated isa Matrix{T} ? conjugated : T.(conjugated)
+"Conjugate a window transform by the scaling it was computed under."
+function _lift_transform(U::AbstractMatrix{T}, shifts::Vector{Int}) where {T<:Integer}
+    conjugated = conjugate_transform(U, shifts)
+    # `conjugate_transform` already returns integer entries; converting again
+    # would copy every entry for nothing.
+    return conjugated isa Matrix{T} ? conjugated : T.(conjugated)
+end
+
+function _drain_transform(stack::_TransformStack{T}, n::Int) where {T}
+    if isempty(stack.factors)
+        result = Matrix{T}(undef, n, n)
+        _set_identity!(result)
+        return result
     end
-
-    return _product_tree(lifted)
+    return _product_tree(stack.factors)
 end
 
 # One place to choose the matrix product used throughout the driver. The
@@ -629,13 +644,12 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     profile = [_log2_abs(B[i, i]) for i in 1:n]
     offsets = zeros(Float64, n)
 
-    transforms = Matrix{T}[]
-    compressions = Vector{Int}[]
+    stack = _TransformStack{T}()
 
     compression_started = _tick()
     working, applied, precision = _compress_integer(B, profile, offsets, n, aggressive)
     telemetry === nothing || (telemetry.time_compress += _tock(compression_started))
-    push!(compressions, applied)
+    compression = applied
 
     # --- the reduction loop -------------------------------------------------
     iteration = 0
@@ -713,9 +727,15 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         end
 
         multiply_started = _tick()
-        push!(transforms, sub_transform === nothing ? size_reduction :
-                          _apply_window_left(sub_transform, size_reduction, window))
+        window_transform = sub_transform === nothing ? size_reduction :
+                           _apply_window_left(sub_transform, size_reduction, window)
         telemetry === nothing || (telemetry.time_matmul += _tock(multiply_started))
+
+        # Lift and fold in immediately: the scaling this transform needs is the
+        # one currently in force, and holding it unlifted would only cost memory.
+        collect_started = _tick()
+        _push_transform!(stack, _lift_transform(window_transform, compression))
+        telemetry === nothing || (telemetry.time_collect += _tock(collect_started))
 
         for i in 1:n
             profile[i] = _log2_abs(factor[i, i])
@@ -724,7 +744,7 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         working, applied, precision =
             _compress_factor(factor, profile, offsets, n, T, aggressive)
         telemetry === nothing || (telemetry.time_compress += _tock(compression_started))
-        push!(compressions, applied)
+        compression = applied
 
         iteration += 1
         telemetry === nothing || (telemetry.iterations += 1)
@@ -735,11 +755,10 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     # it can easily cost more than the whole compressed loop above it.
     finalise_started = _tick()
 
-    # (a) Lift each iteration's transform out of the scaling it was computed
-    #     under, and compose them. The conjugation shifts entries up by the
-    #     compression amounts, so these products are at full scale.
+    # (a) Combine the partial products left on the stack. The lifting itself
+    #     already happened, iteration by iteration, inside the loop.
     collect_started = _tick()
-    transform = _collect_transform(transforms, compressions, n)
+    transform = _drain_transform(stack, n)
     telemetry === nothing || (telemetry.time_collect += _tock(collect_started))
 
     # (b) Apply the composed transform to the ORIGINAL basis, whose entries

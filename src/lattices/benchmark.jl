@@ -75,7 +75,8 @@ Failures are caught rather than thrown: one bad instance should not abandon the
 sweep, and a timeout or a stall is itself a result worth recording.
 """
 function measure(bundle; max_iterations = 120, aggressive = false,
-                 run_fplll = true, verbose = false, repeat_under = 2.0)
+                 run_fplll = true, verbose = false, repeat_under = 2.0,
+                 progress = true)
     B = bundle.basis
     n = size(B, 2)
     log2_det = bundle.log2_determinant
@@ -90,8 +91,15 @@ function measure(bundle; max_iterations = 120, aggressive = false,
     ours_error = nothing
     info = nothing
 
+    # Announce each phase before entering it. A run killed by the OS leaves no
+    # catchable error, so without this there is no way to tell whether our code
+    # or fplll was the one that ran out of memory.
+    announce(phase) = progress && (print(stderr, "    [", bundle.name, " dim ",
+                                         n, "] ", phase, " ...\n"); flush(stderr))
+
     try
         for attempt in 1:3
+            announce(attempt == 1 ? "reducing" : "reducing (repeat)")
             attempt > 1 && GC.gc()
             attempt_telemetry = Flatter.ReductionTelemetry()
             started = time_ns()
@@ -120,6 +128,7 @@ function measure(bundle; max_iterations = 120, aggressive = false,
     theirs_error = nothing
     if run_fplll
         try
+            announce("fplll")
             started = time_ns()
             theirs, _ = Flatter.fplll_reduce(B)
             theirs_time = (time_ns() - started) / 1e9

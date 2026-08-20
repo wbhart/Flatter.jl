@@ -18,6 +18,13 @@
 # Each generator returns a named tuple carrying the basis and whatever is known
 # about it in advance, so a benchmark can say not just "how short a vector did
 # we find" but "did we find the one that is known to be there".
+#
+# THESE ARE NOT STANDARD INSTANCES. They reproduce the SHAPE of the families
+# they are named after, which is enough to track this package against itself and
+# against fplll on the same input, but the parameters are chosen to stress
+# particular machinery rather than to match any published convention. Numbers
+# from these are not comparable with the literature. For that, generate inputs
+# with fplll's `latticegen` or take them from the Darmstadt lattice challenges.
 
 """
     _flip_to_upper(L) -> Matrix{BigInt}
@@ -126,6 +133,15 @@ measures reduction quality rather than recovery of a known target.
 
 `planted_norm2` is `nothing`; the Gaussian heuristic prediction is reported by
 the benchmark instead.
+
+!!! note "The default modulus grows with dimension"
+    `q` defaults to `2^(2n) + 1`, so it carries about `2n + 1` bits and the
+    determinant is `2^(2n^2)` — quadratic in the lattice dimension. That is
+    deliberate, to make entry sizes grow with dimension and exercise the
+    compression machinery, but it is NOT a standard parameterisation and it is
+    what makes memory the binding constraint at large dimension. Published
+    q-ary benchmarks generally fix `q` or scale it polynomially in `n`; pass `q`
+    explicitly to match one.
 """
 function qary_lattice(rng, n::Integer; q::Union{Nothing, Integer} = nothing)
     n >= 1 || throw(ArgumentError("dimension must be positive"))

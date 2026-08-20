@@ -1,11 +1,8 @@
 # lattices/profile_lift.jl
 #
-# A focused look inside the `lift` phase, which the benchmark identified as the
-# dominant cost on most families (77% of runtime on spread-48).
-#
-# The benchmark's timers are coarse: they say `_collect_transform` is expensive
-# but not which part of it. Julia's sampling profiler can see inside, and at
-# this point that is a better instrument than more hand-placed timers.
+# A focused look inside one reduction, for when the benchmark's phase timers
+# are too coarse to say what is actually slow. They report which phase costs
+# what; Julia's sampling profiler can see inside a phase.
 #
 #     julia --project src/lattices/profile_lift.jl
 #
@@ -65,24 +62,52 @@ The default cutoff was chosen for floating point work. BigInt multiplication has
 a completely different cost profile -- the entries are the expensive part, not
 the index arithmetic -- so the crossover may well sit somewhere else.
 """
-function strassen_cutoff_sweep(n::Int = 48, bits::Int = 1200)
+function strassen_cutoff_sweep(n::Int = 48, bits::Int = 1200; repeats::Int = 15)
     rng = MersenneTwister(7)
     make() = BigInt[(big(1) << bits) + rand(rng, 1:1000) for _ in 1:n, _ in 1:n]
     A, B = make(), make()
 
     println("\n", repeat("=", 70))
-    @printf("Strassen cutoff sweep: %d x %d BigInt, ~%d-bit entries\n", n, n, bits)
+    @printf("Strassen cutoff sweep: %d x %d BigInt, ~%d-bit entries, best of %d\n",
+            n, n, bits, repeats)
     println(repeat("=", 70))
+    println("Cutoffs at or above $n mean no recursion at all, so they should all")
+    println("agree; if they do not, the spread between them is the noise floor")
+    println("and any smaller difference elsewhere in the table means nothing.")
+    println()
+
+    # Minimum of several runs, not a single sample: BigInt work allocates
+    # heavily, so one timing is mostly a measurement of when GC happened.
+    # BigInt work allocates heavily, so a single timing mostly measures when
+    # GC happened. Collect first, then take the minimum of several runs, and
+    # report the spread so the noise floor is visible rather than assumed.
+    function best(f)
+        f()
+        samples = Float64[]
+        for _ in 1:repeats
+            GC.gc()
+            push!(samples, @elapsed f())
+        end
+        return minimum(samples), maximum(samples)
+    end
 
     reference = A * B
+    baseline, baseline_worst = best(() -> A * B)
+
     for cutoff in (8, 16, 32, 64, 128, 4096)
-        Flatter.strassen(A, B; cutoff = cutoff)               # warm up
-        elapsed = @elapsed result = Flatter.strassen(A, B; cutoff = cutoff)
-        @printf("  cutoff %5d : %7.1f ms %s\n", cutoff, 1000 * elapsed,
-                result == reference ? "" : "  MISMATCH")
+        result = Flatter.strassen(A, B; cutoff = cutoff)
+        result == reference || println("  MISMATCH at cutoff $cutoff")
+        fastest, slowest = best(() -> Flatter.strassen(A, B; cutoff = cutoff))
+        @printf("  cutoff %5d : %7.1f ms (worst %7.1f) %5.2fx plain   %s\n",
+                cutoff, 1000 * fastest, 1000 * slowest, fastest / baseline,
+                cutoff >= n ? "(no recursion)" : "")
     end
-    elapsed = @elapsed A * B
-    @printf("  plain *      : %7.1f ms\n", 1000 * elapsed)
+    @printf("  plain *      : %7.1f ms (worst %7.1f)\n",
+            1000 * baseline, 1000 * baseline_worst)
+    println()
+    println("Sanity check: every row marked (no recursion) runs identical code.")
+    println("Any spread between those rows is pure measurement noise, and")
+    println("differences smaller than that spread mean nothing.")
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

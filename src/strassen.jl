@@ -1,4 +1,26 @@
+using Base.GMP: MPZ
+
 const DEFAULT_STRASSEN_CUTOFF = 32
+
+# BigInt wants a much lower crossover than machine floats do. For `Float64` the
+# leaf multiplication is BLAS, which is fast enough that recursing far is a
+# loss; for `BigInt` the leaf is a scalar loop and the entries dominate, so
+# trading multiplications for additions keeps paying well past the point where
+# it stops paying for floats.
+#
+# The value below is measured, not guessed; `lattices/profile_lift.jl` has a
+# sweep that reproduces the measurement, and it should be re-run if the leaf
+# multiplication changes.
+const DEFAULT_STRASSEN_CUTOFF_BIGINT = 16
+
+"""
+    _default_cutoff(T) -> Int
+
+The recursion cutoff to use for element type `T` when the caller does not give
+one. See [`DEFAULT_STRASSEN_CUTOFF_BIGINT`](@ref) for why `BigInt` differs.
+"""
+_default_cutoff(::Type) = DEFAULT_STRASSEN_CUTOFF
+_default_cutoff(::Type{BigInt}) = DEFAULT_STRASSEN_CUTOFF_BIGINT
 
 """
     strassen_workspace_length(n; cutoff=32)
@@ -16,6 +38,16 @@ workspace below those blocks.  Thus
 For a power-of-two order `n` whose leaves all have order `b`, this is exactly
 `n^2 - b^2` entries, and is therefore less than `n^2` entries.
 """
+function strassen_workspace_length(::Type{T}, n::Integer;
+                                   cutoff::Integer=_default_cutoff(T)) where {T}
+    return strassen_workspace_length(n; cutoff = cutoff)
+end
+
+# NOTE: the element-type-free form below keeps the generic default. Since
+# `strassen!` now picks its cutoff from the element type, a workspace sized with
+# this method and then handed to `strassen!` on a `BigInt` matrix would be too
+# SMALL -- the lower cutoff recurses deeper and needs more space. Prefer the
+# method above, which takes the type, or pass the same explicit `cutoff` to both.
 function strassen_workspace_length(n::Integer; cutoff::Integer=DEFAULT_STRASSEN_CUTOFF)
     n >= 0 || throw(ArgumentError("n must be nonnegative"))
     cutoff >= 1 || throw(ArgumentError("cutoff must be positive"))
@@ -46,7 +78,7 @@ If `A` and `B` have different element types, they are converted to their
 common promoted type.  The element type must support `zero`, `+`, `-`, and `*`.
 """
 function strassen(A::AbstractMatrix{TA}, B::AbstractMatrix{TB};
-                  cutoff::Integer=DEFAULT_STRASSEN_CUTOFF) where {TA, TB}
+                  cutoff::Integer=_default_cutoff(promote_type(TA, TB))) where {TA, TB}
     m, k = size(A)
     kb, n = size(B)
     k == kb || throw(DimensionMismatch(
@@ -61,6 +93,47 @@ function strassen(A::AbstractMatrix{TA}, B::AbstractMatrix{TB};
     C = Matrix{T}(undef, m, n)
 
     return strassen!(C, Ap, Bp; cutoff=cutoff)
+end
+
+
+# ---------------------------------------------------------------------------
+# Leaf multiplication
+# ---------------------------------------------------------------------------
+#
+# Strassen's recursion bottoms out here, and rectangular products are handled
+# here in full.  For most element types Julia's kernel is the right choice.
+#
+# `BigInt` is the exception.  `mul!` accumulates with `muladd`, which allocates
+# a fresh `BigInt` for the product AND another for the running sum at every step
+# of the inner loop -- roughly `2 * m * k * n` allocations for a single leaf.
+# Accumulating in place through `MPZ` needs one temporary for the whole call plus
+# one `BigInt` per output entry, which is the unavoidable minimum.
+
+@inline _leaf_mul!(C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix) =
+    mul!(C, A, B)
+
+function _leaf_mul!(C::AbstractMatrix{BigInt},
+                    A::AbstractMatrix{BigInt},
+                    B::AbstractMatrix{BigInt})
+    m, inner = size(A)
+    n = size(B, 2)
+
+    # One scratch value for the whole call.  `C` is never read: its entries may
+    # be undefined references, since a workspace is allocated with `undef` and
+    # `BigInt` is a mutable type.
+    product = BigInt()
+
+    @inbounds for j in 1:n
+        for i in 1:m
+            total = BigInt()
+            for t in 1:inner
+                MPZ.mul!(product, A[i, t], B[t, j])
+                MPZ.add!(total, product)
+            end
+            C[i, j] = total
+        end
+    end
+    return C
 end
 
 """
@@ -80,7 +153,7 @@ so the same lower portion of the workspace is reused for all seven products.
 function strassen!(C::AbstractMatrix{T},
                    A::AbstractMatrix{T},
                    B::AbstractMatrix{T};
-                   cutoff::Integer=DEFAULT_STRASSEN_CUTOFF,
+                   cutoff::Integer=_default_cutoff(T),
                    workspace::Union{Nothing, Vector{T}}=nothing) where {T}
     cutoff >= 1 || throw(ArgumentError("cutoff must be positive"))
     c = Int(cutoff)
@@ -100,7 +173,7 @@ function strassen!(C::AbstractMatrix{T},
     # Strassen is used for arbitrary square orders.  Rectangular products and
     # sufficiently small square products are delegated to Julia's kernel.
     if !(m == k && k == n) || m <= c
-        mul!(C, A, B)
+        _leaf_mul!(C, A, B)
         return C
     end
 
@@ -200,7 +273,7 @@ function _strassen_square!(C::AbstractMatrix{T},
     n = size(C, 1)
 
     if n <= cutoff
-        mul!(C, A, B)
+        _leaf_mul!(C, A, B)
         return C
     end
 

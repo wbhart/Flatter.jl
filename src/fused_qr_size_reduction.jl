@@ -34,6 +34,28 @@
 const FUSED_QR_DEADBAND = 0.51
 const FUSED_QR_MAX_PASSES = 64
 
+"""
+    _fused_temporaries(S, count) -> Vector{S}
+
+Scratch values for the in-place kernels, allocated once per factorisation.
+
+Built with a comprehension rather than `fill!` on purpose: `fill!` would store a
+single shared object in every slot, and these are mutated independently.
+"""
+_fused_temporaries(::Type{S}, count::Int) where {S} = S[zero(S) for _ in 1:count]
+
+# Scratch slots. Kept distinct per kernel so that none of them can interfere,
+# even though the call graph happens not to nest them today.
+const _WS_LARF_INNER = 1
+const _WS_LARF_PRODUCT = 2
+const _WS_LARFG_ALPHA = 3
+const _WS_LARFG_NORM = 4
+const _WS_LARFG_BETA = 5
+const _WS_LARFG_SCALE = 6
+const _WS_REDUCE_QUOTIENT = 7
+const _WS_REDUCE_PRODUCT = 8
+const _FUSED_WORKSPACE_SIZE = 8
+
 # ---------------------------------------------------------------------------
 # Single Householder reflector primitives
 # ---------------------------------------------------------------------------
@@ -56,7 +78,8 @@ implicit one, so that `H = I - tau*v*v'` satisfies `H*x = beta*e_1`.
 The sign of `beta` is chosen opposite to the leading entry, which is what keeps
 `alpha - beta` away from cancellation.
 """
-function _fused_larfg!(R::AbstractMatrix{S}, column::Int, m::Int) where {S<:AbstractFloat}
+function _fused_larfg!(R::AbstractMatrix{S}, column::Int, m::Int,
+                       ws::Vector{S}) where {S<:AbstractFloat}
     alpha = R[column, column]
 
     tail_norm_squared = zero(S)
@@ -81,6 +104,41 @@ function _fused_larfg!(R::AbstractMatrix{S}, column::Int, m::Int) where {S<:Abst
     return tau
 end
 
+
+# In-place counterpart. Same algorithm, same result; only the arithmetic differs.
+function _fused_larfg!(R::Matrix{BigFloat}, column::Int, m::Int, ws::Vector{BigFloat})
+    alpha = ws[_WS_LARFG_ALPHA]
+    norm_squared = ws[_WS_LARFG_NORM]
+    beta = ws[_WS_LARFG_BETA]
+    scale = ws[_WS_LARFG_SCALE]
+
+    _mpfr_set!(alpha, R[column, column])
+
+    _mpfr_zero!(norm_squared)
+    @inbounds for i in (column + 1):m
+        _mpfr_fma!(norm_squared, R[i, column], R[i, column], norm_squared)
+    end
+    iszero(norm_squared) && return zero(BigFloat)
+
+    _mpfr_fma!(beta, alpha, alpha, norm_squared)
+    _mpfr_sqrt!(beta, beta)
+    signbit(alpha) || _mpfr_neg!(beta, beta)
+
+    # tau is stored into the caller's vector, so it must be a fresh object.
+    tau = BigFloat()
+    _mpfr_sub!(tau, beta, alpha)
+    _mpfr_div!(tau, tau, beta)
+
+    _mpfr_sub!(scale, alpha, beta)
+    _mpfr_inv!(scale, scale)
+    @inbounds for i in (column + 1):m
+        _mpfr_mul!(R[i, column], R[i, column], scale)
+    end
+    _mpfr_set!(R[column, column], beta)
+
+    return tau
+end
+
 """
     _fused_larf_col!(R, target, reflector, tau, m)
 
@@ -88,7 +146,7 @@ Apply `H = I - tau*v*v'` to `R[reflector:m, target]` in place, where `v` is read
 from column `reflector` of `R` with its implicit leading one.
 """
 function _fused_larf_col!(R::AbstractMatrix{S}, target::Int, reflector::Int,
-                          tau::S, m::Int) where {S<:AbstractFloat}
+                          tau::S, m::Int, ws::Vector{S}) where {S<:AbstractFloat}
     iszero(tau) && return nothing
 
     inner = R[reflector, target]
@@ -100,6 +158,32 @@ function _fused_larf_col!(R::AbstractMatrix{S}, target::Int, reflector::Int,
     R[reflector, target] -= inner
     for i in (reflector + 1):m
         R[i, target] -= inner * R[i, reflector]
+    end
+
+    return nothing
+end
+
+
+# In-place counterpart of the reflector application, and the hot loop of the
+# factorisation: the trailing update calls it once per remaining column, for
+# every column, touching O(m) entries each time.
+function _fused_larf_col!(R::Matrix{BigFloat}, target::Int, reflector::Int,
+                          tau::BigFloat, m::Int, ws::Vector{BigFloat})
+    iszero(tau) && return nothing
+
+    inner = ws[_WS_LARF_INNER]
+    product = ws[_WS_LARF_PRODUCT]
+
+    _mpfr_set!(inner, R[reflector, target])
+    @inbounds for i in (reflector + 1):m
+        _mpfr_fma!(inner, R[i, reflector], R[i, target], inner)
+    end
+    _mpfr_mul!(inner, inner, tau)
+
+    _mpfr_sub!(R[reflector, target], R[reflector, target], inner)
+    @inbounds for i in (reflector + 1):m
+        _mpfr_mul!(product, inner, R[i, reflector])
+        _mpfr_sub!(R[i, target], R[i, target], product)
     end
 
     return nothing
@@ -182,11 +266,32 @@ end
     return absolute_entry / absolute_diagonal <= deadband
 end
 
+
+# R[1:row, column] -= quotient * R[1:row, row]
+@inline function _fused_scale_subtract!(R::AbstractMatrix{S}, column::Int, row::Int,
+                                        quotient::S, ws::Vector{S}) where {S<:AbstractFloat}
+    @inbounds for k in 1:row
+        R[k, column] -= quotient * R[k, row]
+    end
+    return nothing
+end
+
+@inline function _fused_scale_subtract!(R::Matrix{BigFloat}, column::Int, row::Int,
+                                        quotient::BigFloat, ws::Vector{BigFloat})
+    product = ws[_WS_REDUCE_PRODUCT]
+    @inbounds for k in 1:row
+        _mpfr_mul!(product, quotient, R[k, row])
+        _mpfr_sub!(R[k, column], R[k, column], product)
+    end
+    return nothing
+end
+
 # Reduce column `column` against columns 1 .. column-1, returning
 # (any_correction_applied, largest multiplier exponent).
 function _fused_reduce_column!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
                                R::AbstractMatrix{S}, column::Int,
-                               m::Int, deadband::S) where {T<:Integer, S<:AbstractFloat}
+                               m::Int, deadband::S,
+                               ws::Vector{S}) where {T<:Integer, S<:AbstractFloat}
     applied = false
     largest = typemin(Int)
 
@@ -212,8 +317,11 @@ function _fused_reduce_column!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
         end
         for k in 1:row
             U[k, column] -= multiplier * U[k, row]
-            R[k, column] -= quotient * R[k, row]
         end
+        # R is allocated and owned by this file, so its entries may be mutated
+        # in place. B and U belong to the caller and may share objects with a
+        # copy the caller still holds, so they are updated by assignment.
+        _fused_scale_subtract!(R, column, row, quotient, ws)
     end
 
     return applied, largest
@@ -230,6 +338,9 @@ function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
     end
     fill!(tau, zero(S))
 
+    # Scratch for the in-place kernels, allocated once for the whole call.
+    ws = _fused_temporaries(S, _FUSED_WORKSPACE_SIZE)
+
     for column in 1:n
         previous = typemax(Int)
         passes = 0
@@ -240,7 +351,7 @@ function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
                 "column $column did not reduce in $max_passes passes; the " *
                 "working precision is too low for this basis"))
 
-            applied, largest = _fused_reduce_column!(B, U, R, column, m, deadband)
+            applied, largest = _fused_reduce_column!(B, U, R, column, m, deadband, ws)
 
             # Nothing was out of bounds, so the column is reduced and its float
             # coordinates are trustworthy.
@@ -264,7 +375,7 @@ function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
                 R[i, column] = _to_float(S, B[i, column])
             end
             for j in 1:(column - 1)
-                _fused_larf_col!(R, column, j, tau[j], m)
+                _fused_larf_col!(R, column, j, tau[j], m, ws)
             end
         end
 
@@ -272,9 +383,9 @@ function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
         # the right, so that the next column arrives already orthogonalized
         # against everything before it.
         if column < m
-            tau[column] = _fused_larfg!(R, column, m)
+            tau[column] = _fused_larfg!(R, column, m, ws)
             for target in (column + 1):n
-                _fused_larf_col!(R, target, column, tau[column], m)
+                _fused_larf_col!(R, target, column, tau[column], m, ws)
             end
         end
     end

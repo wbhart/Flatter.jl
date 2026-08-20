@@ -434,15 +434,16 @@ function _collect_transform(transforms::Vector{Matrix{T}},
     return _product_tree(lifted)
 end
 
-# One place to choose the matrix product used throughout the driver.
+# One place to choose the matrix product used throughout the driver. The
+# BigInt-specific work lives in `strassen.jl`'s leaf multiplication, so this
+# stays a plain call and every caller in the package benefits.
 _reduction_mul(A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T} = strassen(A, B)
 
 # The window transform embedded in an n x n identity is mostly identity: only
 # the `window` block differs. Forming it and calling a general matrix product
 # costs O(n^3) to compute something that only touches O(n * w^2) entries, and
-# for a half-width window that is four times the necessary work. Since the
-# products by this matrix dominated the profile, both sides get a block-aware
-# version and the embedded matrix is never materialised.
+# for a half-width window that is four times the necessary work. Both sides get
+# a block-aware version, and the embedded matrix is never materialised.
 
 """
     _apply_window_right(A, W, window) -> Matrix
@@ -657,8 +658,7 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             # Nothing moved over a whole cycle of windows, so no further cycle
             # will move anything either: the reduction has converged on
             # something short of the goal. flatter has this test in
-            # `Proved3::is_reduced` but leaves it commented out, which is why
-            # its loop can grind indefinitely at a goal it cannot quite reach.
+            # `Proved3::is_reduced` but leaves it commented out.
             current = profile .+ offsets
             if all(i -> abs(current[i] - cycle_profile[i]) <= REDUCTION_STAGNATION_TOLERANCE,
                    1:n)

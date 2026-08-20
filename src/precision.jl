@@ -40,6 +40,90 @@
 #
 # 5. None of this applies to the Float64 kernels.
 
+# ---------------------------------------------------------------------------
+# In-place MPFR arithmetic
+# ---------------------------------------------------------------------------
+#
+# Every `BigFloat` operation in Julia allocates a fresh result, and the trailing
+# update of this factorisation touches O(m*n^2) entries with several operations
+# each, so value semantics would spend most of the run in the allocator.
+#
+# `Base.MPFR` exposes no in-place arithmetic (only `nextfloat!`, `prevfloat!`
+# and the exponent-range setters), so these go straight to the C library. Each
+# writes its result into an existing `BigFloat`, at that value's own precision.
+#
+# The rounding mode is fixed to round-to-nearest rather than read from
+# `Base.MPFR.ROUNDING_MODE` on every call. Nothing in this package changes the
+# rounding mode, and that global may be resolved through a scoped lookup, which
+# would reintroduce per-operation overhead.
+#
+# !!! warning "Aliasing"
+#     These mutate the `BigFloat` OBJECT, not a matrix slot. Two entries holding
+#     the same object would both change. Only apply them to values this file
+#     owns: the entries of `R`, which are freshly constructed per entry by
+#     `_to_float`, and the temporaries in `_fused_temporaries`. In particular do
+#     NOT use them on `B`, `U` or `tau`: `B` and `U` belong to the caller and may
+#     share objects with a copy the caller still needs, and `tau` is initialised
+#     with `fill!`, which puts one shared object in every slot.
+
+const _MPFR_ROUND = Base.MPFR.MPFRRoundNearest
+
+@inline function _mpfr_set!(z::BigFloat, x::BigFloat)
+    ccall((:mpfr_set, Base.MPFR.libmpfr), Int32,
+          (Ref{BigFloat}, Ref{BigFloat}, Base.MPFR.MPFRRoundingMode),
+          z, x, _MPFR_ROUND)
+    return z
+end
+
+@inline function _mpfr_zero!(z::BigFloat)
+    ccall((:mpfr_set_zero, Base.MPFR.libmpfr), Cvoid, (Ref{BigFloat}, Cint), z, 1)
+    return z
+end
+
+for (name, symbol) in ((:_mpfr_mul!, :mpfr_mul), (:_mpfr_add!, :mpfr_add),
+                       (:_mpfr_sub!, :mpfr_sub), (:_mpfr_div!, :mpfr_div))
+    @eval @inline function $name(z::BigFloat, x::BigFloat, y::BigFloat)
+        ccall(($(QuoteNode(symbol)), Base.MPFR.libmpfr), Int32,
+              (Ref{BigFloat}, Ref{BigFloat}, Ref{BigFloat}, Base.MPFR.MPFRRoundingMode),
+              z, x, y, _MPFR_ROUND)
+        return z
+    end
+end
+
+for (name, symbol) in ((:_mpfr_sqrt!, :mpfr_sqrt), (:_mpfr_neg!, :mpfr_neg))
+    @eval @inline function $name(z::BigFloat, x::BigFloat)
+        ccall(($(QuoteNode(symbol)), Base.MPFR.libmpfr), Int32,
+              (Ref{BigFloat}, Ref{BigFloat}, Base.MPFR.MPFRRoundingMode),
+              z, x, _MPFR_ROUND)
+        return z
+    end
+end
+
+"`z = x*y + w`, in one correctly rounded step."
+@inline function _mpfr_fma!(z::BigFloat, x::BigFloat, y::BigFloat, w::BigFloat)
+    ccall((:mpfr_fma, Base.MPFR.libmpfr), Int32,
+          (Ref{BigFloat}, Ref{BigFloat}, Ref{BigFloat}, Ref{BigFloat},
+           Base.MPFR.MPFRRoundingMode),
+          z, x, y, w, _MPFR_ROUND)
+    return z
+end
+
+"`z = 1 / x`."
+@inline function _mpfr_inv!(z::BigFloat, x::BigFloat)
+    ccall((:mpfr_ui_div, Base.MPFR.libmpfr), Int32,
+          (Ref{BigFloat}, Culong, Ref{BigFloat}, Base.MPFR.MPFRRoundingMode),
+          z, Culong(1), x, _MPFR_ROUND)
+    return z
+end
+
+"`z = round(x)`, to nearest with ties away from zero, as `mpfr_round` defines."
+@inline function _mpfr_round!(z::BigFloat, x::BigFloat)
+    ccall((:mpfr_round, Base.MPFR.libmpfr), Int32,
+          (Ref{BigFloat}, Ref{BigFloat}), z, x)
+    return z
+end
+
+
 """
     with_precision(f, bits)
 
@@ -49,10 +133,8 @@ previous value afterwards, including on exception.
 Use this rather than `setprecision(BigFloat, bits) do ... end` anywhere
 performance matters. The block form installs a `ScopedValue`, and every
 subsequent `BigFloat` allocation then resolves the current precision through a
-`PersistentDict` lookup. Profiling the reduction driver found that lookup
-accounting for **60-64% of total runtime** — more than every matrix product,
-factorisation and compression combined — because the inner loops of the fused
-QR allocate temporaries constantly.
+`PersistentDict` lookup — ruinous in code that allocates temporaries in inner
+loops, which all of the arbitrary-precision kernels here do.
 
 Setting the default directly and restoring it in a `finally` gives identical
 semantics for single-threaded code at a fraction of the cost.
@@ -118,16 +200,23 @@ end
 """
     at_precision(A, p) -> Matrix{BigFloat}
 
-A copy of `A` with every entry rounded to exactly `p` bits.
+An independent copy of `A` with every entry rounded to exactly `p` bits.
 
-This is the conversion to use at a boundary between two computations running at
-different precisions, such as passing an R-factor down a recursion. Rounding is
-explicit and per entry, so the result is uniform regardless of what `A` was.
+Use this at a boundary between two computations running at different
+precisions, such as passing an R-factor down a recursion. Rounding is explicit
+and per entry, so the result is uniform regardless of what `A` was.
+
+The entries are freshly allocated and then written through `_mpfr_set!`, rather
+than built with `BigFloat(x; precision = p)`. That constructor returns `x`
+ITSELF when the requested precision already matches, so it cannot be used to
+obtain an independent copy — the result would share every value with the input,
+and an in-place kernel writing through one would be visible through the other.
 """
 function at_precision(A::AbstractMatrix{BigFloat}, p::Integer)
+    bits = Int(p)
     result = Matrix{BigFloat}(undef, size(A)...)
     for index in eachindex(A)
-        result[index] = BigFloat(A[index]; precision = Int(p))
+        result[index] = _mpfr_set!(BigFloat(; precision = bits), A[index])
     end
     return result
 end

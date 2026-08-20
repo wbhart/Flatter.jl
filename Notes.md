@@ -1,82 +1,130 @@
+# Notes
+
+Things to watch out for. Each entry is a reminder, not an explanation — the
+reasoning is in the code comments and docstrings.
+
+---
+
+## Design choices in this package
+
 * **`smsv.jl` defaults to blocked Householder QR.** `profile(...; blocked=true)` reaches for the recursive implementation to get n^omega with omega < 3 via Strassen. Only the diagonal of R is used for the profile, so the extra machinery buys complexity at the cost of a larger trusted surface. `blocked=false` is the conservative fallback if the profile ever looks wrong.
 
 * **`size_reduction_triu.jl` blocking almost certainly isn't reaching Strassen.** At the current block size the tile products sit at or below the Strassen cutoff and go straight to the base multiplication — raise the block size to actually benefit. Blocking still pays for itself: cache effects, one workspace grabbed up front instead of per-operation allocation, and the option of packing a whole tile into one huge integer for a single GMP multiply (Kronecker substitution). That last is not implemented here, nor in the C++ as far as I know, presumably because it only wins once the BigInt entries are genuinely large.
 
-* **Shift rounding differs from flatter.** flatter uses floor (`mpz_div_2exp`) in the compression path but truncation (`mpz_tdiv_q_2exp`) in `relative_size_reduction/triangular.cpp`. We use floor (`>>`) everywhere. Differs by one on negative entries, so no bit-for-bit agreement with the C++; harmless, since the shift is discarding low bits anyway. Compare invariants, not matrices.
+* **`recursive_reduction.jl` ports `RecursiveGeneric` with `Proved3`'s hardcoded window schedule**, not the `SublatticeSplit` tree. `Proved2`/`Proved3` reference no split object, so this is the shortest route to a working end-to-end reducer. Swapping in the split tree later changes `_reduction_window` and nothing else in that file.
+
+* **`fused_qr_size_reduction.jl` ports only flatter's `Columnwise`.** `ColumnwiseDouble` (same algorithm on doubles, plus a global power-of-two exponent shift to stop R overflowing) is not ported — BigFloat's exponent range makes the shifting unnecessary, and the `Float64` path here throws rather than silently producing `Inf`. `LazyRefine` needs a driver supplying prereduced prefixes; `Iterated` and `SeysenRefine` are unreachable from flatter's own dispatcher.
+
+* **The two-column base case splits between Lagrange and Schoenhage at `schoenhage_threshold` (512 bits).** Both give a Gauss-reduced basis, so the crossover is a pure cost trade: Lagrange is quadratic in the bit size, Schoenhage quasi-linear, but Schoenhage pays for forming the Gram matrix and entering its recursion. flatter splits the same way at `prec < 1400`. Neither involves a precision policy.
+
+* **`schoenhage` takes a Gram matrix, not a basis.** It returns `R == transpose(U) * G * U`; the driver forms `G = Bᵀ B` exactly and applies the returned `U` to the columns. Its reduction condition is exactly Gauss-reduced, i.e. what Lagrange produces — which is what makes the two cross-checkable.
+
+---
+
+## Divergences from flatter
+
+* **Shift rounding.** flatter uses floor (`mpz_div_2exp`) in the compression path but truncation (`mpz_tdiv_q_2exp`) in `relative_size_reduction/triangular.cpp`. We use floor (`>>`) everywhere. Differs by one on negative entries, so no bit-for-bit agreement with the C++; harmless, since the shift is discarding low bits anyway. Compare invariants, not matrices.
 
 * **No `mpfr_mul_z` in Julia.** flatter rounds `float * exact integer` once; `::BigFloat * ::BigInt` promotes first and rounds twice. Only lossy when the multiplier exceeds the working precision, i.e. mostly on the first refinement pass. Absorbed by the refinement loop — symptom would be more passes than the C++ needs, not a wrong answer. `ccall` to `mpfr_mul_z` if it ever matters.
 
 * **flatter's `OrthogonalDouble` refinement loop is dead.** `max_mu_size` is never assigned, so the `while(true)` runs exactly once. We implement the real refinement (as in the MPFR kernel), since 53 bits needs it more, not less. Don't differential-test against the C++ double kernel.
 
-* **The second convergence guard is load-bearing.** `max_mu >= prev_max` (precision exhausted) is what stops a badly conditioned input at 53 bits looping forever. It is not redundant with the unit-magnitude test.
+* **The fused stagnation guard diverges from flatter.** flatter compares multiplier *magnitudes* against an absolute slack of `prec/2`, which is dimensionally odd: for large multipliers the slack vanishes and for small ones `mu_max - prec/2` goes negative so it always fires. We compare exponents instead, matching `relative_size_reduction.jl`.
+
+* **The fused three-tier reduction test compares in `S`, not `double`.** flatter converts both operands out of MPFR and compares the quotient in `double` to save a division. Differs only for entries within a double's rounding error of the threshold, where either answer is fine.
+
+* **Fused QR returns `tau`, not compact-WY `T`.** Reflectors are generated one at a time, so `T` doesn't exist naturally; use `compact_wy_from_reflectors` before handing the factorisation to `apply_Qt!` or the relative size reduction kernels. flatter zeroes `tau[n-1]` at the end (its `Columnwise` discards Q anyway); we keep it, so the returned factorisation is genuine and `Q'B = R` is testable.
+
+* **Fused QR returns R packed, subdiagonal not cleared.** Matches `householder_block`'s convention. flatter clears it because its `Columnwise` asserts `tau` empty. Use `triu(R)` if you want R alone.
+
+* **The stagnation exit is ours; flatter has it commented out.** `Proved3::is_reduced` contains `if (iterations % 3 == 0 && !lattice_changed) { //return true; }` — written but disabled, with nothing else consuming `lattice_changed`. Without it the loop grinds indefinitely at a goal it cannot quite reach. We enable it: if a full cycle of windows leaves the true-scale profile unmoved, stop. `info.stopped` reports `:goal`, `:stagnated`, `:cap` or `:base_case`.
+
+* **flatter's reduction loop has no iteration cap** (`for(iterations=0;;iterations++)`) — it relies on the goal being reachable. We add `max_iterations`. Hitting it is not an error; the basis is still valid, just less reduced, and `info.goal_met` reports which happened.
+
+* **`goal_from_drop`'s proved branch drops the flag, but the branch is unreachable.** It calls `from_slope(n, slope)` instead of `from_slope(n, slope, proved)`, so it would return a *heuristic* goal — except all three call sites in flatter use the two-argument form. Reproduced verbatim anyway.
+
+* **`params.proved` and `goal.proved` are independent flags.** The first (from `FLATTER_PROVED`) picks the *implementation*; the second picks the *acceptance test*. `params.cpp` always builds the initial goal with the two-argument `from_RHF`, so it is heuristic regardless; the only genuinely proved goal in flatter is constructed at `proved_1.cpp:100`. So reaching `Proved2`/`Proved3` without passing through `Proved1` gives proved implementations checked against a heuristic goal. Worth verifying before porting `Proved1/2/3`; irrelevant to the heuristic path.
+
+---
+
+## Julia numeric hazards
+
+* **BigFloat arithmetic uses the global default precision, not the operands'.** Measured on 1.12.6: `arith=default`, `setindex=rebind`, `mul!=widened`. So a `Matrix{BigFloat}` has no precision as a matter of type — only of discipline.
+
+* **Use `with_precision(f, bits)`, not `setprecision(BigFloat, bits) do ... end`.** The block form installs a `ScopedValue`, and every subsequent `BigFloat` allocation then resolves the precision through a `PersistentDict` lookup — ruinous in code that allocates temporaries in inner loops. `with_precision` sets the default directly and restores it in a `finally`. It is **not task-safe**; revisit every call site if this package ever threads. A bare `setprecision` with no restoration remains wrong — it leaks the precision to the caller.
+
+* **Wrap whole computations, not just allocations.** `Matrix{BigFloat}(undef, ...)` pins nothing; it is the arithmetic that reads the default. Applies to `householder_block`, `apply_Qt!` and every BigFloat kernel — none of them establish their own scope.
+
+* **`precision(A[1,1])` does not describe the matrix.** Entries can differ after a stray write. Use `uniform_precision` / `assert_precision`.
+
+* **Widening costs speed, not accuracy.** Extra bits are noise on an already-correct value. But MPFR cost scales with precision, and the "precision exhausted" guard is calibrated against the precision you think you're at.
+
+* **Convert BigFloat matrices explicitly across recursion boundaries** with `at_precision`. Returning one from a scoped block is safe; doing further arithmetic on it outside a matching block is not.
 
 * **`Float64(::BigInt)` overflows to `Inf` on lattice-sized entries.** Use `float64_matrix`, which pulls out a common power-of-two scale. Common, not per-column — per-column would distort the ratios the multipliers depend on.
 
-* **Size-reduction bound isn't 1/2 on the orthogonal kernels.** flatter uses a 0.51 deadband (stops entries oscillating on rounding noise) and terminates on a unit-magnitude test, so expect ~0.51 plus float error. Only `Triangular` achieves a strict 1/2. The exactly testable invariant on every path is `B2_new == B2_old + B1*U` over `BigInt`.
+* **In-place MPFR/MPZ mutate the OBJECT, not the matrix slot.** Only safe on values the callee owns. `R` inside the fused factorisation qualifies, because it is filled entry by entry with `_to_float`. Two tests guard this: "the caller's matrices are never mutated in place" and "copy of a BigFloat matrix is shallow".
 
-* **Relative size reduction never reduces `B2`'s columns against each other.** When checking against `smsv_gso([B1 B2])`, assert only on `mu[j, n1+c]` for `j <= n1`; the rest is unconstrained.
+* **Duplicating a `BigFloat` is harder than it looks, and there are two traps.** `copy` and `Matrix{T}(A)` are SHALLOW — they duplicate the array of references, so every entry is still the same object. And `BigFloat(x)` on a `BigFloat` returns **x itself** when the precision already matches, so the obvious `[BigFloat(x) for x in A]` is also a no-op. The reliable form is `_mpfr_set!(BigFloat(), x)`: allocate, then write. `fill!(v, zero(S))` is worse still — one shared object in every slot. Both traps are pinned by the "duplicating a BigFloat matrix" testset; between them they produced failures that looked numerical but were one code path reading another's output.
 
-* **`blocked` size reduction is not a reordering of the elementary one.** `diag_above` multiplies the *original* tile by `U(j,j)`, where the elementary sweep would use the already-reduced columns. Different valid reduced representative — agrees with `:zz` on only ~2/3 of inputs. Test the contract, not equality.
+* **`at_precision` allocates and writes rather than constructing.** Its whole purpose is an independent copy, and `BigFloat(x; precision = p)` short-circuits to `x` when `p` already matches. Same reasoning applies anywhere else that needs a genuine duplicate.
+
+* **The in-place kernels accumulate with `mpfr_fma`**, which rounds once where the generic path rounds twice, so the two are **not bit-identical** — the in-place path is slightly more accurate. Tests compare with a tolerance.
+
+---
+
+## Algorithm facts that look like bugs
+
+* **`Profile::get_drop` is not first-minus-last.** It is the spread *less the sum of clean upward gaps* — places where every entry to the right sits strictly above every entry to the left. Those gaps are exactly what block compression removes, so they don't count as un-reducedness. `get_spread` is the plain `max - min`. They coincide on a decreasing profile, which is why a first-minus-last stand-in passes most tests. Invariant: `0 <= drop <= spread`.
+
+* **The heuristic `goal_check` has three conditions and all three do work.** Total drop, half-mean separation, and middle-span drop. A profile flat in both halves with a step between them at 95% of the budget is rejected despite its total drop fitting, and the middle-span condition alone rejects profiles the other two accept. Don't simplify it to the drop condition — that's the *proved* goal's test, and it would let the recursion settle for a basis still improvable across the half boundary.
+
+* **`with_best_slope` preserves the budget, it does not move it.** A heuristic goal's target slope splits as `best_slope + gap`; changing the base slope re-attributes the same total and leaves `goal_max_drop` exactly unchanged. Its precondition is `slope < target slope`.
+
+* **`goal_from_rhf` clamps below `2^(BKZ_BEST_SLOPE/2) ≈ 1.0109`.** Asking for a better root Hermite factor than BKZ achieves silently gives the clamp.
+
+* **`goal_slope` returns different kinds of thing for the two goal families.** Proved: an actual slope. Heuristic: the raw `quality` scalar, which is *not* a slope. For the slope a heuristic goal really targets, use `goal_max_drop(g) / g.n`.
+
+* **Heuristic `goal_max_drop(g) / n` recovers the input slope exactly.** The `shape` function cancels between `from_slope` and `max_drop`, so `quality` is a pure scale factor with no dimensional meaning of its own. `_goal_shape(1) == 0`, so dimension-one goals are guarded.
 
 * **Relative size reduction's precision requirement is set by the block magnitude ratio, not just conditioning.** Coordinates are known only to `max|B2| * 2^-p`, so reducing to the deadband needs `p > log2(max|B2| / min|R_jj|)` with margin. The `max|B2|` is the magnitude *after* reduction — only the component of `B2` in `B1`'s span can shrink, so a large orthogonal component sets a floor that no number of refinement passes can lower. Under-provisioning isn't an error: the convergence guard stops, `U` stays exact and unimodular, and only reduction quality suffers.
 
-* **`fused_qr_size_reduction.jl` ports only flatter's `Columnwise`.** `ColumnwiseDouble` (same algorithm on doubles, plus a global power-of-two exponent shift to stop R overflowing) is not ported — BigFloat's exponent range makes the shifting unnecessary, and the `Float64` path here throws rather than silently producing `Inf`. `LazyRefine` needs a driver supplying prereduced prefixes; `Iterated` and `SeysenRefine` are unreachable from flatter's own dispatcher.
+* **The second convergence guard is load-bearing.** `max_mu >= prev_max` (precision exhausted) is what stops a badly conditioned input at 53 bits looping forever. It is not redundant with the unit-magnitude test.
 
-* **The fused stagnation guard diverges from flatter.** flatter compares multiplier *magnitudes* against an absolute slack of `prec/2`, which is dimensionally odd: for large multipliers the slack vanishes (so it means "stopped shrinking") and for small ones `mu_max - prec/2` goes negative so it always fires. We compare exponents instead, matching `relative_size_reduction.jl`. Verified: ≤2 passes per column on random, wide-profile and scrambled bases.
+* **Size-reduction bound isn't 1/2 on the orthogonal kernels.** flatter uses a 0.51 deadband and terminates on a unit-magnitude test, so expect ~0.51 plus float error. Only `Triangular` achieves a strict 1/2. The exactly testable invariant on every path is `B2_new == B2_old + B1*U` over `BigInt`.
 
-* **The fused three-tier reduction test compares in `S`, not `double`.** flatter converts both operands out of MPFR and compares the quotient in `double` to save a division. We compare in the working float type. Differs only for entries within a double's rounding error of the threshold, where either answer is fine — a spurious reduction is a valid transvection, a missed one is caught next pass.
+* **Relative size reduction never reduces `B2`'s columns against each other.** When checking against `smsv_gso([B1 B2])`, assert only on `mu[j, n1+c]` for `j <= n1`.
 
-* **Fused QR returns `tau`, not compact-WY `T`.** Reflectors are generated one at a time, so `T` doesn't exist naturally; use `compact_wy_from_reflectors` to convert before handing the factorization to `apply_Qt!` or the relative size reduction kernels. Note flatter zeroes `tau[n-1]` at the end (its `Columnwise` discards Q anyway); we keep it, so the returned factorization is genuine and `Q'B = R` is testable.
+* **`blocked` size reduction is not a reordering of the elementary one.** `diag_above` multiplies the *original* tile by `U(j,j)`, where the elementary sweep would use the already-reduced columns. Different valid reduced representative — agrees with `:zz` on only ~2/3 of inputs. Test the contract, not equality.
 
-* **Fused QR returns R packed, subdiagonal not cleared.** Matches `householder_block`'s convention: upper trapezoid is R, below-diagonal column `j` holds `v_j`'s tail. flatter clears the subdiagonal because its `Columnwise` asserts `tau` empty. Use `triu(R)` if you want R alone.
+* **`U` from fused QR is unimodular but not triangular.** Columns are processed left to right, but each is reduced against *all* its predecessors. Test `abs(det(U)) == 1` (Bareiss), not the triangular structure.
 
-* **`U` from fused QR is unimodular but not triangular.** Columns are processed left to right, but each is reduced against *all* its predecessors, so `U` is unit upper triangular only when no reduction crosses a column boundary. Test `abs(det(U)) == 1` (Bareiss), not the triangular structure.
+* **Input to the driver is upper triangular; output is a general basis.** `B_out = B_in * U` has a meaningless diagonal that may contain zeros — reading it as a profile gives `-Inf`. The profile is in `info.profile`, from the R factor. flatter is the same. Re-triangularise before feeding a result back in.
 
-* **`Profile::get_drop` is not first-minus-last.** It is the spread *less the sum of clean upward gaps* — places where every entry to the right sits strictly above every entry to the left. Those gaps are exactly what block compression removes, so they don't count as un-reducedness. `get_spread` is the plain `max - min`. The two coincide on a decreasing profile (a reduced basis has no upward jump), which is why a first-minus-last stand-in passes most tests; they diverge on any profile that jumps up, where drop can be 0 while spread is large. Invariant: `0 <= drop <= spread`.
+* **Compression acts on the R factor, never on the basis product.** `B_next = B * U_window` is *not* triangular, so it must be re-factored by the fused QR first, and the resulting R is what gets compressed. Compressing `B_next` directly produces a singular basis within a couple of iterations.
 
-* **`goal_from_drop`'s proved branch drops the flag, but the branch is unreachable.** It calls `from_slope(n, slope)` instead of `from_slope(n, slope, proved)`, so it would return a *heuristic* goal — except all three call sites in flatter (`heuristic_1/2/3.cpp`) use the two-argument form, so `proved` is always false and the correct `else` branch runs. Reproduced verbatim anyway. Harmless as it stands; only matters if a future caller passes `proved = true`.
+* **Compression only fires on profiles that jump *upward*.** The gap test needs the right block higher than the left, which never happens on a descending profile — so on a normal lattice profile the shifts are all zero and only the uniform truncation applies.
 
-* **`params.proved` and `goal.proved` are independent flags.** The first (from `FLATTER_PROVED`) picks the *implementation* — `Proved1/2/3` over `Heuristic1/2/3`. The second picks the *acceptance test* in `check`. `params.cpp` always builds the initial goal with the two-argument `from_RHF`, so it is heuristic regardless; the only genuinely proved goal in flatter is constructed at `proved_1.cpp:100`, and `subgoal` propagates it from there. So reaching `Proved2`/`Proved3` without passing through `Proved1` gives proved implementations checked against a heuristic goal. Whether that is actually reachable depends on the top-level params constructor and CLI setup, neither of which I have seen — and the heuristic test is the *stricter* of the two, so the effect would be over-reduction, not a violated guarantee. Worth verifying before porting `Proved1/2/3`; irrelevant to the heuristic path.
+* **Compression cannot vanish a diagonal entry**, given the precision policy: the smallest column retains about `spread + 30 + 2n` bits. If a diagonal ever does hit zero, suspect the precision policy, not the shifts.
 
-* **Heuristic `goal_max_drop(g) / n` recovers the input slope exactly.** The `shape` function cancels completely between `from_slope` and `max_drop`. Useful invariant, and it means `quality` is a pure scale factor with no dimensional meaning of its own.
+* **`collect_U` pairing is off-by-one by design.** The compression stack holds one more entry than the transform stack. The last compression is discarded, then transform *k* pairs with compression *k−1*. Getting this wrong throws inside `conjugate_transform`'s block-structure check rather than silently corrupting the result.
 
-* **`goal_from_rhf` clamps below `2^(BKZ_BEST_SLOPE/2) ≈ 1.0109`.** Asking for a better root Hermite factor than BKZ achieves silently gives the same goal as asking for the clamp. Not a bug, but it means an over-ambitious `rhf` request is quietly ignored rather than rejected.
+* **`compression_shifts`' truncation depends linearly on the precision argument.** Call with `precision = 0` to recover the constant: `truncation = offset - lll_precision(spread, n)`.
 
-* **`with_best_slope` preserves the budget, it does not move it.** A heuristic goal's target slope splits as `best_slope + gap` with `gap = quality * shape / n`; changing the base slope re-attributes the same total between the two terms and leaves `goal_max_drop` exactly unchanged. Counterintuitive from the name — it sounds like it should make the goal stricter or looser. Its precondition is `slope < target slope`, not merely a small slope.
+* **Compare profiles at true scale, not compressed.** Compression shifts the profile every iteration; the stagnation test uses `profile .+ offsets`.
 
-* **`goal_slope` returns different kinds of thing for the two goal families.** Proved: an actual slope. Heuristic: the raw `quality` scalar, which is *not* a slope. flatter's behaviour, preserved. For the slope a heuristic goal really targets, use `goal_max_drop(g) / g.n`.
+* **The exact invariants hold unconditionally.** `B_out == B_in * U` and `|det U| == 1` are true regardless of working precision, of whether the goal was met, and of the iteration cap. When something looks wrong, check these first: if they hold, it's a precision or goal problem, not an algorithmic one.
 
-* **`_goal_shape(1) == 0`**, so a one-dimensional goal has no budget to scale and `from_slope` would divide by zero. Guarded — dimension-one goals get `quality = 0` and are accepted unconditionally by `goal_check` anyway.
+---
 
-* **The heuristic `goal_check` has three conditions and all three do work.** Total drop, half-mean separation, and middle-span drop. Verified: a profile flat in both halves with a step between them at 95% of the budget is rejected despite its total drop fitting; and the middle-span condition alone rejects profiles the other two accept (696 of 200k random cases). Don't simplify it to the drop condition — that's the *proved* goal's test, and it would let the recursion settle for a basis still improvable across the half boundary.
+## Performance
 
-* **`recursive_reduction.jl` ports `RecursiveGeneric` with `Proved3`'s hardcoded window schedule**, not the `SublatticeSplit` tree. `Proved2`/`Proved3` reference no split object, so this is the shortest route to a working end-to-end reducer. Swapping in the split tree later changes `_reduction_window` and nothing else in that file.
+* **The Strassen cutoff depends on element type.** `BigInt` wants 16, everything else 32. For floats the leaf is BLAS and recursing far is a loss; for `BigInt` the leaf is a scalar loop and the entries dominate. If you preallocate a workspace, size it with `strassen_workspace_length(T, n)` — the type-free method uses the generic cutoff and would under-size the buffer for `BigInt`.
 
-* **Compression acts on the R factor, never on the basis product.** `B_next = B * U_window` is *not* triangular — the window transform mixes columns whose support reaches below their own row — so it must be re-factored by the fused QR first, and the resulting R is what gets compressed and rounded back to the integer working basis. Compressing `B_next` directly produces a singular basis within a couple of iterations.
+* **Never materialise the embedded window transform.** It is the identity outside one `w x w` block, so a general product costs `O(n^3)` to compute something touching `O(n*w^2)` entries. `_apply_window_right`/`_apply_window_left` do the block product and copy the rest.
 
-* **`collect_U` pairing is off-by-one by design.** The compression stack holds one more entry than the transform stack, because the initial compression happens before the first iteration. The last compression is discarded, then transform *k* pairs with compression *k−1* — the scaling in force when that transform was computed. Getting this wrong throws inside `conjugate_transform`'s block-structure check rather than silently corrupting the result, which is worth keeping.
+* **Measure before optimising here.** Three separate predictions about the bottleneck were wrong: the fused QR was expected to dominate and was the smallest phase; the finalise phase was invisible until instrumented; the final size reduction was expected to dominate and was negligible. The real costs turned out to be Julia-level overheads — scoped-precision lookups and GMP allocation — not the algorithm.
 
-* **`compression_shifts`' truncation depends linearly on the precision argument**, and the precision we want comes from the spread, which isn't known until after the call. Calling with `precision = 0` recovers the constant, so one call suffices: `truncation = offset - lll_precision(spread, n)`.
+* **Benchmark timings vary by up to 2x** with GC on BigInt work. `lattices/benchmark.jl` repeats cheap runs and keeps the fastest; the Strassen sweep in `lattices/profile_lift.jl` collects before each sample and prints the noise floor. Treat any single-run difference smaller than that floor as meaningless.
 
-* **Compression only fires on profiles that jump *upward*.** The gap test needs the right block higher than the left, which never happens on a descending profile — so on a normal lattice profile the shifts are all zero and only the uniform truncation applies. That's still the main win (it bounds entry sizes to the working precision); the per-block shifts matter on irregular intermediate profiles.
-
-* **Compression cannot vanish a diagonal entry**, given the precision policy: the smallest column retains about `spread + 30 + 2n` bits, since precision is `2*spread + 30 + 2n` and the compressed profile spans `spread`. If a diagonal ever does hit zero, suspect the precision policy, not the shifts.
-
-* **Input is upper triangular; output is a general basis.** The transform is unimodular but not triangular, so `B_out = B_in * U` has a meaningless diagonal that may contain zeros — reading it as a profile gives `-Inf`. The profile is in `info.profile`, from the R factor. flatter is the same: `fini_solver` leaves `M` general and reports the profile separately. Re-triangularise (fused QR, round R to integers) before feeding a result back in.
-
-* **The exact invariants hold unconditionally.** `B_out == B_in * U` and `|det U| == 1` are true regardless of working precision, of whether the goal was met, and of the iteration cap. Only *quality* depends on those. When something looks wrong, check the exact invariants first: if they hold, it's a precision or goal problem, not an algorithmic one.
-
-* **The stagnation exit is ours; flatter has it commented out.** `Proved3::is_reduced` contains `if (iterations % 3 == 0 && !lattice_changed) { //return true; }` — the test is written but disabled, and nothing else consumes `lattice_changed`. Without it the loop grinds indefinitely at a goal it cannot quite reach: benchmarking found a q-ary dim-64 case that spent 120 iterations missing a drop target of 3.66 by 0.05 bits, while finding a *shorter* vector than fplll. We enable it: if a full cycle of windows leaves the true-scale profile unmoved, stop. `info.stopped` reports `:goal`, `:stagnated`, `:cap` or `:base_case`.
-
-* **Never materialise the embedded window transform.** It is the identity outside one `w x w` block, so a general product costs `O(n^3)` to compute something touching `O(n*w^2)` entries — four times the necessary work at half width. `_apply_window_right`/`_apply_window_left` do the block product and copy the rest. Benchmarking showed these products at 21–84% of runtime before the change.
-
-* **Benchmark findings (dims 48–96, before the block-product fix).** `finalise` 45–47% on several families — `collect_U` plus applying the transform to the original uncompressed basis, all at full scale — `matmul` 21–84%, `fusedQR` only 1–29%. Tiling the fused QR, the obvious-looking optimisation and what flatter's `Heuristic3` does, would have targeted the *smallest* of the three. Measure before optimising here.
-
-* **Compare profiles at true scale, not compressed.** Compression shifts the profile every iteration, so consecutive compressed profiles are not comparable; the stagnation test uses `profile .+ offsets`.
-
-* **flatter's reduction loop has no iteration cap** (`for(iterations=0;;iterations++)`) — it relies on the goal being reachable. We add `max_iterations` so an unreachable goal terminates. Hitting it is not an error; the basis is still valid, just less reduced, and `info.goal_met` reports which happened.
-
-* **The two-column base case splits between Lagrange and Schoenhage at `schoenhage_threshold` (512 bits).** Both give a Gauss-reduced basis, so the crossover is a pure cost trade: Lagrange is quadratic in the bit size, Schoenhage quasi-linear, but Schoenhage pays for forming the Gram matrix and entering its recursion. flatter splits the same way at `prec < 1400`. Neither involves a precision policy — Lagrange works on exact integer squared lengths and inner products, and `schoenhage` on the exact integer Gram.
-
-* **`schoenhage` takes a Gram matrix, not a basis.** It returns `R == transpose(U) * G * U`; the driver forms `G = Bᵀ B` exactly and applies the returned `U` to the columns. Its reduction condition (`R[1,1] <= R[2,2]`, `2|R[1,2]| <= R[1,1]`) is exactly Gauss-reduced, i.e. what Lagrange produces — which is what makes the two cross-checkable.
-
+* **Remaining structural cost: the fused QR is BLAS-2.** The trailing update applies one reflector to one column at a time, so it contains no matrix products at all. Panel blocking — accumulating reflectors and applying them as a compact-WY block update — would route it through `_householder_block_mul!` and hence Strassen. This is what flatter's `Heuristic3` does. Not yet attempted.

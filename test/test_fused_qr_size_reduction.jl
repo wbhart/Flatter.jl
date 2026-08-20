@@ -270,6 +270,138 @@ fqr_maxabs(A) = isempty(A) ? zero(eltype(A)) : maximum(abs, A)
         end
     end
 
+    # The BigFloat kernels are dispatched on `Matrix{BigFloat}`; a view is an
+    # `AbstractMatrix{BigFloat}` but not a `Matrix`, so it takes the generic
+    # value-semantics path. That gives a way to run both implementations on the
+    # same data and compare.
+    #
+    # They are NOT bit-identical, and shouldn't be: the in-place version
+    # accumulates with `mpfr_fma`, which rounds once where the generic version
+    # rounds twice. The in-place path is the more accurate of the two.
+    @testset "in-place BigFloat kernels agree with the generic ones" begin
+        setprecision(BigFloat, 160) do
+            size = Flatter._FUSED_WORKSPACE_SIZE
+
+            # Two traps at once. `copy` on a Matrix{BigFloat} is SHALLOW: it
+            # duplicates the array of references, not the values. And
+            # `BigFloat(x)` returns x ITSELF when the precision already matches,
+            # so it cannot be used to duplicate either. Allocating and writing
+            # through `_mpfr_set!` is the way to get an independent value.
+            duplicate(A) = [Flatter._mpfr_set!(BigFloat(), x) for x in A]
+
+            @testset "reflector generation" begin
+                rng = MersenneTwister(0x1A4F)
+                for (m, column) in ((9, 1), (9, 4), (12, 7), (5, 5))
+                    base = BigFloat.(randn(rng, m, m))
+                    inplace = duplicate(base)
+                    generic = duplicate(base)
+                    tolerance = BigFloat(2)^(-130) * max(1, maximum(abs, base))
+
+                    tau_inplace = Flatter._fused_larfg!(
+                        inplace, column, m, Flatter._fused_temporaries(BigFloat, size))
+                    tau_generic = Flatter._fused_larfg!(
+                        view(generic, :, :), column, m,
+                        Flatter._fused_temporaries(BigFloat, size))
+
+                    @test abs(tau_inplace - tau_generic) < tolerance
+                    @test maximum(abs, inplace - generic) < tolerance
+                end
+            end
+
+            @testset "reflector application" begin
+                rng = MersenneTwister(0x1A50)
+                for (m, n) in ((10, 6), (7, 7))
+                    base = BigFloat.(randn(rng, m, n))
+                    inplace = duplicate(base)
+                    generic = duplicate(base)
+                    # Errors accumulate over a full sweep of reflectors, so this
+                    # is looser than the single-reflector case above.
+                    tolerance = BigFloat(2)^(-110) * max(1, maximum(abs, base))
+                    ws_inplace = Flatter._fused_temporaries(BigFloat, size)
+                    ws_generic = Flatter._fused_temporaries(BigFloat, size)
+
+                    for reflector in 1:min(m, n) - 1
+                        tau = Flatter._fused_larfg!(inplace, reflector, m, ws_inplace)
+                        tau_generic = Flatter._fused_larfg!(
+                            view(generic, :, :), reflector, m, ws_generic)
+                        for target in (reflector + 1):n
+                            Flatter._fused_larf_col!(inplace, target, reflector,
+                                                     tau, m, ws_inplace)
+                            Flatter._fused_larf_col!(view(generic, :, :), target,
+                                                     reflector, tau_generic, m,
+                                                     ws_generic)
+                        end
+                    end
+                    @test maximum(abs, inplace - generic) < tolerance
+                end
+            end
+        end
+    end
+
+    # Two independent hazards, both easy to trip over and both pinned here.
+    # `copy` on a Matrix{BigFloat} duplicates references, not values; and
+    # `BigFloat(x)` on a BigFloat returns x itself when the precision matches,
+    # so neither yields an independent copy. Only allocating a new value and
+    # writing into it does.
+    @testset "duplicating a BigFloat matrix" begin
+        setprecision(BigFloat, 128) do
+            A = BigFloat[1.5 2.5; 3.5 4.5]
+            shallow = copy(A)
+            constructed = [BigFloat(x) for x in A]
+            independent = [Flatter._mpfr_set!(BigFloat(), x) for x in A]
+
+            # Same objects, before anything is mutated.
+            @test all(shallow[i] === A[i] for i in eachindex(A))
+            @test all(constructed[i] === A[i] for i in eachindex(A))
+            @test all(independent[i] !== A[i] for i in eachindex(A))
+            @test independent == A
+
+            ws = Flatter._fused_temporaries(BigFloat, Flatter._FUSED_WORKSPACE_SIZE)
+            Flatter._fused_larfg!(A, 1, 2, ws)
+
+            @test shallow == A          # shares values, so it changed too
+            @test constructed == A      # likewise
+            @test independent != A      # genuinely independent
+        end
+    end
+
+    # `at_precision` exists to hand back an independent, uniformly rounded
+    # matrix, so it must not fall into the same trap when the precision it is
+    # asked for happens to match what it was given.
+    @testset "at_precision returns independent entries" begin
+        setprecision(BigFloat, 128) do
+            A = BigFloat[1.5 2.5; 3.5 4.5]
+            same = Flatter.at_precision(A, 128)
+            wider = Flatter.at_precision(A, 256)
+
+            @test same == A
+            @test all(same[i] !== A[i] for i in eachindex(A))
+            @test Flatter.uniform_precision(same) == 128
+            @test Flatter.uniform_precision(wider) == 256
+        end
+    end
+
+    # The in-place kernels mutate BigFloat OBJECTS. `R` is owned by the
+    # factorisation so that is safe, but `B` and `U` belong to the caller and
+    # may share objects with a copy the caller still holds -- `Matrix{BigInt}(B)`
+    # copies the array, not the entries. If a kernel ever started mutating those
+    # in place, this test is what would catch it.
+    @testset "the caller's matrices are never mutated in place" begin
+        rng = MersenneTwister(0xA11A5)
+        m, n = 10, 6
+        B = fqr_random_basis(rng, m, n; bits = 40)
+
+        shallow = Matrix{BigInt}(B)          # shares entry objects with B
+        deep = [BigInt(x) for x in B]        # independent objects
+
+        Flatter.fused_qr_size_reduction!(B, Matrix{BigInt}(undef, n, n);
+                                         precision = 200)
+
+        # `shallow` must still equal the ORIGINAL, not the reduced result:
+        # assignment into B rebinds slots, it does not mutate the old objects.
+        @test shallow == deep
+    end
+
     @testset "in-place form" begin
         rng = MersenneTwister(0x1409)
         m, n = 9, 5

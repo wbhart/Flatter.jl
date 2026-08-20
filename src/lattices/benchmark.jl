@@ -75,23 +75,42 @@ Failures are caught rather than thrown: one bad instance should not abandon the
 sweep, and a timeout or a stall is itself a result worth recording.
 """
 function measure(bundle; max_iterations = 120, aggressive = false,
-                 run_fplll = true, verbose = false)
+                 run_fplll = true, verbose = false, repeat_under = 2.0)
     B = bundle.basis
     n = size(B, 2)
     log2_det = bundle.log2_determinant
 
+    # Repeat cheap runs and keep the FASTEST, together with the telemetry from
+    # that same run: a single timing on BigInt work varies by up to 2x with GC,
+    # and the time and the phase counters must come from one run or the reported
+    # shares do not add up.
     telemetry = Flatter.ReductionTelemetry()
-
     ours = nothing
     ours_time = NaN
     ours_error = nothing
     info = nothing
+
     try
-        started = time_ns()
-        ours, _, info = Flatter.lattice_reduce(B; max_iterations = max_iterations,
-                                               aggressive = aggressive,
-                                               telemetry = telemetry)
-        ours_time = (time_ns() - started) / 1e9
+        for attempt in 1:3
+            attempt > 1 && GC.gc()
+            attempt_telemetry = Flatter.ReductionTelemetry()
+            started = time_ns()
+            basis, _, attempt_info = Flatter.lattice_reduce(
+                B; max_iterations = max_iterations, aggressive = aggressive,
+                telemetry = attempt_telemetry)
+            elapsed = (time_ns() - started) / 1e9
+
+            if isnan(ours_time) || elapsed < ours_time
+                ours_time = elapsed
+                telemetry = attempt_telemetry
+                ours = basis
+                info = attempt_info
+            end
+
+            # Only repeat while it is cheap to do so. On an expensive instance
+            # the noise matters less than the cost of measuring again.
+            ours_time >= repeat_under && break
+        end
     catch err
         ours_error = sprint(showerror, err)
     end
@@ -104,6 +123,14 @@ function measure(bundle; max_iterations = 120, aggressive = false,
             started = time_ns()
             theirs, _ = Flatter.fplll_reduce(B)
             theirs_time = (time_ns() - started) / 1e9
+            if theirs_time < repeat_under
+                for _ in 1:2
+                    GC.gc()
+                    started = time_ns()
+                    Flatter.fplll_reduce(B)
+                    theirs_time = min(theirs_time, (time_ns() - started) / 1e9)
+                end
+            end
         catch err
             theirs_error = sprint(showerror, err)
         end

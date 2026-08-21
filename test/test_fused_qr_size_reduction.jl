@@ -402,6 +402,34 @@ fqr_maxabs(A) = isempty(A) ? zero(eltype(A)) : maximum(abs, A)
         @test shallow == deep
     end
 
+    # The integer update loops compute the product into a scratch value rather
+    # than allocating one per element. The scratch must not leak into the
+    # result, and the caller's entry objects must still be rebound rather than
+    # mutated, since they may be shared with a copy the caller holds.
+    @testset "integer update matches the direct expression" begin
+        rng = MersenneTwister(0x17D)
+        for (m, n) in ((8, 5), (12, 12))
+            base = fqr_random_basis(rng, m, n; bits = 60)
+            multiplier = BigInt(rand(rng, -50:50))
+
+            direct = [BigInt(x) for x in base]
+            for k in 1:m
+                direct[k, 2] -= multiplier * direct[k, 1]
+            end
+
+            via = [BigInt(x) for x in base]
+            shared = via                      # same array, to check rebinding
+            entries = [via[k, 2] for k in 1:m]
+            Flatter._fused_integer_update!(via, 2, 1, 1:m, multiplier, zero(BigInt))
+
+            @test via[:, 2] == direct[:, 2]
+            @test via[:, 3:end] == direct[:, 3:end]
+            # The old entry objects must be untouched: the slot was rebound.
+            @test all(entries[k] === via[k, 2] || entries[k] == base[k, 2]
+                      for k in 1:m)
+        end
+    end
+
     @testset "in-place form" begin
         rng = MersenneTwister(0x1409)
         m, n = 9, 5

@@ -336,6 +336,38 @@ end
             end
         end
 
+        # The bounded mode is the low-memory option: it folds into a single
+        # running product instead of a tree of partial products. Same answer,
+        # one live matrix instead of O(log k).
+        @testset "bounded mode gives the same product, k = $count" for count in 1:12
+            rng = MersenneTwister(hash((count, :bounded)))
+            n = 4
+            factors = [BigInt[rand(rng, -9:9) for _ in 1:n, _ in 1:n] for _ in 1:count]
+
+            balanced = Flatter._TransformStack{BigInt}(false)
+            bounded = Flatter._TransformStack{BigInt}(true)
+            for factor in factors
+                Flatter._push_transform!(balanced, factor)
+                Flatter._push_transform!(bounded, factor)
+            end
+
+            @test length(bounded.factors) == 1
+            @test Flatter._drain_transform(bounded, n) ==
+                  Flatter._drain_transform(balanced, n)
+        end
+
+        @testset "the driver agrees in both memory modes" begin
+            rng = MersenneTwister(0x10FE)
+            for n in (4, 6, 9)
+                B0 = rr_triangular_basis(rng, n; spread = 50)
+                fast, U_fast, _ = Flatter.lattice_reduce(B0; low_memory = false)
+                lean, U_lean, _ = Flatter.lattice_reduce(B0; low_memory = true)
+                @test fast == lean
+                @test U_fast == U_lean
+                @test rr_check_exact(B0, lean, U_lean)
+            end
+        end
+
         @testset "an empty stack drains to the identity" begin
             result = Flatter._drain_transform(Flatter._TransformStack{BigInt}(), 4)
             @test result == BigInt[i == j ? 1 : 0 for i in 1:4, j in 1:4]
@@ -353,7 +385,7 @@ end
             for i in 1:n
                 U[i, i] = 1
             end
-            @test Flatter._lift_transform(U, shifts) == conjugate_transform(U, shifts)
+            @test Flatter._lift_transform(U, shifts) == Flatter.conjugate_transform(U, shifts)
         end
     end
 

@@ -76,7 +76,9 @@ sweep, and a timeout or a stall is itself a result worth recording.
 """
 function measure(bundle; max_iterations = 120, aggressive = false,
                  run_fplll = true, verbose = false, repeat_under = 2.0,
-                 progress = true)
+                 progress = true, low_memory = nothing,
+                 gc_dimension = Flatter.REDUCTION_GC_DIMENSION,
+                 gc_full = false)
     B = bundle.basis
     n = size(B, 2)
     log2_det = bundle.log2_determinant
@@ -90,6 +92,8 @@ function measure(bundle; max_iterations = 120, aggressive = false,
     ours_time = NaN
     ours_error = nothing
     info = nothing
+    live_growth = 0
+    rss_growth = 0
 
     # Announce each phase before entering it. A run killed by the OS leaves no
     # catchable error, so without this there is no way to tell whether our code
@@ -102,17 +106,26 @@ function measure(bundle; max_iterations = 120, aggressive = false,
             announce(attempt == 1 ? "reducing" : "reducing (repeat)")
             attempt > 1 && GC.gc()
             attempt_telemetry = Flatter.ReductionTelemetry()
+            GC.gc()
+            live_before = Base.gc_live_bytes()
+            rss_before = Sys.maxrss()
             started = time_ns()
             basis, _, attempt_info = Flatter.lattice_reduce(
                 B; max_iterations = max_iterations, aggressive = aggressive,
+                low_memory = low_memory, gc_dimension = gc_dimension,
+                gc_full = gc_full,
                 telemetry = attempt_telemetry)
             elapsed = (time_ns() - started) / 1e9
+            attempt_live = Base.gc_live_bytes() - live_before
+            attempt_rss = Sys.maxrss() - rss_before
 
             if isnan(ours_time) || elapsed < ours_time
                 ours_time = elapsed
                 telemetry = attempt_telemetry
                 ours = basis
                 info = attempt_info
+                live_growth = attempt_live
+                rss_growth = attempt_rss
             end
 
             # Only repeat while it is cheap to do so. On an expensive instance
@@ -166,6 +179,8 @@ function measure(bundle; max_iterations = 120, aggressive = false,
                            log2_big(BigInt(bundle.planted_norm2)) / 2,
             found_planted = (bundle.planted_norm2 === nothing || ours_best === nothing) ?
                             missing : ours_best <= BigInt(bundle.planted_norm2),
+            live_growth = live_growth,
+            rss_growth = rss_growth,
             iterations = info === nothing ? -1 : info.iterations,
             goal_met = info === nothing ? false : info.goal_met,
             info = info,
@@ -241,6 +256,15 @@ function print_time_breakdown(r)
         @printf("      finalise = lift %5.1f%%  apply %5.1f%%  final-SR %5.1f%%\n",
                 100 * t.time_collect / total, 100 * t.time_apply / total,
                 100 * t.time_final_sr / total)
+    end
+    # Live bytes are what the collector still considers reachable; resident is
+    # what the process actually holds. A large gap between them is collection
+    # lag rather than a genuine memory requirement, and is worth knowing about
+    # before concluding that an instance is too big to run.
+    if r.rss_growth > 64 * 1024 * 1024 || r.live_growth > 64 * 1024 * 1024
+        @printf("    memory: live %+.0f MB   resident %+.0f MB   peak %.0f MB\n",
+                r.live_growth / 1024^2, r.rss_growth / 1024^2,
+                r.telemetry.peak_live / 1024^2)
     end
     if t.capped > 0
         @printf("    WARNING: %d of %d levels stopped at the iteration cap, not the goal\n",

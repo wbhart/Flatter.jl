@@ -65,6 +65,8 @@ reasoning is in the code comments and docstrings.
 
 * **In-place MPFR/MPZ mutate the OBJECT, not the matrix slot.** Only safe on values the callee owns. `R` inside the fused factorisation qualifies, because it is filled entry by entry with `_to_float`. Two tests guard this: "the caller's matrices are never mutated in place" and "copy of a BigFloat matrix is shallow".
 
+* **`Matrix{BigInt}(undef, n, n)` holds undefined REFERENCES, not zeros.** `BigInt` and `BigFloat` are mutable, so an `undef` matrix of them has genuinely unassigned slots and any generic iteration over it throws `UndefRefError`. A matrix can legitimately sit in that state mid-computation — the driver's output transform `U` is only filled at the end. Guard with `isassigned` when walking a matrix that might not be fully populated.
+
 * **Duplicating a `BigFloat` is harder than it looks, and there are two traps.** `copy` and `Matrix{T}(A)` are SHALLOW — they duplicate the array of references, so every entry is still the same object. And `BigFloat(x)` on a `BigFloat` returns **x itself** when the precision already matches, so the obvious `[BigFloat(x) for x in A]` is also a no-op. The reliable form is `_mpfr_set!(BigFloat(), x)`: allocate, then write. `fill!(v, zero(S))` is worse still — one shared object in every slot. Both traps are pinned by the "duplicating a BigFloat matrix" testset; between them they produced failures that looked numerical but were one code path reading another's output.
 
 * **`at_precision` allocates and writes rather than constructing.** Its whole purpose is an independent copy, and `BigFloat(x; precision = p)` short-circuits to `x` when `p` already matches. Same reasoning applies anywhere else that needs a genuine duplicate.
@@ -127,7 +129,27 @@ reasoning is in the code comments and docstrings.
 
 * **Benchmark timings vary by up to 2x** with GC on BigInt work. `lattices/benchmark.jl` repeats cheap runs and keeps the fastest; the Strassen sweep in `lattices/profile_lift.jl` collects before each sample and prints the noise floor. Treat any single-run difference smaller than that floor as meaningless.
 
-* **Memory can be the binding constraint at large dimension.** The transform stack keeps this to O(log k) live matrices rather than k, and folding at push time avoids ever holding the raw and lifted copies together. These are the widest matrices in the run — conjugation shifts their entries up by the compression amounts — so if memory becomes a problem again this is still the first place to look.
+* **Memory is the binding constraint at large dimension, and it is live data, not collection lag.** `--heap-size-hint` made no difference at dim 260, and measured live bytes grow steeply with dimension — the collector cannot free what is reachable. The driver still asks for `GC.gc(false)` per iteration at `gc_dimension` (200) since arbitrary-precision limbs are malloc'd and freed by finalizers, but expect little from it. `telemetry.peak_live` and the benchmark's memory line are how to tell the two apart.
+
+* **`Sys.maxrss` deltas are misleading across repeated runs.** It is a high-water mark for the whole process, so a later, larger run can report a delta of zero simply because an earlier one already raised the mark. Use `gc_live_bytes` for comparisons.
+
+* **O(log k) partial products is not O(log k) bytes.** Entry widths add across a product, so a partial product of 2^j factors is ~2^j times as wide as one factor; summing over the balanced stack gives Theta(k) bits — the same order as keeping every factor. The balanced tree buys multiplication speed, not memory.
+
+* **`low_memory` (bounded accumulation) measures WORSE and is off by default.** It folds every factor into one running product, which sounded like it should hold less. Measured at dim 64: 3581 MB peak against 206 MB for the balanced tree, 17x the wrong way — an ever-growing accumulator is copied at its full width on every merge, and that transient dwarfs holding several smaller partial products. The option survives for experimenting only.
+
+* **Finalizable objects survive one collection.** `BigInt` and `BigFloat` both carry finalizers; the first GC pass queues the finalizer, the second releases the limbs. So a single `GC.gc()` leaves them counted as live, and an incremental `GC.gc(false)` cannot reclaim them at all. Measure retained memory after **two** full passes, and use `gc_full` if periodic collection is to have any chance of helping.
+
+* **Memory steps with recursion depth, it does not grow smoothly.** Each extra level adds another level's working state to the live set, so the curve jumps whenever depth increases (q-ary: depth 2 at dim 128, depth 3 at dim 160, levels 559 -> 6865). Fitting a growth exponent across a depth transition badly overstates the trend. Fit within a depth, and expect any projection past the next transition to be low.
+
+* **Measure memory as `Sys.maxrss` in a fresh process. Nothing else here is trustworthy.** `gc_live_bytes` is absolute (so earlier runs in the same session inflate it) AND over-reports for this workload: Julia's malloc'd-byte counter drifts upward under heavy GMP/MPFR reallocation, to the point where it exceeded the process's actual resident size. `Sys.maxrss` is a process-wide high-water mark, so within one session a later run can report zero growth because an earlier one already raised it. `lattices/memory_scaling.jl` spawns one process per measurement for exactly these reasons.
+
+* **Measured resident memory, q-ary family, isolated processes** (includes ~250 MB of Julia runtime): dim 64 → 512 MB, dim 96 → 1126 MB, dim 128 → 1590 MB, dim 160 → 3648 MB. Roughly `dim^3.7` across the last pair, but that pair straddles a depth increase, so treat it as an upper bound on the trend.
+
+* **Periodic collection is nearly free and worth about threefold in memory.** Swept at dim 128: runtime is flat within noise across every interval from 1 to never, while the footprint runs 330 MB (every other iteration) to 1130 MB (never). Defaults are `gc_interval = 2` above `gc_dimension = 32`. An earlier reading that collection cost half again the runtime came from comparing separate runs rather than a controlled sweep — always sweep within one session.
+
+* **`malloc_trim` does nothing here.** Measured saving across dim 64-160: 0%. Whatever holds the memory is not free pages the C allocator can return.
+
+* **On WSL, the memory ceiling is not the machine's.** WSL2 defaults to half of Windows RAM and does not readily return freed pages, so an OOM there can be a VM limit rather than an algorithmic one. `.wslconfig` sets it.
 
 * **The benchmark generators are shape approximations, not standard instances.** The q-ary modulus in particular defaults to `2^(2n)+1`, making `log2 det` quadratic in dimension — chosen to stress compression, not to match any published convention. Fine for tracking this package against itself and against fplll on identical input; not comparable with the literature. Use fplll's `latticegen` or the Darmstadt challenges for that.
 

@@ -267,6 +267,36 @@ end
 end
 
 
+
+# B[k, column] -= multiplier * B[k, row], over a range of rows.
+#
+# The obvious `B[k, column] -= multiplier * B[k, row]` allocates twice per
+# element: once for the product and once for the difference. Only the second is
+# unavoidable -- the slot must be rebound rather than mutated, because `B` and
+# `U` belong to the caller and may share entry objects with a copy the caller
+# still holds. Computing the product into a scratch value removes the other,
+# halving the allocations in what is the busiest loop of the factorisation.
+@inline function _fused_integer_update!(M::AbstractMatrix{T}, column::Int, row::Int,
+                                        rows::UnitRange{Int}, multiplier::T,
+                                        scratch::T) where {T<:Integer}
+    @inbounds for k in rows
+        M[k, column] -= multiplier * M[k, row]
+    end
+    return nothing
+end
+
+@inline function _fused_integer_update!(M::AbstractMatrix{BigInt}, column::Int,
+                                        row::Int, rows::UnitRange{Int},
+                                        multiplier::BigInt, scratch::BigInt)
+    @inbounds for k in rows
+        Base.GMP.MPZ.mul!(scratch, multiplier, M[k, row])
+        result = BigInt()
+        Base.GMP.MPZ.sub!(result, M[k, column], scratch)
+        M[k, column] = result
+    end
+    return nothing
+end
+
 # R[1:row, column] -= quotient * R[1:row, row]
 @inline function _fused_scale_subtract!(R::AbstractMatrix{S}, column::Int, row::Int,
                                         quotient::S, ws::Vector{S}) where {S<:AbstractFloat}
@@ -294,6 +324,7 @@ function _fused_reduce_column!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
                                ws::Vector{S}) where {T<:Integer, S<:AbstractFloat}
     applied = false
     largest = typemin(Int)
+    integer_scratch = zero(T)
 
     @inbounds for row in (column - 1):-1:1
         diagonal = R[row, row]
@@ -312,12 +343,8 @@ function _fused_reduce_column!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
         # Exact updates. B is dense so the whole column moves; U and R are
         # upper triangular in this region, so rows above `row` are structurally
         # zero and need not be touched.
-        for k in 1:m
-            B[k, column] -= multiplier * B[k, row]
-        end
-        for k in 1:row
-            U[k, column] -= multiplier * U[k, row]
-        end
+        _fused_integer_update!(B, column, row, 1:m, multiplier, integer_scratch)
+        _fused_integer_update!(U, column, row, 1:row, multiplier, integer_scratch)
         # R is allocated and owned by this file, so its entries may be mutated
         # in place. B and U belong to the caller and may share objects with a
         # copy the caller still holds, so they are updated by assignment.

@@ -44,6 +44,36 @@ const DEFAULT_REDUCTION_MAX_ITERATIONS = 120
 # rather than progress.
 const REDUCTION_STAGNATION_TOLERANCE = 1e-6
 
+# At and above this dimension the reduction loop asks for an incremental
+# collection once per iteration.
+#
+# Measured on the q-ary family at dimension 128, sweeping the interval: runtime
+# is flat within noise across every setting, while the footprint runs from
+# ~330 MB collecting every other iteration to ~1130 MB never collecting. So
+# collection is close to free here and worth roughly three times in memory.
+#
+# `BigInt` and `BigFloat` limbs are malloc'd through Julia's counted allocators
+# and released by finalizers, and the collector's heuristics for malloc'd bytes
+# are far less eager than for pooled objects. A reduction at high dimension
+# discards an n-by-n arbitrary-precision matrix every iteration, so resident
+# memory can climb well past the live set purely through lag. `GC.gc(false)` is
+# a young-generation pass, which is where that garbage is, and is much cheaper
+# than a full collection.
+#
+# Set `gc_dimension = typemax(Int)` to switch this off.
+const REDUCTION_GC_DIMENSION = 32
+
+# Iterations between collections, once the dimension threshold is met.
+const REDUCTION_GC_INTERVAL = 2
+
+# Bounded accumulation is NOT enabled automatically. It was introduced to cut
+# the live set and measures markedly worse than the balanced tree -- an
+# ever-growing accumulator is repeatedly copied at its full width, and the
+# transient cost of that outweighs holding several smaller partial products.
+# The option remains for experimenting; the constant records that the default
+# is off.
+const REDUCTION_LOW_MEMORY_DIMENSION = typemax(Int)
+
 # ---------------------------------------------------------------------------
 # Logarithms of magnitudes
 # ---------------------------------------------------------------------------
@@ -210,6 +240,8 @@ mutable struct ReductionTelemetry
     iterations::Int
     capped::Int
     stagnated::Int
+    peak_live::Int
+    peak_data::Int
     base_cases::Int
     lagrange_calls::Int
     schoenhage_calls::Int
@@ -226,7 +258,7 @@ mutable struct ReductionTelemetry
     time_final_sr::Float64
 end
 
-ReductionTelemetry() = ReductionTelemetry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+ReductionTelemetry() = ReductionTelemetry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 function Base.show(io::IO, t::ReductionTelemetry)
     println(io, "ReductionTelemetry:")
@@ -235,6 +267,10 @@ function Base.show(io::IO, t::ReductionTelemetry)
     println(io, "  window reductions        : ", t.iterations)
     println(io, "  levels stopped by the cap: ", t.capped, " of ", t.levels)
     println(io, "  levels stopped stagnating: ", t.stagnated, " of ", t.levels)
+    println(io, "  peak live bytes seen     : ",
+                round(t.peak_live / 1024^2; digits = 1), " MB")
+    println(io, "  peak data held (measured): ",
+                round(t.peak_data / 1024^2; digits = 1), " MB")
     println(io, "  base cases               : ", t.base_cases,
                 " (", t.lagrange_calls, " Lagrange, ", t.schoenhage_calls,
                 " Schoenhage, ", t.fplll_calls, " fplll)")
@@ -362,6 +398,75 @@ function _compress_factor(R::AbstractMatrix{S}, prof::Vector{Float64},
     return compressed, applied, precision
 end
 
+"""
+    release_free_memory() -> Bool
+
+Ask the C allocator to return free heap pages to the operating system.
+
+Arbitrary-precision arithmetic allocates a limb block per value, a few dozen to
+a few hundred bytes, and frees it almost immediately. glibc serves blocks that
+size from the main heap and keeps them on free lists rather than returning
+them, so resident memory tracks the high-water mark of the heap rather than
+what is live -- measured at 300 times the actual data held. Neither garbage
+collection nor a Julia heap-size hint touches this, because Julia has already
+freed the memory; the allocator is holding it.
+
+`malloc_trim` releases the free pages it can. Returns whether anything was
+released, and is a no-op off glibc.
+"""
+function release_free_memory()
+    @static if Sys.islinux()
+        return ccall(:malloc_trim, Cint, (Csize_t,), 0) != 0
+    else
+        return false
+    end
+end
+
+"""
+    held_bytes(x) -> Int
+    held_bytes(A) -> Int
+
+Actual memory held by an arbitrary-precision value, or by every entry of an
+array of them.
+
+For `BigInt`, `x.alloc` is the number of 64-bit limbs GMP has reserved, which is
+what is really held -- `x.size`, the number in use, can be much smaller after a
+value shrinks. For `BigFloat` the significand is fixed at its precision. The
+constant covers the Julia object header, the struct, and a typical malloc block
+header.
+
+Summing this over the live structures gives the working set of the DATA, which
+compared against the process's resident size says how much of the footprint is
+data and how much is garbage awaiting collection, or allocator fragmentation.
+"""
+held_bytes(x::BigInt) = 32 + 16 + 8 * abs(Int(x.alloc))
+
+# A BigFloat's significand is allocated at its precision and never resized, so
+# the limb count follows directly from `precision`.
+held_bytes(x::BigFloat) = 32 + 16 + 8 * cld(precision(x), 64)
+
+# Total over every integer type and container, so that instrumenting a
+# reduction can never be what breaks it. Fixed-width integers are stored
+# inline, so their cost is just the element width.
+held_bytes(x::Integer) = sizeof(x)
+held_bytes(x::AbstractFloat) = sizeof(x)
+held_bytes(::Nothing) = 0
+
+# Unassigned slots must be skipped, not indexed. `Matrix{BigInt}(undef, ...)`
+# holds undefined REFERENCES, since BigInt is a mutable type, and a matrix can
+# legitimately be in that state while a computation is in progress -- the
+# transform `U` is only filled once the reduction finishes. Iterating such a
+# matrix throws `UndefRefError`.
+function held_bytes(A::AbstractArray)
+    total = 0
+    for index in eachindex(A)
+        isassigned(A, index) || continue
+        total += held_bytes(A[index])
+    end
+    return total
+end
+held_bytes(items::Vector{<:AbstractArray}) = sum(held_bytes, items; init = 0)
+
 # ---------------------------------------------------------------------------
 # Lifting the accumulated transforms
 # ---------------------------------------------------------------------------
@@ -413,14 +518,45 @@ end
 # balanced: it performs exactly the pairings a product tree over all k factors
 # would, without needing all k at once.
 
+# The stack has two modes, and the choice is a genuine trade.
+#
+# Balanced (the default) merges a pushed factor with the top for as long as the
+# top represents the same number of original factors, performing exactly the
+# pairings a product tree over all k factors would. GMP is fastest on operands
+# of similar width, so this is the quicker option.
+#
+# Bounded folds every factor into a single running product. That is the slower
+# multiplication pattern -- an ever-growing accumulator against a fixed-width
+# factor -- but it holds ONE matrix instead of O(log k) partial products.
+#
+# The distinction matters more than the matrix count suggests. Entry widths add
+# across a product, so a partial product of 2^j factors is about 2^j times as
+# wide as one factor; summing over the balanced stack gives Theta(k) bits, the
+# same order as keeping every factor. The bounded accumulator instead holds a
+# single matrix whose entries are bounded by the FINAL transform, which for a
+# lattice reduction is governed by the basis geometry rather than by k.
+
 mutable struct _TransformStack{T}
     factors::Vector{Matrix{T}}   # partial products, oldest first
     widths::Vector{Int}          # how many original factors each represents
+    bounded::Bool
 end
 
-_TransformStack{T}() where {T} = _TransformStack{T}(Matrix{T}[], Int[])
+_TransformStack{T}(bounded::Bool = false) where {T} =
+    _TransformStack{T}(Matrix{T}[], Int[], bounded)
 
 function _push_transform!(stack::_TransformStack{T}, factor::Matrix{T}) where {T}
+    if stack.bounded
+        if isempty(stack.factors)
+            push!(stack.factors, factor)
+            push!(stack.widths, 1)
+        else
+            stack.factors[1] = _reduction_mul(stack.factors[1], factor)
+            stack.widths[1] += 1
+        end
+        return stack
+    end
+
     width = 1
     while !isempty(stack.widths) && stack.widths[end] == width
         factor = _reduction_mul(pop!(stack.factors), factor)
@@ -551,6 +687,30 @@ Keyword arguments:
                         basis is still valid, just less reduced.
   * `aggressive`     -- passed to [`lll_precision`](@ref); halves the working
                         precision, faster but likelier to stall.
+  * `low_memory`     -- fold accumulated transforms into a single running
+                        product instead of a balanced tree of partial products.
+                        Slower multiplication, but the live set is one matrix
+                        rather than Theta(k) bits' worth. `nothing` chooses it
+                        automatically at dimension $(REDUCTION_LOW_MEMORY_DIMENSION)
+                        and above.
+  * `trim_memory`    -- after each periodic collection, ask the C allocator to
+                        return free pages to the operating system. Resident
+                        memory for this workload is dominated by heap the
+                        allocator is holding rather than by live data, so this
+                        is the setting that affects it. Linux only; harmless
+                        elsewhere.
+  * `gc_full`        -- make the periodic collection two full passes rather
+                        than one incremental one. Arbitrary-precision limbs are
+                        released by finalizers, and a finalizable object
+                        survives one cycle, so only this form can reclaim them.
+                        Expensive; measure before enabling.
+  * `gc_dimension`   -- at or above this dimension, collect periodically.
+                        `typemax(Int)` disables it.
+  * `gc_interval`    -- iterations between collections. Measured at dimension
+                        128 the runtime is flat across every setting while the
+                        footprint varies threefold, so a small value is close to
+                        free; `gc_tradeoff()` in the scaling probe re-measures
+                        this.
   * `base_cutoff`    -- dimensions at or below this go straight to
                         [`fplll_reduce`](@ref) instead of being recursed on.
                         Default `$(DEFAULT_BASE_CUTOFF)`, matching flatter. The
@@ -583,6 +743,12 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                          aggressive::Bool = false,
                          schoenhage_threshold::Integer = DEFAULT_SCHOENHAGE_THRESHOLD,
                          base_cutoff::Integer = DEFAULT_BASE_CUTOFF,
+                         gc_dimension::Integer = REDUCTION_GC_DIMENSION,
+                         gc_interval::Integer = REDUCTION_GC_INTERVAL,
+                         low_memory::Union{Nothing, Bool} = nothing,
+                         gc_full::Bool = false,
+                         trim_memory::Bool = true,
+                         _held_above::Int = 0,
                          telemetry::Union{Nothing, ReductionTelemetry} = nothing,
                          _depth::Integer = 0) where {T<:Integer}
     n = _check_reduction_input(B)
@@ -644,7 +810,9 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     profile = [_log2_abs(B[i, i]) for i in 1:n]
     offsets = zeros(Float64, n)
 
-    stack = _TransformStack{T}()
+    bounded = low_memory === nothing ? n >= REDUCTION_LOW_MEMORY_DIMENSION :
+                                       low_memory
+    stack = _TransformStack{T}(bounded)
 
     compression_started = _tick()
     working, applied, precision = _compress_integer(B, profile, offsets, n, aggressive)
@@ -692,6 +860,10 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
 
         # Reduce the window recursively. A window of one column has nothing to
         # do, but the iteration still counts so the schedule advances.
+        held_above = telemetry === nothing ? 0 :
+                     _held_above + held_bytes(working) + held_bytes(B) +
+                     held_bytes(original) + held_bytes(stack.factors)
+
         sub_transform = nothing
         if width >= 2
             sub_basis = Matrix{T}(working[window, window])
@@ -703,6 +875,12 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                             aggressive = aggressive,
                             schoenhage_threshold = schoenhage_threshold,
                             base_cutoff = base_cutoff,
+                            gc_dimension = gc_dimension,
+                            gc_interval = gc_interval,
+                            low_memory = low_memory,
+                            gc_full = gc_full,
+                            trim_memory = trim_memory,
+                            _held_above = held_above,
                             telemetry = telemetry,
                             _depth = Int(_depth) + 1)
             telemetry === nothing || (telemetry.time_recursion += _tock(recursion_started))
@@ -740,6 +918,20 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         for i in 1:n
             profile[i] = _log2_abs(factor[i, i])
         end
+        # Sample here rather than at the end of the iteration: this is the
+        # point where the most is live, with the previous working basis, the
+        # candidate, its floating point factor and the size reduction all still
+        # in scope alongside the transform stack. `_held_above` carries what the
+        # levels above this one hold, so the figure is the whole live path
+        # rather than one level's share. `U` is excluded because the caller
+        # supplies it with `undef` slots that are not filled until the end.
+        if telemetry !== nothing
+            here = held_bytes(working) + held_bytes(B) + held_bytes(original) +
+                   held_bytes(candidate) + held_bytes(size_reduction) +
+                   held_bytes(factor) + held_bytes(stack.factors)
+            telemetry.peak_data = max(telemetry.peak_data, _held_above + here)
+        end
+
         compression_started = _tick()
         working, applied, precision =
             _compress_factor(factor, profile, offsets, n, T, aggressive)
@@ -748,6 +940,32 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
 
         iteration += 1
         telemetry === nothing || (telemetry.iterations += 1)
+
+        # Everything from this iteration -- the candidate basis, its R factor,
+        # the fused factorisation's temporaries -- is now unreachable.
+        if n >= gc_dimension && iszero(mod(iteration, max(gc_interval, 1)))
+            # Arbitrary-precision values carry finalizers, and a finalizable
+            # object survives one collection: the first queues its finalizer,
+            # the second releases the limbs. An incremental pass therefore
+            # cannot reclaim them at all, so `gc_full` runs two full passes.
+            if gc_full
+                GC.gc(); GC.gc()
+            else
+                GC.gc(false)
+            end
+            # Julia freeing a limb block does not return it to the operating
+            # system; the C allocator keeps it. This is what actually reduces
+            # resident memory for this workload.
+            trim_memory && release_free_memory()
+        end
+
+        # `gc_live_bytes` reports the figure from the most recent collection,
+        # so sampling it each iteration tracks a high-water mark rather than the
+        # instantaneous set. It is ABSOLUTE, not relative to the start of this
+        # reduction, so a caller comparing runs must subtract its own baseline --
+        # or better, measure each run in a fresh process.
+        telemetry === nothing ||
+            (telemetry.peak_live = max(telemetry.peak_live, Base.gc_live_bytes()))
     end
 
     # --- lift, apply, and size reduce once at true scale ---------------------

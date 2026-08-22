@@ -471,35 +471,6 @@ held_bytes(items::Vector{<:AbstractArray}) = sum(held_bytes, items; init = 0)
 # Lifting the accumulated transforms
 # ---------------------------------------------------------------------------
 
-"""
-    _product_tree(factors) -> Matrix
-
-The ordered product `factors[1] * factors[2] * ... * factors[end]`, combined
-pairwise rather than accumulated left to right.
-
-Both orders give the same matrix — pairing adjacent factors preserves the
-order — but not the same cost. Entry bit-lengths add across a product, so
-accumulating sequentially multiplies an ever-growing result against a
-fixed-size factor, which is the worst case for GMP's sub-quadratic
-multiplication: it is fastest on operands of similar size. A balanced tree
-keeps the operands comparable at every level.
-"""
-function _product_tree(factors::Vector{Matrix{T}}) where {T}
-    isempty(factors) && throw(ArgumentError("no factors to multiply"))
-    current = factors
-    while length(current) > 1
-        combined = Vector{Matrix{T}}(undef, cld(length(current), 2))
-        index = 1
-        for position in 1:2:(length(current) - 1)
-            combined[index] = _reduction_mul(current[position], current[position + 1])
-            index += 1
-        end
-        isodd(length(current)) && (combined[index] = current[end])
-        current = combined
-    end
-    return current[1]
-end
-
 # flatter's `collect_U`. Each iteration's transform is computed against a
 # COMPRESSED basis, so before it can be composed with the others it has to be
 # conjugated by the scaling that was in force at the time -- the D^-1 U D of
@@ -576,13 +547,39 @@ function _lift_transform(U::AbstractMatrix{T}, shifts::Vector{Int}) where {T<:In
     return conjugated isa Matrix{T} ? conjugated : T.(conjugated)
 end
 
+"""
+    _drain_transform(stack, n) -> Matrix
+
+Combine the partial products left on the stack into the final transform.
+
+Folds by popping rather than by building each level of a product tree, because
+this is where the matrices are at their widest and the peak here sets the
+footprint of the whole run. A tree holds an entire level while constructing the
+next, roughly doubling the live set at the worst possible moment; popping holds
+two operands and a result, and releases each factor as it is consumed.
+
+The tree is still the right structure while the stack is being built, where the
+factors are narrow and the balanced pairings are what keep the multiplications
+cheap. Only the final combination trades that for the smaller peak, and by then
+there are only O(log k) factors left, so the difference in multiplication cost
+is negligible.
+"""
 function _drain_transform(stack::_TransformStack{T}, n::Int) where {T}
-    if isempty(stack.factors)
+    factors = stack.factors
+    if isempty(factors)
         result = Matrix{T}(undef, n, n)
         _set_identity!(result)
         return result
     end
-    return _product_tree(stack.factors)
+
+    # Popping from the back keeps the order: the stack holds the factors oldest
+    # first, so this builds factors[1] * (factors[2] * (... * factors[end])).
+    result = pop!(factors)
+    empty!(stack.widths)
+    while !isempty(factors)
+        result = _reduction_mul(pop!(factors), result)
+    end
+    return result
 end
 
 # One place to choose the matrix product used throughout the driver. The
@@ -984,9 +981,16 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     apply_started = _tick()
     reduced = _reduction_mul(original, transform)
     telemetry === nothing || (telemetry.time_apply += _tock(apply_started))
+
+    # Release the originals before the next product: this phase holds the widest
+    # matrices of the run, and `original` and `reduced` are both finished with
+    # once the result has been copied out.
+    original = Matrix{T}(undef, 0, 0)
     for j in 1:n, i in 1:n
         B[i, j] = reduced[i, j]
     end
+    reduced = Matrix{T}(undef, 0, 0)
+    n >= gc_dimension && GC.gc(false)
 
     # The profile was tracked in compressed coordinates throughout; restore it.
     for i in 1:n

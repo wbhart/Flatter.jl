@@ -290,19 +290,6 @@ end
         end
     end
 
-    # The product tree reorders the associativity of a matrix product. Matrix
-    # multiplication is associative so this is safe, but the ORDER of factors
-    # must be preserved, and a pairing bug would silently transpose two of them.
-    @testset "product tree preserves factor order" begin
-        rng = MersenneTwister(0x9204)
-        for count in 1:9, n in (3, 5)
-            factors = [BigInt[rand(rng, -9:9) for _ in 1:n, _ in 1:n] for _ in 1:count]
-            expected = reduce(*, factors)
-            @test Flatter._product_tree(copy(factors)) == expected
-        end
-        @test_throws ArgumentError Flatter._product_tree(Matrix{BigInt}[])
-    end
-
     # The transform stack folds factors together as they arrive rather than
     # collecting them all. It must produce exactly the ordered product, and it
     # must leave only O(log k) partial products live -- that bound is the whole
@@ -319,6 +306,10 @@ end
             end
 
             @test Flatter._drain_transform(stack, n) == reduce(*, factors)
+            # Draining consumes the stack: it releases each factor as it folds
+            # it in, which is the point of doing it that way.
+            @test isempty(stack.factors)
+            @test isempty(stack.widths)
         end
 
         @testset "holds O(log k) partial products" begin

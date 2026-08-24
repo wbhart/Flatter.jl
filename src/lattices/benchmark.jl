@@ -110,7 +110,7 @@ function measure(bundle; max_iterations = 120, aggressive = false,
             live_before = Base.gc_live_bytes()
             rss_before = Sys.maxrss()
             started = time_ns()
-            basis, _, attempt_info = Flatter.lattice_reduce(
+            basis, _, attempt_info = Flatter.reduce_basis(
                 B; max_iterations = max_iterations, aggressive = aggressive,
                 low_memory = low_memory, gc_dimension = gc_dimension,
                 gc_full = gc_full,
@@ -170,15 +170,17 @@ function measure(bundle; max_iterations = 120, aggressive = false,
             theirs_time = theirs_time,
             ours_norm_log2 = ours_best === nothing ? NaN : log2_big(ours_best) / 2,
             theirs_norm_log2 = theirs_best === nothing ? NaN : log2_big(theirs_best) / 2,
-            ours_rhf = ours_best === nothing ? NaN :
+            ours_rhf = (ours_best === nothing || isnan(log2_det)) ? NaN :
                        root_hermite_factor(ours_best, log2_det, n),
-            theirs_rhf = theirs_best === nothing ? NaN :
+            theirs_rhf = (theirs_best === nothing || isnan(log2_det)) ? NaN :
                          root_hermite_factor(theirs_best, log2_det, n),
-            gaussian_log2 = gaussian_heuristic_log2(log2_det, n),
+            gaussian_log2 = isnan(log2_det) ? NaN :
+                            gaussian_heuristic_log2(log2_det, n),
             planted_log2 = bundle.planted_norm2 === nothing ? NaN :
                            log2_big(BigInt(bundle.planted_norm2)) / 2,
             found_planted = (bundle.planted_norm2 === nothing || ours_best === nothing) ?
                             missing : ours_best <= BigInt(bundle.planted_norm2),
+            path = info === nothing ? :none : get(info, :path, :triangular),
             live_growth = live_growth,
             rss_growth = rss_growth,
             iterations = info === nothing ? -1 : info.iterations,
@@ -194,9 +196,9 @@ end
 # --------------------------------------------------------------------------
 
 function print_header()
-    @printf("%-18s %4s %10s %10s %9s %9s %8s %6s %5s %4s\n",
+    @printf("%-18s %4s %10s %10s %9s %9s %8s %6s %5s %4s %5s\n",
             "family", "dim", "ours(ms)", "fplll(ms)", "log2|b1|", "fplll",
-            "vs GH", "ratio", "iter", "stop")
+            "vs GH", "ratio", "iter", "stop", "path")
     println(repeat("-", 96))
 end
 
@@ -212,11 +214,13 @@ function print_row(r)
              r.info.stopped === :goal ? "goal" :
              r.info.stopped === :stagnated ? "stag" :
              r.info.stopped === :base_case ? "base" : "CAP"
-    @printf("%-18s %4d %10.2f %10.2f %9.2f %9.2f %8.2f %6.0fx %5d %4s\n",
+    marker = r.found_planted === missing ? "" :
+             r.found_planted ? "  planted vector FOUND" : "  planted vector missed"
+    @printf("%-18s %4d %10.2f %10.2f %9.2f %9.2f %8.2f %6.0fx %5d %4s %5s%s\n",
             r.name, r.dimension, 1000 * r.ours_time, 1000 * r.theirs_time,
             r.ours_norm_log2, r.theirs_norm_log2,
             r.ours_norm_log2 - r.gaussian_log2, ratio,
-            r.iterations, reason)
+            r.iterations, reason, string(r.path), marker)
 end
 
 """
@@ -262,9 +266,12 @@ function print_time_breakdown(r)
     # lag rather than a genuine memory requirement, and is worth knowing about
     # before concluding that an instance is too big to run.
     if r.rss_growth > 64 * 1024 * 1024 || r.live_growth > 64 * 1024 * 1024
-        @printf("    memory: live %+.0f MB   resident %+.0f MB   peak %.0f MB\n",
-                r.live_growth / 1024^2, r.rss_growth / 1024^2,
-                r.telemetry.peak_live / 1024^2)
+        # Growth figures only. `telemetry.peak_live` is an absolute reading, so
+        # in a shared session it reports whatever earlier runs left live and
+        # says nothing about this one; `lattices/memory_scaling.jl` measures in
+        # a fresh process for that reason.
+        @printf("    memory: live %+.0f MB   resident %+.0f MB\n",
+                r.live_growth / 1024^2, r.rss_growth / 1024^2)
     end
     if t.capped > 0
         @printf("    WARNING: %d of %d levels stopped at the iteration cap, not the goal\n",
@@ -281,16 +288,21 @@ end
 
 Sweep one lattice family over a list of size parameters.
 
-`sizes` is the generator's size parameter, which is not always the dimension:
-the knapsack family produces `n+1` columns and the q-ary family `2n`.
+`sizes` defaults to the range the family declares for itself, which differs
+between families because they do not cost the same at a given dimension. Pass a
+list to override, mostly useful for a quick pass at small dimensions.
+
+The size parameter is not always the dimension: knapsack produces `n+1` columns,
+q-ary `2n`, and relation `n+1` columns in `n+2` rows.
 """
-function run_family(name::AbstractString, sizes; seed::Integer = 1,
+function run_family(name::AbstractString, sizes = nothing; seed::Integer = 1,
                     breakdown::Bool = true, time_budget::Real = 60.0, kwargs...)
     families = Flatter.lattice_families()
     index = findfirst(f -> f.name == name, families)
     index === nothing && error("unknown family $name; have " *
                                join((f.name for f in families), ", "))
     family = families[index]
+    sizes = sizes === nothing ? family.sizes : sizes
 
     println("\n=== $(family.name) ===")
     print_header()
@@ -325,12 +337,14 @@ end
 """
     run_all(; sizes=..., seed=1, kwargs...) -> Vector
 
-The default sweep: every family at a range of sizes, small first so a stall
-shows up before much time has been spent.
+Every family over its own declared range, smallest first so a stall shows up
+before much time has been spent. Pass `sizes` to override every family at once.
 """
-function run_all(; sizes = [8, 16, 32, 48], seed::Integer = 1, kwargs...)
+function run_all(; sizes = nothing, seed::Integer = 1, kwargs...)
     results = []
     for family in Flatter.lattice_families()
+        # Each family carries the range that suits it; `sizes` overrides them
+        # all, which is mostly useful for a quick pass at small dimensions.
         append!(results, run_family(family.name, sizes; seed = seed, kwargs...))
     end
 

@@ -47,10 +47,11 @@ const REDUCTION_STAGNATION_TOLERANCE = 1e-6
 # At and above this dimension the reduction loop asks for an incremental
 # collection once per iteration.
 #
-# Measured on the q-ary family at dimension 128, sweeping the interval: runtime
-# is flat within noise across every setting, while the footprint runs from
-# ~330 MB collecting every other iteration to ~1130 MB never collecting. So
-# collection is close to free here and worth roughly three times in memory.
+# Collection is worth roughly threefold in memory and costs a little time, so
+# it is only worth paying where the memory matters. Measured excess with no
+# collection at all: 44 MB at dimension 64, 580 MB at 96, 1141 MB at 128,
+# 3092 MB at 160. Below about 128 there is nothing to manage, and collecting
+# anyway is pure cost -- and a source of run-to-run variance.
 #
 # `BigInt` and `BigFloat` limbs are malloc'd through Julia's counted allocators
 # and released by finalizers, and the collector's heuristics for malloc'd bytes
@@ -61,18 +62,18 @@ const REDUCTION_STAGNATION_TOLERANCE = 1e-6
 # than a full collection.
 #
 # Set `gc_dimension = typemax(Int)` to switch this off.
-const REDUCTION_GC_DIMENSION = 32
+const REDUCTION_GC_DIMENSION = 128
 
 # Iterations between collections, once the dimension threshold is met.
 const REDUCTION_GC_INTERVAL = 2
 
-# Bounded accumulation is NOT enabled automatically. It was introduced to cut
-# the live set and measures markedly worse than the balanced tree -- an
-# ever-growing accumulator is repeatedly copied at its full width, and the
-# transient cost of that outweighs holding several smaller partial products.
-# The option remains for experimenting; the constant records that the default
-# is off.
-const REDUCTION_LOW_MEMORY_DIMENSION = typemax(Int)
+# Bounded accumulation holds one running product rather than O(log k) partial
+# products. It multiplies less efficiently -- an ever-growing accumulator
+# against a fixed-width factor is the wrong shape for GMP -- so it is not worth
+# paying for until the footprint is the binding constraint. Observed: the
+# default settings reach about dimension 260, and bounded accumulation extends
+# that to about 300.
+const REDUCTION_LOW_MEMORY_DIMENSION = 256
 
 # ---------------------------------------------------------------------------
 # Logarithms of magnitudes
@@ -686,16 +687,16 @@ Keyword arguments:
                         precision, faster but likelier to stall.
   * `low_memory`     -- fold accumulated transforms into a single running
                         product instead of a balanced tree of partial products.
-                        Slower multiplication, but the live set is one matrix
-                        rather than Theta(k) bits' worth. `nothing` chooses it
-                        automatically at dimension $(REDUCTION_LOW_MEMORY_DIMENSION)
-                        and above.
+                        Multiplies less efficiently, but holds one matrix rather
+                        than several partial products at their widest. `nothing`
+                        chooses it automatically at dimension
+                        $(REDUCTION_LOW_MEMORY_DIMENSION) and above, which is
+                        roughly where the footprint becomes the binding
+                        constraint rather than the runtime.
   * `trim_memory`    -- after each periodic collection, ask the C allocator to
-                        return free pages to the operating system. Resident
-                        memory for this workload is dominated by heap the
-                        allocator is holding rather than by live data, so this
-                        is the setting that affects it. Linux only; harmless
-                        elsewhere.
+                        return free pages to the operating system. Measured
+                        saving on this workload: none, so it is off by default.
+                        Linux only; harmless elsewhere.
   * `gc_full`        -- make the periodic collection two full passes rather
                         than one incremental one. Arbitrary-precision limbs are
                         released by finalizers, and a finalizable object
@@ -744,7 +745,7 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                          gc_interval::Integer = REDUCTION_GC_INTERVAL,
                          low_memory::Union{Nothing, Bool} = nothing,
                          gc_full::Bool = false,
-                         trim_memory::Bool = true,
+                         trim_memory::Bool = false,
                          _held_above::Int = 0,
                          telemetry::Union{Nothing, ReductionTelemetry} = nothing,
                          _depth::Integer = 0) where {T<:Integer}

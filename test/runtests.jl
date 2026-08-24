@@ -11,4 +11,5 @@ using Flatter
     include("test_fused_qr_size_reduction.jl")
     include("test_goal.jl")
     include("test_recursive_reduction.jl")
+    include("test_irregular.jl")
 end

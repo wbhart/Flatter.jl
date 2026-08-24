@@ -101,6 +101,12 @@ reasoning is in the code comments and docstrings.
 
 * **`U` from fused QR is unimodular but not triangular.** Columns are processed left to right, but each is reduced against *all* its predecessors. Test `abs(det(U)) == 1` (Bareiss), not the triangular structure.
 
+* **`reduce_basis` accepts any full-rank integer basis; `lattice_reduce` requires upper triangular.** Prefer the former unless the input is known triangular. It detects all four corner orientations and flips into place — reversing columns reorders basis vectors, reversing rows permutes coordinates, so neither changes the lattice. `info.path` reports `:triangular`, `:reoriented` or `:dense`.
+
+* **The dense path diverges from flatter.** flatter routes a non-triangular basis to `CondUnknown` (phase 1, `log_cond = 0` deliberately, since `Heuristic1` asserts it positive). We instead QR-factor, round the R factor to an integer triangular lattice with `to_integer_lattice`, reduce that, and apply the resulting transform to the original — valid because ANY unimodular transform is valid, so a poor approximation costs quality and never correctness. Iterated a few rounds, since each re-factorises an already better basis. Rank-deficient input is reported rather than handled; that is what `CondUnknown` is for and it is not ported.
+
+* **After flipping, the transform needs its ROWS reversed, not its columns.** Reducing `Q B P` to `Q B P U'` means the transform for the original basis is `P U'`. flatter does the same via `flip_mat(U, flip_cols, false)`, which is easy to misread as a column flip.
+
 * **Input to the driver is upper triangular; output is a general basis.** `B_out = B_in * U` has a meaningless diagonal that may contain zeros — reading it as a profile gives `-Inf`. The profile is in `info.profile`, from the R factor. flatter is the same. Re-triangularise before feeding a result back in.
 
 * **Compression acts on the R factor, never on the basis product.** `B_next = B * U_window` is *not* triangular, so it must be re-factored by the fused QR first, and the resulting R is what gets compressed. Compressing `B_next` directly produces a singular basis within a couple of iterations.
@@ -147,11 +153,17 @@ reasoning is in the code comments and docstrings.
 
 * **Measured resident memory, q-ary family, isolated processes** (includes ~250 MB of Julia runtime): dim 64 → 512 MB, dim 96 → 1126 MB, dim 128 → 1590 MB, dim 160 → 3648 MB. Roughly `dim^3.7` across the last pair, but that pair straddles a depth increase, so treat it as an upper bound on the trend.
 
-* **Periodic collection is nearly free and worth about threefold in memory.** Swept at dim 128: runtime is flat within noise across every interval from 1 to never, while the footprint runs 330 MB (every other iteration) to 1130 MB (never). Defaults are `gc_interval = 2` above `gc_dimension = 32`. An earlier reading that collection cost half again the runtime came from comparing separate runs rather than a controlled sweep — always sweep within one session.
+* **The memory measures are gated by dimension, and the gates matter more than the measures.** Collection is worth threefold in memory and costs a little time, so it only pays where memory is actually a constraint: excess with no collection is 44 MB at dim 64, 580 at 96, 1141 at 128, 3092 at 160. Defaults: collect every 2 iterations above dimension 128, switch to bounded accumulation above 256. Below those, reduction runs unencumbered. Setting the gates too low costs speed at small dimensions for no benefit, and shows up as run-to-run variance.
+
+* **`malloc_trim` measured no saving at all**, so `trim_memory` defaults off. The call is retained for the case where a different allocator behaves differently.
 
 * **`malloc_trim` does nothing here.** Measured saving across dim 64-160: 0%. Whatever holds the memory is not free pages the C allocator can return.
 
 * **On WSL, the memory ceiling is not the machine's.** WSL2 defaults to half of Windows RAM and does not readily return freed pages, so an OOM there can be a VM limit rather than an algorithmic one. `.wslconfig` sets it.
+
+* **Families declare their own size ranges.** They do not cost the same at a given dimension — q-ary is by far the most expensive, relation and ideal cheap enough to run much further. `run_family(name)` uses the declared range; passing `sizes` overrides.
+
+* **Two families have a known answer, which is a sharper test than "how short".** `relation` recovers the minimal polynomial of `radicand^(1/degree)`, so `found_planted` says whether reduction found the true relation, not merely something short — this is the integer-relation application of LLL. `knapsack` likewise plants a subset-sum solution. `ideal` is the ideal `(g)` in `Z[x]/(f)`, whose short vectors are small elements of the ideal — ideal-SVP, and the same computation as looking for small generators in class group work.
 
 * **The benchmark generators are shape approximations, not standard instances.** The q-ary modulus in particular defaults to `2^(2n)+1`, making `log2 det` quadratic in dimension — chosen to stress compression, not to match any published convention. Fine for tracking this package against itself and against fplll on identical input; not comparable with the literature. Use fplll's `latticegen` or the Darmstadt challenges for that.
 

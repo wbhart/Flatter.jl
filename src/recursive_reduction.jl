@@ -241,6 +241,7 @@ mutable struct ReductionTelemetry
     iterations::Int
     capped::Int
     stagnated::Int
+    dense_rounds::Int
     peak_live::Int
     peak_data::Int
     base_cases::Int
@@ -257,9 +258,10 @@ mutable struct ReductionTelemetry
     time_collect::Float64
     time_apply::Float64
     time_final_sr::Float64
+    time_dense_qr::Float64
 end
 
-ReductionTelemetry() = ReductionTelemetry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+ReductionTelemetry() = ReductionTelemetry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 function Base.show(io::IO, t::ReductionTelemetry)
     println(io, "ReductionTelemetry:")
@@ -268,6 +270,11 @@ function Base.show(io::IO, t::ReductionTelemetry)
     println(io, "  window reductions        : ", t.iterations)
     println(io, "  levels stopped by the cap: ", t.capped, " of ", t.levels)
     println(io, "  levels stopped stagnating: ", t.stagnated, " of ", t.levels)
+    if t.dense_rounds > 0
+        println(io, "  dense-path rounds        : ", t.dense_rounds)
+        println(io, "  time in dense-path QR    : ",
+                    round(t.time_dense_qr; digits = 3), " s")
+    end
     println(io, "  peak live bytes seen     : ",
                 round(t.peak_live / 1024^2; digits = 1), " MB")
     println(io, "  peak data held (measured): ",

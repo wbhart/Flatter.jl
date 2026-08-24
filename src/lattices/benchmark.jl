@@ -249,10 +249,23 @@ function print_time_breakdown(r)
     @printf("    levels=%d depth=%d windows=%d capped=%d base=%d (L%d/S%d/F%d) fusedQR=%d\n",
             t.levels, t.max_depth, t.iterations, t.capped, t.base_cases,
             t.lagrange_calls, t.schoenhage_calls, t.fplll_calls, t.fused_calls)
+    accounted = t.time_fused + t.time_matmul + t.time_compress + t.time_base +
+                t.time_finalise + t.time_dense_qr
     @printf("    fusedQR %5.1f%%  matmul %5.1f%%  compress %5.1f%%  base %5.1f%%  finalise %5.1f%%\n",
             100 * t.time_fused / total, 100 * t.time_matmul / total,
             100 * t.time_compress / total, 100 * t.time_base / total,
             100 * t.time_finalise / total)
+    if t.dense_rounds > 0
+        # The dense path's own factorisation, paid once per round and outside
+        # the driver entirely.
+        @printf("    dense path: %d rounds, QR %5.1f%% of total\n",
+                t.dense_rounds, 100 * t.time_dense_qr / total)
+    end
+    # Anything unaccounted is worth seeing: it has hidden a dominant cost twice.
+    if accounted < 0.75 * total
+        @printf("    (%.0f%% of the time is unaccounted for)\n",
+                100 * (1 - accounted / total))
+    end
     # When finalising dominates, break it down: lifting the transforms,
     # applying them to the original basis, and the final size reduction are
     # three quite different costs with three quite different remedies.

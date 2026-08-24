@@ -143,6 +143,76 @@ end
         end
     end
 
+    # The dense path starts at the QR precision policy rather than the reduction
+    # one, and doubles when the factorisation comes back degenerate. Both the
+    # cheap start and the recovery need to hold.
+    @testset "dense precision discovery" begin
+        @testset "starts well below the reduction policy" begin
+            rng = MersenneTwister(0x9EC1)
+            B = BigInt[rand(rng, -100:100) for _ in 1:128, _ in 1:128]
+            @test Flatter._dense_precision(B, 128) < Flatter.lll_precision(8, 128)
+        end
+
+        @testset "an ill-conditioned basis still factorises" begin
+            # A wide profile needs far more precision than the entry sizes
+            # suggest, so this is the case the doubling exists for.
+            rng = MersenneTwister(0x9EC2)
+            n = 8
+            B = rr_triangular_basis(rng, n; spread = 400) *
+                ir_random_unimodular(rng, n)
+            approximation = Flatter._dense_approximation(B, n, n)
+            @test size(approximation) == (n, n)
+            @test all(!iszero(approximation[i, i]) for i in 1:n)
+        end
+
+        # The hardware path is only taken when 53 bits is what the policy asked
+        # for. It must agree with the arbitrary-precision path, and fall through
+        # to it when 53 bits turns out not to resolve the profile.
+        @testset "hardware and arbitrary precision agree" begin
+            rng = MersenneTwister(0x53B1)
+            for n in (6, 10, 16)
+                # Small entries, so the policy asks for exactly 53 bits.
+                B = BigInt[rand(rng, -60:60) for _ in 1:n, _ in 1:n]
+                abs(rr_det(B)) == 0 && continue
+                @test Flatter._dense_precision(B, n) == 53
+
+                fast = Flatter._dense_approximation(B, n, n; hardware = true)
+                slow = Flatter._dense_approximation(B, n, n; hardware = false)
+
+                # Both are integer approximations of the same R factor at the
+                # same precision, so the diagonals should agree closely. They
+                # need not be identical: the scale is chosen from rounded logs.
+                for i in 1:n
+                    @test abs(Flatter._log2_abs(fast[i, i]) -
+                              Flatter._log2_abs(slow[i, i])) < 1.0
+                end
+            end
+        end
+
+        @testset "falls through when 53 bits is not enough" begin
+            # A wide profile: the policy still asks for more than 53 bits, so
+            # the hardware path is skipped outright rather than attempted.
+            rng = MersenneTwister(0x53B2)
+            n = 8
+            B = rr_triangular_basis(rng, n; spread = 400) *
+                ir_random_unimodular(rng, n)
+            @test Flatter._dense_precision(B, n) > 53
+            approximation = Flatter._dense_approximation(B, n, n; hardware = true)
+            @test all(!iszero(approximation[i, i]) for i in 1:n)
+        end
+
+        # Rank deficiency reaches `to_integer_lattice` as a diagonal entry at the
+        # noise floor rather than an exact zero, so the check has to be relative
+        # to the working precision. Raising the precision cannot help here, so
+        # the doubling loop runs to its ceiling and reports.
+        @testset "a rank deficient basis is reported, not looped on" begin
+            singular = BigInt[1 2 3; 2 4 6; 1 1 1]     # row 2 is twice row 1
+            @test iszero(rr_det(singular))
+            @test_throws ArgumentError Flatter._dense_approximation(singular, 3, 3)
+            @test_throws ArgumentError Flatter.reduce_basis(singular)
+        end
+    end
+
     @testset "to_integer_lattice" begin
         @testset "is upper triangular with no zero diagonal" begin
             setprecision(BigFloat, 200) do

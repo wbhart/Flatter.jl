@@ -111,7 +111,7 @@ matrix, at a scale that keeps every diagonal entry nonzero.
 
 A port of flatter's `to_int_lattice`, which appears identically in
 `columnwise.cpp` and `iterated.cpp`. The scale is chosen from the spread of the
-diagonal: with `precision = spread + n + 10` bits allotted to the largest
+diagonal: with `spread + n + 10` bits allotted to the largest
 diagonal entry, the smallest retains `n + 10`, so none rounds away.
 
 The result is a different lattice from the one `R` came from — it is an
@@ -122,16 +122,32 @@ function to_integer_lattice(R::AbstractMatrix{S}, n::Integer) where {S<:Abstract
     n = Int(n)
     logs = Vector{Float64}(undef, n)
     for i in 1:n
-        iszero(R[i, i]) && throw(ArgumentError(
-            "the R factor has a zero diagonal entry at index $i; the basis is " *
-            "rank deficient, which this path does not handle"))
         logs[i] = _log2_abs(R[i, i])
     end
 
     largest = maximum(logs)
+
+    # Rank deficiency does not show up as an exact zero. Factorising a singular
+    # matrix in floating point leaves the dependent diagonal entry at the noise
+    # floor -- around 2^-53 relative to the rest for a Float64 -- and scaling
+    # that up would manufacture a nonzero entry out of rounding error. The test
+    # that catches it is relative: an entry more than the working precision
+    # below the largest carries no information at all.
+    available = Base.precision(R[1, 1])
+    for i in 1:n
+        largest - logs[i] > available - 10 && throw(ArgumentError(
+            "diagonal entry $i is $(round(largest - logs[i]; digits = 1)) bits " *
+            "below the largest, beyond the $available bits available: the basis " *
+            "is rank deficient, or the precision is too low to resolve its " *
+            "profile"))
+    end
+
     spread = largest - minimum(logs)
-    precision = spread + n + 10
-    scale = round(Int, precision - largest)
+    # Bits allotted to the largest diagonal entry, leaving the smallest with
+    # `n + 10`. Named to avoid shadowing `Base.precision`, which is needed just
+    # above -- flatter calls this local `prec`.
+    allotted = spread + n + 10
+    scale = round(Int, allotted - largest)
 
     result = zeros(BigInt, n, n)
     for j in 1:n, i in 1:j
@@ -148,12 +164,87 @@ end
 # Entry point
 # ---------------------------------------------------------------------------
 
-function _reduction_precision(B::AbstractMatrix{<:Integer}, n::Int, aggressive::Bool)
+"""
+    _dense_precision(B, m) -> Int
+
+Starting precision for the dense path's factorisation.
+
+This uses the QR policy, not the reduction policy. `lll_precision` carries a
+`2n` term describing the COMPRESSED basis inside the driver, whose profile spans
+about `n` bits after compression; that term has nothing to do with factorising a
+raw basis, and on a small-entry lattice it dominates — at dimension 128 with
+8-bit entries it asks for 302 bits where 53 suffice, and MPFR cost scales with
+precision.
+
+The entry bit-length stands in for the log condition number, which is optimistic
+for an ill-conditioned basis. `_dense_approximation` doubles from here when the
+factorisation comes back degenerate, so an underestimate costs a retry rather
+than a wrong answer.
+"""
+function _dense_precision(B::AbstractMatrix{<:Integer}, m::Int)
     largest = 0
     for value in B
         iszero(value) || (largest = max(largest, ndigits(value; base = 2)))
     end
-    return lll_precision(largest, n; aggressive = aggressive)
+    return householder_precision(m, Float64(largest))
+end
+
+"""
+    _dense_approximation(B, n, m) -> Matrix{BigInt}
+
+The integer triangular lattice approximating `B`'s Gram-Schmidt structure,
+factorising at the cheapest precision that produces a usable R factor.
+
+A degenerate factor -- a diagonal entry rounding to zero -- means the precision
+was too low to resolve the profile, so the precision doubles and it tries again.
+That is the same discovery loop flatter's `CondUnknown` runs, in miniature: the
+condition number is not known in advance, so it is found by attempting.
+"""
+function _dense_approximation(B::AbstractMatrix{<:Integer}, n::Int, m::Int;
+                              hardware::Bool = true)
+    bits = _dense_precision(B, m)
+    ceiling = 64 * max(bits, 64)
+
+    # `householder_precision` bottoms out at 53 bits, which is exactly what a
+    # `Float64` carries -- and for a small-entry basis that is what it asks for.
+    # Running such a factorisation in `BigFloat` pays an allocation and an
+    # indirection per operation to compute the same thing, and forgoes BLAS in
+    # the leaf multiplications. `float64_matrix` pulls out a common power of two
+    # so nothing overflows; a uniform scale leaves the ratios between diagonal
+    # entries alone, and `to_integer_lattice` chooses its own scale regardless.
+    if hardware && bits <= 53
+        try
+            scaled, _ = float64_matrix(B)
+            # LAPACK's `dgeqrf` rather than this package's generic Householder:
+            # same algorithm, but with hand-tuned BLAS-3 panel updates. It
+            # overwrites its argument with R in the upper trapezoid, which is
+            # exactly the part `to_integer_lattice` reads, so nothing needs
+            # extracting.
+            LinearAlgebra.LAPACK.geqrf!(scaled)
+            return to_integer_lattice(scaled, n)
+        catch problem
+            # A degenerate factor here means 53 bits could not resolve the
+            # profile after all, so fall through and discover the precision the
+            # slow way.
+            problem isa ArgumentError || rethrow()
+        end
+    end
+
+    while true
+        try
+            return with_precision(bits) do
+                factors, _ = householder_block(bigfloat_matrix(B, bits))
+                to_integer_lattice(factors, n)
+            end
+        catch problem
+            problem isa ArgumentError || rethrow()
+            bits *= 2
+            bits > ceiling && throw(ArgumentError(
+                "could not factorise the basis at any precision up to $ceiling " *
+                "bits; it is probably rank deficient, which this path does not " *
+                "handle"))
+        end
+    end
 end
 
 """
@@ -193,6 +284,7 @@ ported.
 function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                        max_rounds::Integer = DEFAULT_DENSE_ROUNDS,
                        aggressive::Bool = false,
+                       telemetry::Union{Nothing, ReductionTelemetry} = nothing,
                        kwargs...) where {T<:Integer}
     m, n = size(B)
     m >= n || throw(DimensionMismatch(
@@ -206,7 +298,8 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         flip_rows, flip_columns = orientation
         _flip!(B, flip_rows, flip_columns)
 
-        _, _, info = lattice_reduce!(B, U; aggressive = aggressive, kwargs...)
+        _, _, info = lattice_reduce!(B, U; aggressive = aggressive,
+                                     telemetry = telemetry, kwargs...)
 
         # Undo the row reversal on the basis, and apply the column reversal to
         # the transform: reducing `Q B P` to `Q B P U'` means the transform for
@@ -218,29 +311,34 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         return B, U, (; path, rounds = 0, info...)
     end
 
-    return _reduce_dense!(B, U, Int(max_rounds), aggressive; kwargs...)
+    return _reduce_dense!(B, U, Int(max_rounds), aggressive, telemetry; kwargs...)
 end
 
 function _reduce_dense!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
-                        max_rounds::Int, aggressive::Bool;
+                        max_rounds::Int, aggressive::Bool,
+                        telemetry::Union{Nothing, ReductionTelemetry};
                         kwargs...) where {T<:Integer}
     m, n = size(B)
     _set_identity!(U)
     last_info = nothing
     rounds = 0
 
-    for round in 1:max_rounds
-        bits = _reduction_precision(B, n, aggressive)
+    previous_drop = Inf
 
-        # The integer lattice approximating this basis' Gram-Schmidt structure.
-        approximation = with_precision(bits) do
-            factors, _ = householder_block(bigfloat_matrix(B, bits))
-            to_integer_lattice(factors, n)
+    for round in 1:max_rounds
+        # This factorisation is separate from the one inside the driver and is
+        # paid once per round, so it is timed on its own.
+        started = time_ns()
+        approximation = _dense_approximation(B, n, m)
+        if telemetry !== nothing
+            telemetry.time_dense_qr += (time_ns() - started) / 1e9
+            telemetry.dense_rounds += 1
         end
 
         step = Matrix{BigInt}(undef, n, n)
         _, _, last_info = lattice_reduce!(approximation, step;
-                                          aggressive = aggressive, kwargs...)
+                                          aggressive = aggressive,
+                                          telemetry = telemetry, kwargs...)
         rounds = round
 
         applied = T.(step)
@@ -256,6 +354,14 @@ function _reduce_dense!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
         for j in 1:n, i in 1:n
             U[i, j] = composed[i, j]
         end
+
+        # Another round re-factorises an improved basis and so approximates it
+        # better -- but only while the basis is still improving. Once the
+        # profile stops flattening there is nothing left for a further round to
+        # find, and the factorisation is the most expensive part of this path.
+        drop = profile_drop(last_info.profile)
+        drop >= previous_drop - 1e-6 && break
+        previous_drop = drop
     end
 
     return B, U, (; path = :dense, rounds = rounds, last_info...)

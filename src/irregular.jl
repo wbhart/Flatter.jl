@@ -34,6 +34,26 @@
 
 const DEFAULT_DENSE_ROUNDS = 4
 
+"""
+Fixed-precision float types the dense path will try, cheapest first, before
+falling back to `BigFloat`.
+
+Only `Float64` is here by default, because it is all the standard library
+offers. A double-double type gives about 106 bits at a small multiple of
+`Float64` cost -- far cheaper than `BigFloat` at the same width -- and slots
+into the gap this path otherwise jumps. Nothing in the package depends on such a
+type; pass one in instead:
+
+    using DoubleFloats
+    reduce_basis(B; float_tiers = (Float64, Double64, BigFloat))
+
+Which bases benefit: `householder_precision` is roughly `34.5 + entry_bits` at
+dimension 128, so entries of 19 to 71 bits land between `Float64` and a
+double-double. Bases with entries smaller than that are already on `Float64`,
+and ones much larger need arbitrary precision regardless.
+"""
+const DEFAULT_FLOAT_TIERS = (Float64,)
+
 # ---------------------------------------------------------------------------
 # Orientation
 # ---------------------------------------------------------------------------
@@ -190,6 +210,41 @@ function _dense_precision(B::AbstractMatrix{<:Integer}, m::Int)
 end
 
 """
+    _scaled_float_matrix(T, B) -> Matrix{T}
+
+`B` converted to `T`, with a common power of two pulled out so that nothing
+overflows the exponent range.
+
+A uniform scale leaves the ratios between diagonal entries of the R factor
+untouched, and `to_integer_lattice` chooses its own scale regardless, so the
+factor is not shifted by this.
+"""
+function _scaled_float_matrix(::Type{T}, B::AbstractMatrix{<:Integer}) where {T<:AbstractFloat}
+    largest = 0
+    for value in B
+        iszero(value) || (largest = max(largest, ndigits(value; base = 2)))
+    end
+    headroom = max(0, Base.precision(T) - 5)
+    shift = max(0, largest - headroom)
+    return T[T(value >> shift) for value in B]
+end
+
+"Factor at a fixed float type, using LAPACK where the type is a BLAS one."
+function _factor_at(::Type{T}, B::AbstractMatrix{<:Integer},
+                    n::Int) where {T<:AbstractFloat}
+    scaled = _scaled_float_matrix(T, B)
+    if T <: LinearAlgebra.BlasFloat
+        # `dgeqrf` and friends: the same Householder algorithm with BLAS-3 panel
+        # updates. It leaves R in the upper trapezoid, which is all that
+        # `to_integer_lattice` reads.
+        LinearAlgebra.LAPACK.geqrf!(scaled)
+        return to_integer_lattice(scaled, n)
+    end
+    factors, _ = householder_block(scaled)
+    return to_integer_lattice(factors, n)
+end
+
+"""
     _dense_approximation(B, n, m) -> Matrix{BigInt}
 
 The integer triangular lattice approximating `B`'s Gram-Schmidt structure,
@@ -201,7 +256,8 @@ That is the same discovery loop flatter's `CondUnknown` runs, in miniature: the
 condition number is not known in advance, so it is found by attempting.
 """
 function _dense_approximation(B::AbstractMatrix{<:Integer}, n::Int, m::Int;
-                              hardware::Bool = true)
+                              hardware::Bool = true,
+                              float_tiers = DEFAULT_FLOAT_TIERS)
     bits = _dense_precision(B, m)
     ceiling = 64 * max(bits, 64)
 
@@ -212,21 +268,23 @@ function _dense_approximation(B::AbstractMatrix{<:Integer}, n::Int, m::Int;
     # the leaf multiplications. `float64_matrix` pulls out a common power of two
     # so nothing overflows; a uniform scale leaves the ratios between diagonal
     # entries alone, and `to_integer_lattice` chooses its own scale regardless.
-    if hardware && bits <= 53
-        try
-            scaled, _ = float64_matrix(B)
-            # LAPACK's `dgeqrf` rather than this package's generic Householder:
-            # same algorithm, but with hand-tuned BLAS-3 panel updates. It
-            # overwrites its argument with R in the upper trapezoid, which is
-            # exactly the part `to_integer_lattice` reads, so nothing needs
-            # extracting.
-            LinearAlgebra.LAPACK.geqrf!(scaled)
-            return to_integer_lattice(scaled, n)
-        catch problem
-            # A degenerate factor here means 53 bits could not resolve the
-            # profile after all, so fall through and discover the precision the
-            # slow way.
-            problem isa ArgumentError || rethrow()
+    # Try each fixed-precision tier that is wide enough, cheapest first. Every
+    # one of these is dramatically faster than `BigFloat` at the same width --
+    # no allocation per operation, and BLAS for the ones LAPACK handles -- so it
+    # is worth taking the narrowest that will do.
+    #
+    # A degenerate factor from a tier means its width could not resolve the
+    # profile after all, so the next tier gets a turn and arbitrary precision
+    # has the last word.
+    if hardware
+        for tier in float_tiers
+            tier === BigFloat && continue
+            Base.precision(tier) >= bits || continue
+            try
+                return _factor_at(tier, B, n)
+            catch problem
+                problem isa ArgumentError || rethrow()
+            end
         end
     end
 
@@ -285,6 +343,8 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                        max_rounds::Integer = DEFAULT_DENSE_ROUNDS,
                        aggressive::Bool = false,
                        telemetry::Union{Nothing, ReductionTelemetry} = nothing,
+                       float_tiers = DEFAULT_FLOAT_TIERS,
+                       want_profile::Bool = true,
                        kwargs...) where {T<:Integer}
     m, n = size(B)
     m >= n || throw(DimensionMismatch(
@@ -299,6 +359,7 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         _flip!(B, flip_rows, flip_columns)
 
         _, _, info = lattice_reduce!(B, U; aggressive = aggressive,
+                                     want_profile = want_profile,
                                      telemetry = telemetry, kwargs...)
 
         # Undo the row reversal on the basis, and apply the column reversal to
@@ -311,12 +372,14 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         return B, U, (; path, rounds = 0, info...)
     end
 
-    return _reduce_dense!(B, U, Int(max_rounds), aggressive, telemetry; kwargs...)
+    return _reduce_dense!(B, U, Int(max_rounds), aggressive, telemetry,
+                          float_tiers, want_profile; kwargs...)
 end
 
 function _reduce_dense!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
                         max_rounds::Int, aggressive::Bool,
-                        telemetry::Union{Nothing, ReductionTelemetry};
+                        telemetry::Union{Nothing, ReductionTelemetry},
+                        float_tiers, want_profile::Bool;
                         kwargs...) where {T<:Integer}
     m, n = size(B)
     _set_identity!(U)
@@ -329,20 +392,31 @@ function _reduce_dense!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
         # This factorisation is separate from the one inside the driver and is
         # paid once per round, so it is timed on its own.
         started = time_ns()
-        approximation = _dense_approximation(B, n, m)
+        approximation = _dense_approximation(B, n, m; float_tiers = float_tiers)
         if telemetry !== nothing
             telemetry.time_dense_qr += (time_ns() - started) / 1e9
             telemetry.dense_rounds += 1
         end
 
+        # The approximation is upper triangular, so its profile is just the
+        # diagonal -- no factorisation needed. Reading it BEFORE reducing gives
+        # the drop this round starts from, which is what the stopping test
+        # compares. Asking the driver for a profile instead would make it
+        # factorise the reduced basis, and at these dimensions that costs more
+        # than the reduction.
+        drop = profile_drop([_log2_abs(approximation[i, i]) for i in 1:n])
+
         step = Matrix{BigInt}(undef, n, n)
         _, _, last_info = lattice_reduce!(approximation, step;
                                           aggressive = aggressive,
+                                          want_profile = false,
                                           telemetry = telemetry, kwargs...)
         rounds = round
 
         applied = T.(step)
         _is_identity(applied) && break
+
+        update_started = time_ns()
 
         # Any unimodular transform is valid, so this is exact regardless of how
         # good the approximation was; a poor one costs quality, never validity.
@@ -354,12 +428,15 @@ function _reduce_dense!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
         for j in 1:n, i in 1:n
             U[i, j] = composed[i, j]
         end
+        # The basis and transform updates: two integer matrix products per
+        # round, at full entry width.
+        telemetry === nothing ||
+            (telemetry.time_matmul += (time_ns() - update_started) / 1e9)
 
         # Another round re-factorises an improved basis and so approximates it
         # better -- but only while the basis is still improving. Once the
         # profile stops flattening there is nothing left for a further round to
-        # find, and the factorisation is the most expensive part of this path.
-        drop = profile_drop(last_info.profile)
+        # find.
         drop >= previous_drop - 1e-6 && break
         previous_drop = drop
     end

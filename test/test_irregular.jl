@@ -168,6 +168,28 @@ end
         # The hardware path is only taken when 53 bits is what the policy asked
         # for. It must agree with the arbitrary-precision path, and fall through
         # to it when 53 bits turns out not to resolve the profile.
+        # LAPACK's factorisation must agree with the package's own generic one:
+        # same algorithm, different implementation, so the R factors should match
+        # to hardware precision up to the sign convention on each column.
+        @testset "LAPACK agrees with the generic Householder" begin
+            rng = MersenneTwister(0x1A9A)
+            for (m, n) in ((8, 8), (12, 8), (16, 16))
+                A = randn(rng, m, n)
+
+                viaLAPACK = copy(A)
+                LinearAlgebra.LAPACK.geqrf!(viaLAPACK)
+
+                factors, _ = Flatter.householder_block(copy(A))
+
+                # Compare |R| entrywise: Householder sign choices can differ per
+                # column between implementations, which flips a whole row of R.
+                for j in 1:n, i in 1:j
+                    @test abs(abs(viaLAPACK[i, j]) - abs(factors[i, j])) <
+                          1e-9 * max(1.0, maximum(abs, A))
+                end
+            end
+        end
+
         @testset "hardware and arbitrary precision agree" begin
             rng = MersenneTwister(0x53B1)
             for n in (6, 10, 16)
@@ -205,6 +227,39 @@ end
         # noise floor rather than an exact zero, so the check has to be relative
         # to the working precision. Raising the precision cannot help here, so
         # the doubling loop runs to its ceiling and reports.
+        # The tier list is the seam a wider fixed-precision type plugs into.
+        # `BigFloat` stands in for one here: it is not a fixed-precision type,
+        # but it exercises the dispatch, and the result must not depend on which
+        # tier produced it.
+        @testset "the tier list does not change the answer" begin
+            rng = MersenneTwister(0x71E5)
+            for n in (6, 10)
+                B = BigInt[rand(rng, -60:60) for _ in 1:n, _ in 1:n]
+                iszero(rr_det(B)) && continue
+
+                viaFloat64 = Flatter._dense_approximation(B, n, n;
+                                                          float_tiers = (Float64,))
+                viaNone = Flatter._dense_approximation(B, n, n; hardware = false)
+
+                for i in 1:n
+                    @test abs(Flatter._log2_abs(viaFloat64[i, i]) -
+                              Flatter._log2_abs(viaNone[i, i])) < 1.0
+                end
+            end
+        end
+
+        @testset "a tier too narrow is skipped, not attempted" begin
+            # A wide profile needs more than 53 bits, so the Float64 tier must
+            # be passed over rather than tried and failed.
+            rng = MersenneTwister(0x71E6)
+            n = 8
+            B = rr_triangular_basis(rng, n; spread = 400) *
+                ir_random_unimodular(rng, n)
+            @test Flatter._dense_precision(B, n) > Base.precision(Float64)
+            approximation = Flatter._dense_approximation(B, n, n)
+            @test all(!iszero(approximation[i, i]) for i in 1:n)
+        end
+
         @testset "a rank deficient basis is reported, not looped on" begin
             singular = BigInt[1 2 3; 2 4 6; 1 1 1]     # row 2 is twice row 1
             @test iszero(rr_det(singular))

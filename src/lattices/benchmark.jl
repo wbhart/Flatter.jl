@@ -76,7 +76,7 @@ sweep, and a timeout or a stall is itself a result worth recording.
 """
 function measure(bundle; max_iterations = 120, aggressive = false,
                  run_fplll = true, verbose = false, repeat_under = 2.0,
-                 progress = true, low_memory = nothing,
+                 progress = true, measure_memory = false, low_memory = nothing,
                  gc_dimension = Flatter.REDUCTION_GC_DIMENSION,
                  gc_full = false)
     B = bundle.basis
@@ -106,6 +106,7 @@ function measure(bundle; max_iterations = 120, aggressive = false,
             announce(attempt == 1 ? "reducing" : "reducing (repeat)")
             attempt > 1 && GC.gc()
             attempt_telemetry = Flatter.ReductionTelemetry()
+            attempt_telemetry.measure_memory = measure_memory
             GC.gc()
             live_before = Base.gc_live_bytes()
             rss_before = Sys.maxrss()
@@ -250,11 +251,19 @@ function print_time_breakdown(r)
             t.levels, t.max_depth, t.iterations, t.capped, t.base_cases,
             t.lagrange_calls, t.schoenhage_calls, t.fplll_calls, t.fused_calls)
     accounted = t.time_fused + t.time_matmul + t.time_compress + t.time_base +
-                t.time_finalise + t.time_dense_qr
+                t.time_finalise + t.time_dense_qr + t.time_profile
     @printf("    fusedQR %5.1f%%  matmul %5.1f%%  compress %5.1f%%  base %5.1f%%  finalise %5.1f%%\n",
             100 * t.time_fused / total, 100 * t.time_matmul / total,
             100 * t.time_compress / total, 100 * t.time_base / total,
             100 * t.time_finalise / total)
+    if t.profile_calls > 0 && t.time_profile > 0.01 * total
+        # Reporting `info.profile` needs a factorisation of the reduced basis.
+        # fplll computes no such thing, so this is work the comparison charges
+        # to us and not to it; `want_profile = false` skips it.
+        @printf("    profile report: %5.1f%% of total (%d factorisation%s)\n",
+                100 * t.time_profile / total, t.profile_calls,
+                t.profile_calls == 1 ? "" : "s")
+    end
     if t.dense_rounds > 0
         # The dense path's own factorisation, paid once per round and outside
         # the driver entirely.
@@ -278,7 +287,7 @@ function print_time_breakdown(r)
     # what the process actually holds. A large gap between them is collection
     # lag rather than a genuine memory requirement, and is worth knowing about
     # before concluding that an instance is too big to run.
-    if r.rss_growth > 64 * 1024 * 1024 || r.live_growth > 64 * 1024 * 1024
+    if (r.rss_growth > 64 * 1024 * 1024 || r.live_growth > 64 * 1024 * 1024)
         # Growth figures only. `telemetry.peak_live` is an absolute reading, so
         # in a shared session it reports whatever earlier runs left live and
         # says nothing about this one; `lattices/memory_scaling.jl` measures in

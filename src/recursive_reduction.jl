@@ -242,6 +242,8 @@ mutable struct ReductionTelemetry
     capped::Int
     stagnated::Int
     dense_rounds::Int
+    profile_calls::Int
+    measure_memory::Bool
     peak_live::Int
     peak_data::Int
     base_cases::Int
@@ -259,9 +261,10 @@ mutable struct ReductionTelemetry
     time_apply::Float64
     time_final_sr::Float64
     time_dense_qr::Float64
+    time_profile::Float64
 end
 
-ReductionTelemetry() = ReductionTelemetry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+ReductionTelemetry() = ReductionTelemetry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 function Base.show(io::IO, t::ReductionTelemetry)
     println(io, "ReductionTelemetry:")
@@ -275,10 +278,12 @@ function Base.show(io::IO, t::ReductionTelemetry)
         println(io, "  time in dense-path QR    : ",
                     round(t.time_dense_qr; digits = 3), " s")
     end
-    println(io, "  peak live bytes seen     : ",
-                round(t.peak_live / 1024^2; digits = 1), " MB")
-    println(io, "  peak data held (measured): ",
-                round(t.peak_data / 1024^2; digits = 1), " MB")
+    if t.measure_memory
+        println(io, "  peak live bytes seen     : ",
+                    round(t.peak_live / 1024^2; digits = 1), " MB")
+        println(io, "  peak data held (measured): ",
+                    round(t.peak_data / 1024^2; digits = 1), " MB")
+    end
     println(io, "  base cases               : ", t.base_cases,
                 " (", t.lagrange_calls, " Lagrange, ", t.schoenhage_calls,
                 " Schoenhage, ", t.fplll_calls, " fplll)")
@@ -297,6 +302,31 @@ end
 @inline _tick() = time_ns()
 @inline _tock(start) = (time_ns() - start) / 1e9
 
+
+"""
+    _reported_profile(B, aggressive, want_profile, depth, telemetry) -> Vector{Float64}
+
+The profile to hand back in `info`, or an empty vector when nobody will read it.
+
+Computing this needs a full arbitrary-precision factorisation of a basis that is
+no longer triangular, which is not cheap: on a single-level run it can cost more
+than the reduction did. Two things make it skippable. Recursive calls discard
+the info they are given, so only the outermost one can read it at all; and a
+caller who does not want a profile can say so, which also makes a comparison
+against a bare reduction fair, since that computes no profile either.
+"""
+function _reported_profile(B::AbstractMatrix{<:Integer}, aggressive::Bool,
+                           want_profile::Bool, depth::Int,
+                           telemetry::Union{Nothing, ReductionTelemetry})
+    (want_profile && depth == 0) || return Float64[]
+    started = _tick()
+    result = _basis_profile(B, aggressive)
+    if telemetry !== nothing
+        telemetry.time_profile += _tock(started)
+        telemetry.profile_calls += 1
+    end
+    return result
+end
 
 """
     _basis_profile(B, aggressive) -> Vector{Float64}
@@ -666,7 +696,9 @@ Returns `(B, U, info)` where `info` is a named tuple with
                     unmoved, `:cap` if `max_iterations` was reached, or
                     `:base_case` if the dimension was small enough to hand
                     straight to a base-case reducer;
-  * `profile`    -- `log2 |r_ii|` of the reduced basis, at true scale.
+  * `profile`    -- `log2 |r_ii|` of the reduced basis, at true scale. Empty
+                    for a base case reached recursively: computing it needs a
+                    factorisation, and only the outermost caller reads it.
 
 !!! note "The returned basis is not triangular"
     Input must be upper triangular, but output is a general reduced basis: the
@@ -709,6 +741,10 @@ Keyword arguments:
                         released by finalizers, and a finalizable object
                         survives one cycle, so only this form can reclaim them.
                         Expensive; measure before enabling.
+  * `want_profile`   -- compute `info.profile`, which needs a factorisation of
+                        the reduced basis. Only the outermost call can report
+                        one, and on a single-level run it can cost more than the
+                        reduction. Set `false` when the profile is not read.
   * `gc_dimension`   -- at or above this dimension, collect periodically.
                         `typemax(Int)` disables it.
   * `gc_interval`    -- iterations between collections. Measured at dimension
@@ -748,6 +784,7 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                          aggressive::Bool = false,
                          schoenhage_threshold::Integer = DEFAULT_SCHOENHAGE_THRESHOLD,
                          base_cutoff::Integer = DEFAULT_BASE_CUTOFF,
+                         want_profile::Bool = true,
                          gc_dimension::Integer = REDUCTION_GC_DIMENSION,
                          gc_interval::Integer = REDUCTION_GC_INTERVAL,
                          low_memory::Union{Nothing, Bool} = nothing,
@@ -784,8 +821,14 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             U[i, j] = applied[i, j]
         end
         telemetry === nothing || (telemetry.time_base += _tock(started))
+        # The profile costs a full arbitrary-precision factorisation, and only
+        # the outermost caller ever reads it -- every recursive call discards
+        # the info it is returned in. At dimension 96 the q-ary family makes 507
+        # base-case calls, so computing it unconditionally means 507 wasted
+        # factorisations.
         return B, U, (iterations = 0, goal_met = true, stopped = :base_case,
-                      profile = _basis_profile(B, aggressive))
+                      profile = _reported_profile(B, aggressive, want_profile,
+                                                  _depth, telemetry))
     end
 
     if n <= 2
@@ -865,9 +908,14 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
 
         # Reduce the window recursively. A window of one column has nothing to
         # do, but the iteration still counts so the schedule advances.
-        held_above = telemetry === nothing ? 0 :
+        # Measuring what is held walks every entry of four matrices, inspecting
+        # each value's allocation -- O(n^2) big-integer inspections per
+        # iteration, at every level. That is a real cost, not a free
+        # observation, so it is off unless asked for. Set
+        # `telemetry.measure_memory = true` when the question is memory.
+        held_above = (telemetry !== nothing && telemetry.measure_memory) ?
                      _held_above + held_bytes(working) + held_bytes(B) +
-                     held_bytes(original) + held_bytes(stack.factors)
+                     held_bytes(original) + held_bytes(stack.factors) : 0
 
         sub_transform = nothing
         if width >= 2
@@ -880,6 +928,7 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                             aggressive = aggressive,
                             schoenhage_threshold = schoenhage_threshold,
                             base_cutoff = base_cutoff,
+                            want_profile = want_profile,
                             gc_dimension = gc_dimension,
                             gc_interval = gc_interval,
                             low_memory = low_memory,
@@ -930,7 +979,7 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         # levels above this one hold, so the figure is the whole live path
         # rather than one level's share. `U` is excluded because the caller
         # supplies it with `undef` slots that are not filled until the end.
-        if telemetry !== nothing
+        if telemetry !== nothing && telemetry.measure_memory
             here = held_bytes(working) + held_bytes(B) + held_bytes(original) +
                    held_bytes(candidate) + held_bytes(size_reduction) +
                    held_bytes(factor) + held_bytes(stack.factors)
@@ -969,8 +1018,9 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         # instantaneous set. It is ABSOLUTE, not relative to the start of this
         # reduction, so a caller comparing runs must subtract its own baseline --
         # or better, measure each run in a fresh process.
-        telemetry === nothing ||
-            (telemetry.peak_live = max(telemetry.peak_live, Base.gc_live_bytes()))
+        if telemetry !== nothing && telemetry.measure_memory
+            telemetry.peak_live = max(telemetry.peak_live, Base.gc_live_bytes())
+        end
     end
 
     # --- lift, apply, and size reduce once at true scale ---------------------

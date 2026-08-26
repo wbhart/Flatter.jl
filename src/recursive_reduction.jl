@@ -260,10 +260,13 @@ Base.@kwdef mutable struct ReductionTelemetry
     time_recursion::Float64 = 0.0
     time_finalise::Float64 = 0.0
     time_collect::Float64 = 0.0
+    time_push::Float64 = 0.0
     time_apply::Float64 = 0.0
     time_final_sr::Float64 = 0.0
     time_dense_qr::Float64 = 0.0
     time_profile::Float64 = 0.0
+    time_gc::Float64 = 0.0
+    time_setup::Float64 = 0.0
     fused_split::Vector{Float64} = zeros(Float64, FUSED_TIME_SLOTS)
 end
 
@@ -302,8 +305,17 @@ function Base.show(io::IO, t::ReductionTelemetry)
     println(io, "  time in matrix products  : ", round(t.time_matmul; digits = 3), " s")
     println(io, "  time in compression      : ", round(t.time_compress; digits = 3), " s")
     println(io, "  time in base cases       : ", round(t.time_base; digits = 3), " s")
+    println(io, "  time in recursive calls  : ", round(t.time_recursion; digits = 3),
+                " s  (a parent's view of its children, so NOT part of any total)")
+    println(io, "  time collecting garbage  : ", round(t.time_gc; digits = 3), " s")
+    println(io, "  time in per-level setup  : ", round(t.time_setup; digits = 3), " s")
+    if t.profile_calls > 0
+        println(io, "  time reporting profiles  : ", round(t.time_profile; digits = 3),
+                    " s (", t.profile_calls, " factorisations)")
+    end
     println(io, "  time finalising          : ", round(t.time_finalise; digits = 3), " s")
-    println(io, "    lifting transforms     : ", round(t.time_collect; digits = 3), " s")
+    println(io, "    folding in transforms  : ", round(t.time_push; digits = 3), " s")
+    println(io, "    combining transforms   : ", round(t.time_collect; digits = 3), " s")
     println(io, "    applying to the basis  : ", round(t.time_apply; digits = 3), " s")
     print(io,   "    final size reduction   : ", round(t.time_final_sr; digits = 3), " s")
 end
@@ -929,8 +941,15 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
 
         sub_transform = nothing
         if width >= 2
+            # Extracting the sub-basis copies a window of the working matrix and
+            # allocating the sub-transform fills n^2 slots. Individually small,
+            # but paid at every level of a recursion that reaches thousands of
+            # levels, so worth seeing rather than inferring.
+            setup_started = _tick()
             sub_basis = Matrix{T}(working[window, window])
             sub_transform = Matrix{T}(undef, width, width)
+            telemetry === nothing || (telemetry.time_setup += _tock(setup_started))
+
             recursion_started = _tick()
             lattice_reduce!(sub_basis, sub_transform;
                             goal = subgoal(resolved_goal, first(window) - 1, last(window)),
@@ -976,9 +995,13 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
 
         # Lift and fold in immediately: the scaling this transform needs is the
         # one currently in force, and holding it unlifted would only cost memory.
-        collect_started = _tick()
+        # Lifting and folding happen in the LOOP, while draining happens in the
+        # finalise block. They had shared a counter, which meant the in-loop
+        # half -- real integer matrix products -- was timed into a figure that
+        # nothing summed, and surfaced only as unaccounted time.
+        push_started = _tick()
         _push_transform!(stack, _lift_transform(window_transform, compression))
-        telemetry === nothing || (telemetry.time_collect += _tock(collect_started))
+        telemetry === nothing || (telemetry.time_push += _tock(push_started))
 
         for i in 1:n
             profile[i] = _log2_abs(factor[i, i])
@@ -1008,6 +1031,10 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
 
         # Everything from this iteration -- the candidate basis, its R factor,
         # the fused factorisation's temporaries -- is now unreachable.
+        # Collection is not free and fires often at high dimension -- every
+        # `gc_interval` iterations at every level -- so it is timed rather than
+        # left to surface as unaccounted.
+        gc_started = _tick()
         if n >= gc_dimension && iszero(mod(iteration, max(gc_interval, 1)))
             # Arbitrary-precision values carry finalizers, and a finalizable
             # object survives one collection: the first queues its finalizer,
@@ -1023,6 +1050,7 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             # resident memory for this workload.
             trim_memory && release_free_memory()
         end
+        telemetry === nothing || (telemetry.time_gc += _tock(gc_started))
 
         # `gc_live_bytes` reports the figure from the most recent collection,
         # so sampling it each iteration tracks a high-water mark rather than the
@@ -1059,6 +1087,9 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         B[i, j] = reduced[i, j]
     end
     reduced = Matrix{T}(undef, 0, 0)
+    # Not added to `time_gc`: this collection sits inside the finalise block and
+    # is already counted there, and counting it twice pushed the accounted total
+    # past 100%.
     n >= gc_dimension && GC.gc(false)
 
     # The profile was tracked in compressed coordinates throughout; restore it.
@@ -1078,10 +1109,15 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         telemetry.time_final_sr += _tock(final_sr_started)
     end
 
+    # Composing the accumulated transform with the final size reduction: another
+    # full-width integer product, and the last part of `finalise` that had no
+    # counter of its own.
+    compose_started = _tick()
     result = _reduction_mul(transform, final_transform)
     for j in 1:n, i in 1:n
         U[i, j] = result[i, j]
     end
+    telemetry === nothing || (telemetry.time_apply += _tock(compose_started))
     for i in 1:n
         profile[i] = _log2_abs(final_factor[i, i])
     end

@@ -59,6 +59,16 @@ const LARGE_CASES = [
 ]
 
 """
+The subset that finishes in seconds rather than minutes: about 17s and 14s
+against 96, 506 and 1054 for the others. Used by [`run_cheap`](@ref) for
+iterating without paying for the full set each time.
+"""
+const CHEAP_CASES = [
+    (family = "random-triangular", size = 256),
+    (family = "knapsack",          size = 255),
+]
+
+"""
     machine_tag() -> String
 
 Something stable enough to notice that a cached timing came from elsewhere.
@@ -133,19 +143,53 @@ function find_reference(entries, machine, family, size, kind, basis)
 end
 
 """
-    run_large(; record_baseline = false, force_fplll = false)
+    run_cheap(; seed = 1)
+
+The two quick cases only, touching nothing on disk.
+
+For iterating on instrumentation or on a change whose effect should show up
+everywhere. Roughly half a minute, against half an hour for the full set. It
+never writes `reference_times.tsv` and never runs fpLLL, so a baseline recorded
+earlier stays exactly as it was.
+
+`scrambled`, `q-ary` and `relation` are excluded because they take 96, 506 and
+1054 seconds respectively. Run [`run_large`](@ref) when the change is ready to
+be judged.
+"""
+run_cheap(; verbose::Bool = false, seed::Integer = 1) =
+    run_large(; cases = CHEAP_CASES, record_baseline = false,
+              skip_fplll = true, verbose = verbose, seed = seed)
+
+"""
+    run_large(; cases, record_baseline = false, force_fplll = false, skip_fplll = false)
 
 Time the large cases, reusing cached reference timings where they exist.
 
 `record_baseline` stores our own time as the figure future runs compare against.
 Do that once, on the current implementation, BEFORE changing anything — a
 baseline captured afterwards measures nothing.
+
+`refresh_baseline` appends a fresh row even when one already exists, which is
+what to use when the OLD baseline is known to be wrong rather than when the
+implementation has changed. The first baselines taken here were measured without
+a warm-up and so included JIT compilation; `find_reference` returns the first
+matching row, so a refreshed row must be added with the stale one deleted from
+the file by hand.
 """
-function run_large(; record_baseline::Bool = false, force_fplll::Bool = false,
-                   seed::Integer = 1)
+function run_large(; cases = LARGE_CASES, record_baseline::Bool = false,
+                   refresh_baseline::Bool = false,
+                   force_fplll::Bool = false, skip_fplll::Bool = false,
+                   verbose::Bool = false, seed::Integer = 1)
     machine = machine_tag()
     entries = load_references()
     families = Dict(f.name => f for f in Flatter.lattice_families())
+
+    # Compile everything on a small instance first. Without this the FIRST case
+    # measured carries the JIT cost of the whole call graph -- 7 of 17 seconds
+    # on a dimension-256 run -- which shows up as unaccounted time and vanishes
+    # for every later case.
+    Flatter.reduce_basis(Flatter.random_triangular_lattice(
+        MersenneTwister(7), 24).basis; want_profile = false)
 
     println("Large cases, dimension ~256. Machine: ", machine)
     println("Cached timings in ", REFERENCE_FILE, "\n")
@@ -153,7 +197,7 @@ function run_large(; record_baseline::Bool = false, force_fplll::Bool = false,
             "family", "dim", "ours(s)", "fplll(s)", "faster", "baseline(s)", "change")
     println(repeat("-", 84))
 
-    for case in LARGE_CASES
+    for case in cases
         family = get(families, case.family, nothing)
         family === nothing && continue
 
@@ -171,7 +215,12 @@ function run_large(; record_baseline::Bool = false, force_fplll::Bool = false,
         # fpLLL, only if we have not already paid for it on this machine.
         cached = force_fplll ? nothing :
                  find_reference(entries, machine, case.family, case.size, "fplll", tag)
-        if cached === nothing
+        if cached === nothing && skip_fplll
+            # Nothing on disk and not allowed to measure: report our own time
+            # alone rather than spending minutes on a comparison not asked for.
+            cached = Reference(machine, case.family, case.size, "fplll", tag,
+                               NaN, NaN, "")
+        elseif cached === nothing
             println("    measuring fplll for ", case.family, " (once; then cached)")
             GC.gc()
             theirs_time = @elapsed theirs, _ = Flatter.fplll_reduce(bundle.basis)
@@ -181,8 +230,9 @@ function run_large(; record_baseline::Bool = false, force_fplll::Bool = false,
                                               string(Dates.now())))
         end
 
-        baseline = find_reference(entries, machine, case.family, case.size, "ours", tag)
-        if record_baseline && baseline === nothing
+        baseline = refresh_baseline ? nothing :
+                   find_reference(entries, machine, case.family, case.size, "ours", tag)
+        if (record_baseline || refresh_baseline) && baseline === nothing
             baseline = save_reference(Reference(machine, case.family, case.size,
                                                 "ours", tag, elapsed, shortest,
                                                 string(Dates.now())))
@@ -196,7 +246,8 @@ function run_large(; record_baseline::Bool = false, force_fplll::Bool = false,
         # Show which way round it is rather than a ratio that rounds to zero:
         # at dimension 256 on q-ary we are twenty times FASTER than fpLLL, and
         # "0.0x" hid that completely.
-        ratio = elapsed <= cached.seconds ?
+        ratio = isnan(cached.seconds) ? "-" :
+                elapsed <= cached.seconds ?
                 @sprintf("%.1fx us", cached.seconds / elapsed) :
                 @sprintf("%.1fx them", elapsed / cached.seconds)
         @printf("%-18s %5d %11.2f %11.2f %9s %11s %s\n",
@@ -205,6 +256,15 @@ function run_large(; record_baseline::Bool = false, force_fplll::Bool = false,
                 change)
 
         print_fused_split(telemetry, elapsed)
+        if verbose
+            # Every counter, including the ones the summary does not add up.
+            # When a residual will not close, the field that is large and
+            # missing from `accounted` is the one to look at.
+            println()
+            show(stdout, telemetry)
+            @printf("      total elapsed          : %.3f s\n", elapsed)
+            println()
+        end
     end
 
     println("\nRecord a baseline with `run_large(record_baseline = true)` BEFORE")
@@ -232,13 +292,17 @@ function print_fused_split(t, total)
             100 * t.fused_split[Flatter.FUSED_TIME_REORTH] / total,
             100 * t.fused_split[Flatter.FUSED_TIME_TRAILING] / total)
     accounted = t.time_fused + t.time_matmul + t.time_finalise + t.time_base +
-                t.time_compress + t.time_dense_qr
+                t.time_compress + t.time_dense_qr + t.time_gc + t.time_setup +
+                t.time_push
     @printf("      matmul %5.1f%%  finalise %5.1f%%  base %5.1f%%  compress %5.1f%%",
             100 * t.time_matmul / total, 100 * t.time_finalise / total,
             100 * t.time_base / total, 100 * t.time_compress / total)
     if t.time_dense_qr > 0.01 * total
         @printf("  denseQR %5.1f%%", 100 * t.time_dense_qr / total)
     end
+    @printf("\n      gc %5.1f%%  setup %5.1f%%  fold-in %5.1f%%",
+            100 * t.time_gc / total, 100 * t.time_setup / total,
+            100 * t.time_push / total)
     if accounted < 0.9 * total
         @printf("  [%.0f%% unaccounted]", 100 * (1 - accounted / total))
     end

@@ -251,7 +251,8 @@ function print_time_breakdown(r)
             t.levels, t.max_depth, t.iterations, t.capped, t.base_cases,
             t.lagrange_calls, t.schoenhage_calls, t.fplll_calls, t.fused_calls)
     accounted = t.time_fused + t.time_matmul + t.time_compress + t.time_base +
-                t.time_finalise + t.time_dense_qr + t.time_profile
+                t.time_finalise + t.time_dense_qr + t.time_profile +
+                t.time_gc + t.time_setup + t.time_push
     @printf("    fusedQR %5.1f%%  matmul %5.1f%%  compress %5.1f%%  base %5.1f%%  finalise %5.1f%%\n",
             100 * t.time_fused / total, 100 * t.time_matmul / total,
             100 * t.time_compress / total, 100 * t.time_base / total,
@@ -289,9 +290,11 @@ function print_time_breakdown(r)
     # applying them to the original basis, and the final size reduction are
     # three quite different costs with three quite different remedies.
     if t.time_finalise > 0.25 * total
-        @printf("      finalise = lift %5.1f%%  apply %5.1f%%  final-SR %5.1f%%\n",
+        # `fold-in` happens in the loop and `combine` in the finalise block, so
+        # only the latter is part of `finalise`; they used to share a counter.
+        @printf("      finalise = combine %5.1f%%  apply %5.1f%%  final-SR %5.1f%%  (fold-in %5.1f%% in loop)\n",
                 100 * t.time_collect / total, 100 * t.time_apply / total,
-                100 * t.time_final_sr / total)
+                100 * t.time_final_sr / total, 100 * t.time_push / total)
     end
     # Live bytes are what the collector still considers reachable; resident is
     # what the process actually holds. A large gap between them is collection
@@ -316,6 +319,27 @@ end
 # --------------------------------------------------------------------------
 
 """
+    warm_up()
+
+Compile the reduction paths on a tiny instance, so that no measurement carries
+the cost of compiling them.
+
+`measure` keeps the fastest of three attempts, which hides the compiling run for
+anything quick — but it stops after one attempt once a run exceeds
+`repeat_under`, so the expensive cases get a single timing. Those are protected
+only by some earlier case happening to compile the same path first, which is
+luck. Both entry points are exercised here, since they compile separately.
+"""
+function warm_up()
+    rng = MersenneTwister(7)
+    Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 24).basis;
+                         want_profile = false)                       # triangular
+    Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
+                         want_profile = false)                       # dense
+    return nothing
+end
+
+"""
     run_family(name, sizes; seed=1, kwargs...) -> Vector
 
 Sweep one lattice family over a list of size parameters.
@@ -328,13 +352,15 @@ The size parameter is not always the dimension: knapsack produces `n+1` columns,
 q-ary `2n`, and relation `n+1` columns in `n+2` rows.
 """
 function run_family(name::AbstractString, sizes = nothing; seed::Integer = 1,
-                    breakdown::Bool = true, time_budget::Real = 60.0, kwargs...)
+                    breakdown::Bool = true, time_budget::Real = 60.0,
+                    warm::Bool = true, kwargs...)
     families = Flatter.lattice_families()
     index = findfirst(f -> f.name == name, families)
     index === nothing && error("unknown family $name; have " *
                                join((f.name for f in families), ", "))
     family = families[index]
     sizes = sizes === nothing ? family.sizes : sizes
+    warm && warm_up()
 
     println("\n=== $(family.name) ===")
     print_header()
@@ -373,11 +399,13 @@ Every family over its own declared range, smallest first so a stall shows up
 before much time has been spent. Pass `sizes` to override every family at once.
 """
 function run_all(; sizes = nothing, seed::Integer = 1, kwargs...)
+    warm_up()
     results = []
     for family in Flatter.lattice_families()
         # Each family carries the range that suits it; `sizes` overrides them
         # all, which is mostly useful for a quick pass at small dimensions.
-        append!(results, run_family(family.name, sizes; seed = seed, kwargs...))
+        append!(results, run_family(family.name, sizes; seed = seed, warm = false,
+                                    kwargs...))
     end
 
     println("\n=== summary ===")
@@ -469,6 +497,7 @@ A faster policy that leaves both unchanged is free; one that degrades either is
 not, however good the timing looks.
 """
 function precision_tradeoff(; sizes = nothing, seed::Integer = 1)
+    warm_up()
     println("\nWorking precision: default against aggressive, same instances\n")
     @printf("%-18s %5s %11s %11s %7s %11s %11s %s\n",
             "family", "dim", "default(ms)", "aggr.(ms)", "speedup",

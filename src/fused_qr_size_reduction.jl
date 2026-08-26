@@ -354,9 +354,41 @@ function _fused_reduce_column!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
     return applied, largest
 end
 
+"""
+Slots in the optional `timings` vector, which splits this factorisation into the
+four things it actually does. They respond very differently to blocking:
+
+  * `FUSED_TIME_REDUCE` -- size reducing a column against its predecessors.
+    Integer work on `B` and `U`, unaffected by blocking.
+  * `FUSED_TIME_REORTH` -- rebuilding a column from the exact integer basis and
+    re-applying every earlier reflector. Blockable in principle: the reflectors
+    of completed panels could be applied as compact-WY products.
+  * `FUSED_TIME_REFLECTOR` -- generating a reflector. Inherently sequential,
+    O(m) each, and blocking cannot touch it.
+  * `FUSED_TIME_TRAILING` -- pushing a reflector through the columns to its
+    right. This is the rank-1 update that blocking replaces with a matrix
+    product, and the only part a panel-blocked rewrite fully addresses.
+
+If the trailing update is not the dominant slot, blocking will buy far less than
+the total cost of this routine suggests.
+"""
+const FUSED_TIME_REDUCE = 1
+const FUSED_TIME_REORTH = 2
+const FUSED_TIME_REFLECTOR = 3
+const FUSED_TIME_TRAILING = 4
+const FUSED_TIME_SLOTS = 4
+
+@inline _fused_tick() = time_ns()
+@inline function _fused_tock!(timings, slot, started)
+    timings === nothing || (timings[slot] += (time_ns() - started) / 1e9)
+    return nothing
+end
+
 function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
                             R::AbstractMatrix{S}, tau::AbstractVector{S};
-                            deadband::S, max_passes::Int) where {T<:Integer, S<:AbstractFloat}
+                            deadband::S, max_passes::Int,
+                            timings::Union{Nothing, Vector{Float64}} = nothing
+                            ) where {T<:Integer, S<:AbstractFloat}
     m, n = size(B)
 
     _set_identity!(U)
@@ -378,7 +410,9 @@ function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
                 "column $column did not reduce in $max_passes passes; the " *
                 "working precision is too low for this basis"))
 
+            reduce_started = _fused_tick()
             applied, largest = _fused_reduce_column!(B, U, R, column, m, deadband, ws)
+            _fused_tock!(timings, FUSED_TIME_REDUCE, reduce_started)
 
             # Nothing was out of bounds, so the column is reduced and its float
             # coordinates are trustworthy.
@@ -398,22 +432,29 @@ function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
             # column is rebuilt from the EXACT integer column and the previous
             # reflectors re-applied. This is what stops error compounding across
             # passes, exactly as in the relative size reduction kernels.
+            reorth_started = _fused_tick()
             for i in 1:m
                 R[i, column] = _to_float(S, B[i, column])
             end
             for j in 1:(column - 1)
                 _fused_larf_col!(R, column, j, tau[j], m, ws)
             end
+            _fused_tock!(timings, FUSED_TIME_REORTH, reorth_started)
         end
 
         # Generate this column's reflector and push it through the columns to
         # the right, so that the next column arrives already orthogonalized
         # against everything before it.
         if column < m
+            reflector_started = _fused_tick()
             tau[column] = _fused_larfg!(R, column, m, ws)
+            _fused_tock!(timings, FUSED_TIME_REFLECTOR, reflector_started)
+
+            trailing_started = _fused_tick()
             for target in (column + 1):n
                 _fused_larf_col!(R, target, column, tau[column], m, ws)
             end
+            _fused_tock!(timings, FUSED_TIME_TRAILING, trailing_started)
         end
     end
 
@@ -497,7 +538,9 @@ function fused_qr_size_reduction!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                                   float_type::Type{<:AbstractFloat} = BigFloat,
                                   precision::Union{Nothing, Integer} = nothing,
                                   deadband::Real = FUSED_QR_DEADBAND,
-                                  max_passes::Integer = FUSED_QR_MAX_PASSES) where {T<:Integer}
+                                  max_passes::Integer = FUSED_QR_MAX_PASSES,
+                                  timings::Union{Nothing, Vector{Float64}} = nothing
+                                  ) where {T<:Integer}
     m, n = size(B)
     m >= n || throw(DimensionMismatch(
         "expected at least as many rows as columns, got $m x $n"))
@@ -515,7 +558,7 @@ function fused_qr_size_reduction!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         return with_precision(bits) do
             R = Matrix{BigFloat}(undef, m, n)
             tau = Vector{BigFloat}(undef, n)
-            _fused_columnwise!(B, U, R, tau;
+            _fused_columnwise!(B, U, R, tau; timings = timings,
                                deadband = BigFloat(deadband),
                                max_passes = Int(max_passes))
             (B, U, R, tau)
@@ -525,7 +568,7 @@ function fused_qr_size_reduction!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     S = float_type
     R = Matrix{S}(undef, m, n)
     tau = Vector{S}(undef, n)
-    _fused_columnwise!(B, U, R, tau;
+    _fused_columnwise!(B, U, R, tau; timings = timings,
                        deadband = S(deadband), max_passes = Int(max_passes))
     return B, U, R, tau
 end

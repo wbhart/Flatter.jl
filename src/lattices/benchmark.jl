@@ -256,6 +256,16 @@ function print_time_breakdown(r)
             100 * t.time_fused / total, 100 * t.time_matmul / total,
             100 * t.time_compress / total, 100 * t.time_base / total,
             100 * t.time_finalise / total)
+    if t.time_fused > 0.10 * total
+        # The four things this factorisation does respond very differently to
+        # blocking: it replaces the trailing update entirely, could be extended
+        # to the re-orthogonalisation, and does nothing for the other two.
+        @printf("      fusedQR = size-red %4.1f%%  reorth %4.1f%%  reflectors %4.1f%%  trailing %4.1f%%\n",
+                100 * t.fused_split[Flatter.FUSED_TIME_REDUCE] / total,
+                100 * t.fused_split[Flatter.FUSED_TIME_REORTH] / total,
+                100 * t.fused_split[Flatter.FUSED_TIME_REFLECTOR] / total,
+                100 * t.fused_split[Flatter.FUSED_TIME_TRAILING] / total)
+    end
     if t.profile_calls > 0 && t.time_profile > 0.01 * total
         # Reporting `info.profile` needs a factorisation of the reduced basis.
         # fplll computes no such thing, so this is work the comparison charges
@@ -433,6 +443,73 @@ end
 
 # Running the file directly does the default sweep. Small sizes first: if the
 # driver is going to stall it should do so cheaply.
+
+"""
+    precision_tradeoff(; sizes, seed)
+
+Time and quality at the two working-precision policies, on identical instances.
+
+`lll_precision` offers `2*spread + 30 + 2n` by default and `spread + 30` under
+`aggressive`. Ball-arithmetic measurement (`lattices/arb_probe.jl`) suggests the
+default carries several hundred bits of headroom, but also that `aggressive` may
+undershoot: at dimension 32 with a spread of 256 the two are 606 and 286 bits,
+and the certifying threshold measured around 406.
+
+MPFR cost scales with precision, so the time difference should be large. What
+matters is whether the quality survives, which is why this reports both and
+compares them on the same basis rather than across runs:
+
+  * `log2|b1|` is what the reduction actually achieved. A higher figure at lower
+    precision means the coordinates were too coarse to size-reduce properly.
+  * `stopped` says whether the goal was met. A run that starts stagnating at
+    lower precision has run out of precision, not out of progress -- exactly
+    what the guard exists to catch.
+
+A faster policy that leaves both unchanged is free; one that degrades either is
+not, however good the timing looks.
+"""
+function precision_tradeoff(; sizes = nothing, seed::Integer = 1)
+    println("\nWorking precision: default against aggressive, same instances\n")
+    @printf("%-18s %5s %11s %11s %7s %11s %11s %s\n",
+            "family", "dim", "default(ms)", "aggr.(ms)", "speedup",
+            "default|b1|", "aggr.|b1|", "verdict")
+    println(repeat("-", 100))
+
+    for family in Flatter.lattice_families()
+        for n in (sizes === nothing ? family.sizes : sizes)
+            bundle = family.generate(MersenneTwister(hash((seed, family.name, n))), n)
+
+            standard = measure(bundle; aggressive = false, progress = false,
+                               run_fplll = false)
+            reduced = measure(bundle; aggressive = true, progress = false,
+                              run_fplll = false)
+            (standard.ours_error !== nothing || reduced.ours_error !== nothing) && continue
+            (isnan(standard.ours_norm_log2) || isnan(reduced.ours_norm_log2)) && continue
+
+            quality_loss = reduced.ours_norm_log2 - standard.ours_norm_log2
+            stalled = reduced.info !== nothing && standard.info !== nothing &&
+                      reduced.info.stopped !== standard.info.stopped
+
+            verdict = quality_loss > 0.01 ? "WORSE by $(round(quality_loss; digits = 2)) bits" :
+                      stalled ? "same length, different stop" :
+                      reduced.ours_time < 0.9 * standard.ours_time ? "free speedup" :
+                      "no difference"
+
+            @printf("%-18s %5d %11.2f %11.2f %6.1fx %11.2f %11.2f %s\n",
+                    bundle.name, bundle.dimension,
+                    1000 * standard.ours_time, 1000 * reduced.ours_time,
+                    standard.ours_time / max(reduced.ours_time, eps()),
+                    standard.ours_norm_log2, reduced.ours_norm_log2, verdict)
+
+            standard.ours_time > 20 && break     # keep the sweep bounded
+        end
+    end
+
+    println("\nA policy is only worth adopting where the verdict is a free")
+    println("speedup across every family: a shorter vector missed on one")
+    println("instance costs more than the time saved on the others.")
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
     run_all()
 end

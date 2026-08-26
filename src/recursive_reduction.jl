@@ -235,36 +235,38 @@ Times are in seconds and count only the phase named, so they do not sum to the
 total: `time_recursion` covers the nested reduction calls and therefore overlaps
 everything measured at deeper levels.
 """
-mutable struct ReductionTelemetry
-    levels::Int
-    max_depth::Int
-    iterations::Int
-    capped::Int
-    stagnated::Int
-    dense_rounds::Int
-    profile_calls::Int
-    measure_memory::Bool
-    peak_live::Int
-    peak_data::Int
-    base_cases::Int
-    lagrange_calls::Int
-    schoenhage_calls::Int
-    fplll_calls::Int
-    fused_calls::Int
-    time_fused::Float64
-    time_matmul::Float64
-    time_compress::Float64
-    time_base::Float64
-    time_recursion::Float64
-    time_finalise::Float64
-    time_collect::Float64
-    time_apply::Float64
-    time_final_sr::Float64
-    time_dense_qr::Float64
-    time_profile::Float64
+# Defaults live on the fields, so adding one cannot desynchronise a positional
+# constructor -- which it did, twice, while this struct was growing.
+Base.@kwdef mutable struct ReductionTelemetry
+    levels::Int = 0
+    max_depth::Int = 0
+    iterations::Int = 0
+    capped::Int = 0
+    stagnated::Int = 0
+    dense_rounds::Int = 0
+    profile_calls::Int = 0
+    measure_memory::Bool = false
+    peak_live::Int = 0
+    peak_data::Int = 0
+    base_cases::Int = 0
+    lagrange_calls::Int = 0
+    schoenhage_calls::Int = 0
+    fplll_calls::Int = 0
+    fused_calls::Int = 0
+    time_fused::Float64 = 0.0
+    time_matmul::Float64 = 0.0
+    time_compress::Float64 = 0.0
+    time_base::Float64 = 0.0
+    time_recursion::Float64 = 0.0
+    time_finalise::Float64 = 0.0
+    time_collect::Float64 = 0.0
+    time_apply::Float64 = 0.0
+    time_final_sr::Float64 = 0.0
+    time_dense_qr::Float64 = 0.0
+    time_profile::Float64 = 0.0
+    fused_split::Vector{Float64} = zeros(Float64, FUSED_TIME_SLOTS)
 end
 
-ReductionTelemetry() = ReductionTelemetry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 function Base.show(io::IO, t::ReductionTelemetry)
     println(io, "ReductionTelemetry:")
@@ -289,6 +291,14 @@ function Base.show(io::IO, t::ReductionTelemetry)
                 " Schoenhage, ", t.fplll_calls, " fplll)")
     println(io, "  fused QR calls           : ", t.fused_calls)
     println(io, "  time in fused QR         : ", round(t.time_fused; digits = 3), " s")
+    if t.time_fused > 0
+        names = ("size reduction", "re-orthogonalise", "reflectors", "trailing update")
+        for slot in 1:FUSED_TIME_SLOTS
+            println(io, "    ", rpad(names[slot], 21), ": ",
+                        round(t.fused_split[slot]; digits = 3), " s (",
+                        round(100 * t.fused_split[slot] / t.time_fused; digits = 1), "%)")
+        end
+    end
     println(io, "  time in matrix products  : ", round(t.time_matmul; digits = 3), " s")
     println(io, "  time in compression      : ", round(t.time_compress; digits = 3), " s")
     println(io, "  time in base cases       : ", round(t.time_base; digits = 3), " s")
@@ -951,8 +961,9 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
 
         size_reduction = Matrix{T}(undef, n, n)
         fused_started = _tick()
-        _, _, factor, _ = fused_qr_size_reduction!(candidate, size_reduction;
-                                                   precision = precision)
+        _, _, factor, _ = fused_qr_size_reduction!(
+            candidate, size_reduction; precision = precision,
+            timings = telemetry === nothing ? nothing : telemetry.fused_split)
         if telemetry !== nothing
             telemetry.time_fused += _tock(fused_started)
             telemetry.fused_calls += 1

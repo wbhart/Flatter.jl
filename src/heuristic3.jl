@@ -1,0 +1,433 @@
+# heuristic3.jl
+#
+# The tiled representation update: flatter's `Heuristic3`.
+#
+# WHAT THIS REPLACES
+#
+# `RecursiveGeneric::update_representation`, which this package currently
+# follows, folds each sublattice reduction into the basis and then re-factorises
+# the WHOLE matrix from scratch:
+#
+#     for each sublattice i
+#         B_next *= U_tmp                       (full n-by-n product)
+#         FusedQRSizeReduction(B_next, R, U_sr) (full n-by-n factorisation)
+#         U_i *= U_tmp * U_sr
+#
+# `Heuristic3` never factorises the whole matrix. The columns are partitioned
+# into tiles -- one per sublattice window, plus one for each gap between them --
+# and the update works tile by tile:
+#
+#     U_i          <- block diagonal of the sublattice transforms
+#     B_next[r, c] <- B[r, c] * U_i[c, c]       for r <= c, per tile pair
+#     R[c, c]      <- QR(B_next[c, c])          per diagonal tile
+#     R[r, c]      <- size reduce tile c against tile r, bottom up
+#
+# So the O(n^3) factorisation becomes a set of tile-sized ones, and the
+# off-diagonal blocks of R come from relative size reduction rather than from a
+# global sweep. That is the substance of `Heuristic3`; its tiling is a serial
+# optimisation, not a threading device -- `Threaded3` is the threaded variant and
+# `heuristic_3.cpp` contains no OpenMP at all.
+#
+# WHAT IT COSTS
+#
+# The R factor is no longer a single global factorisation, so it is only as good
+# as the tile decomposition. flatter accepts this: the profile it reads back is
+# used to steer the reduction, not to certify it, and the exact invariants live
+# in the integer matrices regardless.
+
+"""
+    Tile
+
+A contiguous range of columns, and whether a sublattice reduction acted on it.
+
+`reduce = false` marks a gap between windows. Those tiles are carried through the
+update unchanged -- there is no transform to apply and no factorisation to
+redo -- which is most of what makes the tiled update cheaper than the generic
+one.
+"""
+struct Tile
+    range::UnitRange{Int}
+    reduce::Bool
+end
+
+Base.length(t::Tile) = length(t.range)
+Base.first(t::Tile) = first(t.range)
+Base.last(t::Tile) = last(t.range)
+
+"""
+    tile_partition(windows, n) -> (tiles, reducible)
+
+Partition `1:n` into tiles from a sorted, disjoint list of sublattice windows.
+
+Each window becomes a tile marked for reduction; every gap becomes a tile that is
+not. `reducible` indexes the tiles that came from windows, in order, so a caller
+holding one transform per window can match them up without searching.
+
+A port of `Heuristic3::init_tiles`.
+"""
+function tile_partition(windows::AbstractVector{UnitRange{Int}}, n::Integer)
+    n = Int(n)
+    n >= 0 || throw(ArgumentError("n must be nonnegative"))
+
+    tiles = Tile[]
+    reducible = Int[]
+    previous = 0
+
+    for window in windows
+        isempty(window) && continue
+        first(window) > previous || throw(ArgumentError(
+            "windows must be sorted and disjoint; $window follows column $previous"))
+        last(window) <= n || throw(ArgumentError("window $window exceeds $n columns"))
+
+        if first(window) > previous + 1
+            push!(tiles, Tile((previous + 1):(first(window) - 1), false))
+        end
+        push!(reducible, length(tiles) + 1)
+        push!(tiles, Tile(window, true))
+        previous = last(window)
+    end
+
+    previous < n && push!(tiles, Tile((previous + 1):n, false))
+    return tiles, reducible
+end
+
+"""
+    embed_transforms!(U, tiles, reducible, transforms) -> U
+
+Place each sublattice transform into its own diagonal block of `U`, leaving the
+rest the identity.
+
+The result is block diagonal, which is what lets the basis update below work one
+tile pair at a time: column tile `c` is only ever multiplied by `U[c, c]`.
+"""
+function embed_transforms!(U::AbstractMatrix{T}, tiles::Vector{Tile},
+                           reducible::Vector{Int},
+                           transforms::Vector{<:AbstractMatrix{T}}) where {T<:Integer}
+    length(reducible) == length(transforms) || throw(DimensionMismatch(
+        "$(length(reducible)) reducible tiles but $(length(transforms)) transforms"))
+    _set_identity!(U)
+
+    for (slot, index) in enumerate(reducible)
+        range = tiles[index].range
+        block = transforms[slot]
+        size(block) == (length(range), length(range)) || throw(DimensionMismatch(
+            "transform $slot is $(size(block)) but its tile spans $(length(range))"))
+        for (j, column) in enumerate(range), (i, row) in enumerate(range)
+            U[row, column] = block[i, j]
+        end
+    end
+    return U
+end
+
+"""
+    tiled_basis_update!(B_next, B, U, tiles) -> B_next
+
+`B_next = B * U`, for a `U` that is block diagonal over `tiles`.
+
+Column tile `c` depends only on `U[c, c]`, so the product is a set of tile-sized
+multiplications rather than one of order `n`. A tile that was not reduced has the
+identity on its diagonal block, so its columns are copied rather than multiplied.
+
+Only the blocks at or above the diagonal are touched: `B` is upper triangular by
+tile, so everything below is structurally zero.
+
+A port of `Heuristic3::update_b`.
+"""
+function tiled_basis_update!(B_next::AbstractMatrix{T}, B::AbstractMatrix{T},
+                             U::AbstractMatrix{T},
+                             tiles::Vector{Tile}) where {T<:Integer}
+    for (c, column_tile) in enumerate(tiles)
+        columns = column_tile.range
+        for r in 1:c
+            rows = tiles[r].range
+            if !column_tile.reduce
+                # Nothing acted on this tile, so its columns pass straight
+                # through. This is where the saving is: a run with one window
+                # per iteration leaves most tiles untouched.
+                for j in columns, i in rows
+                    B_next[i, j] = B[i, j]
+                end
+                continue
+            end
+            product = _reduction_mul(Matrix{T}(view(B, rows, columns)),
+                                     Matrix{T}(view(U, columns, columns)))
+            for (jj, j) in enumerate(columns), (ii, i) in enumerate(rows)
+                B_next[i, j] = product[ii, jj]
+            end
+        end
+    end
+    return B_next
+end
+
+"""
+    tiled_diagonal_qr!(R, tau, B_next, tiles, precision) -> (R, tau)
+
+Factorise each reduced tile's diagonal block on its own, writing the result into
+the corresponding block of `R`.
+
+This is the step that removes the global factorisation: instead of one QR of
+order `n`, there is one per reduced tile, of that tile's order. Tiles that were
+not reduced keep whatever `R` already held for them.
+
+A port of `Heuristic3::qr`.
+"""
+function tiled_diagonal_qr!(R::AbstractMatrix{S}, tau::AbstractVector{S},
+                            B_next::AbstractMatrix{T}, tiles::Vector{Tile},
+                            precision::Integer) where {T<:Integer, S<:AbstractFloat}
+    bits = Int(precision)
+    for tile in tiles
+        range = tile.range
+
+        if !tile.reduce
+            # A gap tile passes through untouched, so its block is still upper
+            # triangular and is therefore its own R factor. flatter can skip
+            # this because its `R` persists between iterations and already holds
+            # the answer; ours is built fresh each time, and leaving the block
+            # zero puts a -Inf in the profile.
+            with_precision(bits) do
+                for j in range, i in range
+                    R[i, j] = i <= j ? S(B_next[i, j]) : zero(S)
+                end
+                for i in range
+                    tau[i] = zero(S)
+                end
+            end
+            continue
+        end
+        block = with_precision(bits) do
+            factors, scalars = householder_block(
+                bigfloat_matrix(view(B_next, range, range), bits))
+            (factors, scalars)
+        end
+        factors, scalars = block
+        for (j, column) in enumerate(range), (i, row) in enumerate(range)
+            R[row, column] = factors[i, j]
+        end
+        for (i, row) in enumerate(range)
+            tau[row] = scalars[i]
+        end
+    end
+    return R, tau
+end
+
+"""
+    tiled_size_reduction!(B, B_next, U_i, U_sr, R, tau, tiles, precision)
+
+Size reduce the tiled representation, one tile pair at a time.
+
+For each column tile, the tiles above it are reduced against their own diagonal
+block, working BOTTOM UP so that a reduction is never undone by one below it.
+Each step produces a transform for that tile pair, which is then propagated to
+the tiles above it in the same column and folded into the running `U_i`.
+
+`U_sr` AND `U_i` ARE NOT THE SAME THING, and confusing them is easy. `U_sr`
+holds each tile pair's transform on its own, as scratch handed from one step to
+the next -- flatter's `U_sr`, passed into `update_b_next` and `update_u`. `U_i`
+accumulates their PRODUCT, and is the transform satisfying
+
+    B_next == B_on_entry * U_i
+
+With one or two tiles the two coincide, because there is at most one pair and no
+cross term; from three tiles on they diverge, since `U_i[t1, t3]` picks up
+`U_i[t1, t2] * U_sr[t2, t3]` and `U_sr` never sees it. Callers want `U_i`.
+
+The diagonal block a tile is reduced against comes in one of two forms, and
+telling `relative_size_reduction!` which saves it a factorisation:
+
+  * a REDUCED tile already has its QR in `R` and `tau` from
+    [`tiled_diagonal_qr!`](@ref), passed as `factors`/`compact_T`;
+  * a tile that was not reduced is still upper triangular from the previous
+    iteration, so `triangular = true` and no factorisation is needed at all.
+
+A port of `Heuristic3::sr`, `update_b_next` and `update_u`.
+"""
+function tiled_size_reduction!(B::AbstractMatrix{T}, B_next::AbstractMatrix{T},
+                               U_i::AbstractMatrix{T}, U_sr::AbstractMatrix{T},
+                               R::AbstractMatrix{S}, tau::AbstractVector{S},
+                               tiles::Vector{Tile};
+                               precision::Integer,
+                               strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF
+                               ) where {T<:Integer, S<:AbstractFloat}
+    _set_identity!(U_sr)
+    bits = Int(precision)
+
+    # Everything below allocates BigFloats -- the compact-WY factor, and the
+    # temporaries inside the relative size reduction -- and BigFloat arithmetic
+    # takes its precision from the global default rather than from its operands.
+    # `R` and `tau` already hold values at `bits`, so without this the two would
+    # disagree and `assert_precision` would refuse them. See Notes.md: it is the
+    # COMPUTATION that has to be wrapped, not just the allocations.
+    return with_precision(bits) do
+        _tiled_size_reduction_body!(B, B_next, U_i, U_sr, R, tau, tiles, bits,
+                                    Int(strassen_cutoff))
+    end
+end
+
+function _tiled_size_reduction_body!(B::AbstractMatrix{T}, B_next::AbstractMatrix{T},
+                                     U_i::AbstractMatrix{T}, U_sr::AbstractMatrix{T},
+                                     R::AbstractMatrix{S}, tau::AbstractVector{S},
+                                     tiles::Vector{Tile}, bits::Int,
+                                     strassen_cutoff::Int) where {T<:Integer, S<:AbstractFloat}
+    for column_index in 1:length(tiles)
+        columns = tiles[column_index].range
+
+        # Bottom up: reducing against a lower diagonal block changes the entries
+        # a higher one would have seen, so the order is not free.
+        for row_index in (column_index - 1):-1:1
+            row_tile = tiles[row_index]
+            rows = row_tile.range
+
+            B1 = Matrix{T}(view(B, rows, rows))
+            B2 = Matrix{T}(view(B_next, rows, columns))
+            block = Matrix{T}(undef, length(rows), length(columns))
+
+            # The precision this reduction needs is set by the tile pair, not by
+            # the driver: it depends on the ratio between the block being reduced
+            # and the smallest diagonal it is reduced against. Forcing the
+            # driver's figure on it -- chosen for the WHOLE matrix -- can leave
+            # it short, and an under-provisioned relative size reduction does not
+            # fail. It runs every refinement pass on every column without
+            # converging, which reads as an unaccountably slow run.
+            required = relative_size_reduction_precision(B1)
+
+            if row_tile.reduce && required <= bits
+                # Its QR is already in R and tau at `bits`, which is enough, so
+                # hand those over rather than recomputing them.
+                factors = Matrix{S}(view(R, rows, rows))
+                scalars = Vector{S}(view(tau, rows))
+                compact = compact_wy_from_reflectors(factors, scalars)
+                _, _, R2 = relative_size_reduction!(B1, B2, block;
+                                                    factors = factors,
+                                                    compact_T = compact,
+                                                    precision = bits,
+                                                    strassen_cutoff = strassen_cutoff)
+            elseif row_tile.reduce
+                # The stored factorisation is too coarse for this pair, so let
+                # the reduction build its own at the precision it needs.
+                _, _, R2 = relative_size_reduction!(B1, B2, block;
+                                                    strassen_cutoff = strassen_cutoff)
+            else
+                # Untouched since the previous iteration, so still triangular;
+                # no factorisation is needed at any precision.
+                _, _, R2 = relative_size_reduction!(B1, B2, block;
+                                                    triangular = true,
+                                                    precision = max(bits, required),
+                                                    strassen_cutoff = strassen_cutoff)
+            end
+
+            for (jj, j) in enumerate(columns), (ii, i) in enumerate(rows)
+                B_next[i, j] = B2[ii, jj]
+                U_sr[i, j] = block[ii, jj]
+            end
+
+            # The coordinates of the reduced block in this tile's frame are the
+            # off-diagonal block of R -- flatter's `params.R2`. Without them the
+            # compression sees a block-diagonal R and produces a basis that has
+            # lost everything above the diagonal.
+            if R2 !== nothing
+                # Converted, not assigned: a reduction that needed more
+                # precision than the driver's returns `R2` at ITS figure, and
+                # storing that verbatim would leave `R` holding entries of two
+                # different widths. This runs inside a `with_precision(bits)`
+                # block, so the conversion lands at the driver's precision.
+                for (jj, j) in enumerate(columns), (ii, i) in enumerate(rows)
+                    R[i, j] = S(R2[ii, jj])
+                end
+            end
+
+            # Propagate: the same transform applies to every tile above this one
+            # in the same column, for the basis and for the running transform.
+            _tiled_accumulate!(B_next, B, U_sr, tiles, row_index, column_index,
+                               1:(row_index - 1))
+            _tiled_accumulate!(U_i, U_i, U_sr, tiles, row_index, column_index,
+                               1:row_index)
+
+            for j in columns, i in 1:last(rows)
+                B[i, j] = B_next[i, j]
+            end
+        end
+    end
+    return B_next, U_sr
+end
+
+"""
+`target[k, col] += source[k, row] * U_sr[row, col]`, over the tiles in `above`.
+
+Split out because the basis and the running transform need the same propagation
+against different sources: the basis reads the PREVIOUS iterate while the
+transform accumulates into itself.
+"""
+function _tiled_accumulate!(target::AbstractMatrix{T}, source::AbstractMatrix{T},
+                            U_sr::AbstractMatrix{T}, tiles::Vector{Tile},
+                            row_index::Int, column_index::Int,
+                            above) where {T<:Integer}
+    rows = tiles[row_index].range
+    columns = tiles[column_index].range
+    factor = Matrix{T}(view(U_sr, rows, columns))
+    all(iszero, factor) && return nothing
+
+    for k in above
+        band = tiles[k].range
+        product = _reduction_mul(Matrix{T}(view(source, band, rows)), factor)
+        for (jj, j) in enumerate(columns), (ii, i) in enumerate(band)
+            target[i, j] += product[ii, jj]
+        end
+    end
+    return nothing
+end
+
+"""
+    heuristic3_update!(working, window, sub_transform, n, precision; kwargs...)
+
+One iteration's representation update, done tile by tile.
+
+Returns `(basis, transform, R, tau)`: the updated basis, the transform taking the
+old basis to it, and the R factor assembled from the tile factorisations.
+
+This is `Heuristic3::update_representation`, and it replaces the generic route of
+folding in the sublattice transform and then re-factorising the whole matrix. The
+columns are cut into tiles at the window boundaries, each reduced tile is
+factorised on its own, and the off-diagonal blocks of `R` come from relative size
+reduction between tiles.
+
+The R factor is therefore assembled locally rather than being a single global
+factorisation. flatter accepts that: the profile it yields steers the reduction
+rather than certifying it, and the exact invariants live in the integer matrices
+either way -- `basis == working * transform` holds regardless of how the tiles
+are cut.
+"""
+function heuristic3_update!(working::AbstractMatrix{T}, window::UnitRange{Int},
+                            sub_transform::AbstractMatrix{T}, n::Int,
+                            precision::Integer;
+                            float_type::Type{S} = BigFloat,
+                            strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF
+                            ) where {T<:Integer, S<:AbstractFloat}
+    tiles, reducible = tile_partition([window], n)
+
+    transform = Matrix{T}(undef, n, n)
+    embed_transforms!(transform, tiles, reducible, [Matrix{T}(sub_transform)])
+
+    basis = Matrix{T}(undef, n, n)
+    for j in 1:n, i in 1:n
+        basis[i, j] = zero(T)
+    end
+    tiled_basis_update!(basis, working, transform, tiles)
+
+    # Allocated INSIDE the precision block: a `zeros(BigFloat, ...)` outside it
+    # would hold entries at the default precision, and the tiles written by the
+    # factorisation would then disagree with the ones left untouched.
+    R, tau = with_precision(Int(precision)) do
+        (zeros(S, n, n), zeros(S, n))
+    end
+    tiled_diagonal_qr!(R, tau, basis, tiles, precision)
+
+    # `tiled_size_reduction!` reads the previous iterate from its first argument
+    # and writes the current one to its second, so they start equal.
+    previous = Matrix{T}(basis)
+    scratch = Matrix{T}(undef, n, n)
+    tiled_size_reduction!(previous, basis, transform, scratch, R, tau, tiles;
+                          precision = precision,
+                          strassen_cutoff = strassen_cutoff)
+
+    return basis, transform, R, tau
+end

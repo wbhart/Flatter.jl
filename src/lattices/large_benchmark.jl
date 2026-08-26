@@ -69,6 +69,32 @@ const CHEAP_CASES = [
 ]
 
 """
+`relation` at a dimension small enough to sweep but large enough to be
+representative — the full case at 256 takes about 1050 seconds, this one a
+couple of minutes.
+
+It is the family where the trailing update is large (19.7% at dimension 256
+against 2.9% for random-triangular), so it is the one where panelling could
+plausibly pay.
+"""
+const RELATION_PROBE = [(family = "relation", size = 128)]
+
+"""
+Modest sizes for comparing the tiled representation update against the
+monolithic one.
+
+The tiled route is a different computation and may be far slower before it is
+tuned, so the first comparison should be at a size where a tenfold loss still
+finishes in under a minute. `CHEAP_CASES` at dimension 256 is not that: a run
+that takes twenty minutes is indistinguishable from a hang, because nothing is
+printed until the first row completes.
+"""
+const TILED_PROBE = [
+    (family = "random-triangular", size = 64),
+    (family = "knapsack",          size = 63),
+]
+
+"""
     machine_tag() -> String
 
 Something stable enough to notice that a cached timing came from elsewhere.
@@ -131,15 +157,21 @@ function save_reference(entry::Reference)
     return entry
 end
 
+"""
+The LAST matching row wins, so a refreshed baseline supersedes a stale one
+without the old row having to be deleted by hand. Rows are only ever appended,
+so the file keeps its history.
+"""
 function find_reference(entries, machine, family, size, kind, basis)
+    found = nothing
     for e in entries
         e.family == family && e.size == size && e.kind == kind &&
             e.basis == basis || continue
         e.machine == machine ||
             @warn "cached timing came from another machine" family size kind e.machine
-        return e
+        found = e
     end
-    return nothing
+    return found
 end
 
 """
@@ -308,6 +340,111 @@ function print_fused_split(t, total)
     end
     println()
     return nothing
+end
+
+"""
+    tiled_compare(; cases, seed)
+
+The `Heuristic3` representation update against the monolithic one, on the same
+instances, writing nothing to disk.
+
+They are different computations: the tiled version factorises each tile on its
+own and assembles `R` locally, so it reaches a different representative of the
+same lattice. Time and quality both have to be read, since a faster route to a
+worse basis is not an improvement.
+"""
+function tiled_compare(; cases = TILED_PROBE, seed::Integer = 1,
+                       budget::Real = 300.0)
+    families = Dict(f.name => f for f in Flatter.lattice_families())
+    Flatter.reduce_basis(Flatter.random_triangular_lattice(
+        MersenneTwister(7), 24).basis; want_profile = false)
+
+    @printf("%-18s %5s %11s %11s %8s %11s %11s\n",
+            "family", "dim", "plain(s)", "tiled(s)", "change", "plain|b1|", "tiled|b1|")
+    println(repeat("-", 82))
+    println("(a run over the budget is skipped rather than waited on)")
+
+    for case in cases
+        family = get(families, case.family, nothing)
+        family === nothing && continue
+        bundle = family.generate(MersenneTwister(hash((seed, case.family, case.size))),
+                                 case.size)
+
+        # Announce before each half. The tiled route can be much the slower, and
+        # a silent wait gives no way to tell slow from stuck.
+        print(stderr, "    [", case.family, " dim ",
+              Base.size(bundle.basis, 2), "] plain ...\n"); flush(stderr)
+        GC.gc()
+        plain_time = @elapsed plain, _, _ = Flatter.reduce_basis(
+            bundle.basis; tiled = false, want_profile = false)
+
+        if plain_time > budget
+            @printf("%-18s %5d %11.2f %11s %8s %11.2f %11s\n",
+                    case.family, Base.size(bundle.basis, 2), plain_time,
+                    "skipped", "-", shortest_norm_log2(plain), "-")
+            continue
+        end
+
+        print(stderr, "    [", case.family, " dim ",
+              Base.size(bundle.basis, 2), "] tiled ...\n"); flush(stderr)
+        GC.gc()
+        tiled_time = @elapsed tiled, _, _ = Flatter.reduce_basis(
+            bundle.basis; tiled = true, want_profile = false)
+
+        @printf("%-18s %5d %11.2f %11.2f %7.2fx %11.2f %11.2f\n",
+                case.family, Base.size(bundle.basis, 2), plain_time, tiled_time,
+                plain_time / tiled_time,
+                shortest_norm_log2(plain), shortest_norm_log2(tiled))
+    end
+
+    println("\nA shorter time with a longer vector is not an improvement.")
+end
+
+"""
+    panel_sweep(; cases, panels, blocks)
+
+Time the cheap cases across panel and block sizes, writing nothing to disk.
+
+Both parameters are exact — the integer results do not depend on either — so the
+only question is speed, and the best value is a property of the machine and the
+dimension rather than a constant worth guessing. A panel too narrow spends its
+time building compact-WY factors for a few reflectors; too wide and each
+deferred column still has to be brought up to date elementwise when its turn
+comes.
+"""
+function panel_sweep(; cases = CHEAP_CASES, panels = (0, 8, 16, 32, 64, 128),
+                     blocks = (16,), seed::Integer = 1)
+    warmed = false
+    families = Dict(f.name => f for f in Flatter.lattice_families())
+
+    for case in cases
+        family = get(families, case.family, nothing)
+        family === nothing && continue
+        bundle = family.generate(MersenneTwister(hash((seed, case.family, case.size))),
+                                 case.size)
+        if !warmed
+            Flatter.reduce_basis(Flatter.random_triangular_lattice(
+                MersenneTwister(7), 24).basis; want_profile = false)
+            warmed = true
+        end
+
+        println("\n--- ", case.family, ", dimension ", Base.size(bundle.basis, 2), " ---")
+        @printf("%8s %8s %11s %11s\n", "panel", "block", "time(s)", "fusedQR")
+        println(repeat("-", 42))
+
+        for block in blocks, panel in panels
+            telemetry = Flatter.ReductionTelemetry()
+            GC.gc()
+            elapsed = @elapsed Flatter.reduce_basis(
+                bundle.basis; blocksize = block, panelsize = panel,
+                telemetry = telemetry, want_profile = false)
+            @printf("%8s %8d %11.2f %10.1f%%\n",
+                    panel == 0 ? "off" : string(panel), block, elapsed,
+                    100 * telemetry.time_fused / elapsed)
+        end
+    end
+
+    println("\nBoth settings are exact, so the fastest is simply the best.")
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

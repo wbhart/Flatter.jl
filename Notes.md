@@ -53,6 +53,8 @@ reasoning is in the code comments and docstrings.
 
 * **Use `with_precision(f, bits)`, not `setprecision(BigFloat, bits) do ... end`.** The block form installs a `ScopedValue`, and every subsequent `BigFloat` allocation then resolves the precision through a `PersistentDict` lookup — ruinous in code that allocates temporaries in inner loops. `with_precision` sets the default directly and restores it in a `finally`. It is **not task-safe**; revisit every call site if this package ever threads. A bare `setprecision` with no restoration remains wrong — it leaks the precision to the caller.
 
+* **Wrapping a precision block around the caller hides the bug; the callee must wrap itself.** Every `heuristic3.jl` test passed while the driver failed, because the tests wrapped the call in `setprecision` and the driver did not. `compact_wy_from_reflectors` allocates its `T` at the DEFAULT precision, so it disagreed with an `R` built at the working precision and `assert_precision` refused it. Any function that allocates BigFloats and is called from unwrapped code has to establish its own scope — and at least one test must call it without a surrounding block, or the whole class of fault is invisible.
+
 * **Wrap whole computations, not just allocations.** `Matrix{BigFloat}(undef, ...)` pins nothing; it is the arithmetic that reads the default. Applies to `householder_block`, `apply_Qt!` and every BigFloat kernel — none of them establish their own scope.
 
 * **`precision(A[1,1])` does not describe the matrix.** Entries can differ after a stray write. Use `uniform_precision` / `assert_precision`.
@@ -89,9 +91,13 @@ reasoning is in the code comments and docstrings.
 
 * **Heuristic `goal_max_drop(g) / n` recovers the input slope exactly.** The `shape` function cancels between `from_slope` and `max_drop`, so `quality` is a pure scale factor with no dimensional meaning of its own. `_goal_shape(1) == 0`, so dimension-one goals are guarded.
 
+* **Do not force the driver's precision on a relative size reduction.** It computes its own from the block it reduces against, and the two diverge with dimension: at n=64 the driver gives ~278 bits against ~306 required, at n=256 ~662 against ~734. Under-provisioned it does not fail — it runs every refinement pass on every column without converging, the profile barely moves, and the driver then needs more iterations. Both compound, which is how a dimension-64 case finishing in 0.39s becomes a dimension-256 case that does not finish in fifteen minutes. Where the stored factorisation is too coarse, let the reduction build its own; and convert the `R2` it returns back to the driver's precision, or `R` ends up holding entries of two widths.
+
 * **Relative size reduction's precision requirement is set by the block magnitude ratio, not just conditioning.** Coordinates are known only to `max|B2| * 2^-p`, so reducing to the deadband needs `p > log2(max|B2| / min|R_jj|)` with margin. The `max|B2|` is the magnitude *after* reduction — only the component of `B2` in `B1`'s span can shrink, so a large orthogonal component sets a floor that no number of refinement passes can lower. Under-provisioning isn't an error: the convergence guard stops, `U` stays exact and unimodular, and only reduction quality suffers.
 
 * **The second convergence guard is load-bearing.** `max_mu >= prev_max` (precision exhausted) is what stops a badly conditioned input at 53 bits looping forever. It is not redundant with the unit-magnitude test.
+
+* **Size reduction bounds entries against the DIAGONAL they are reduced against, not against `max|B|`.** So `max|B|` need not fall, and can drift up by a few parts per billion as other rows' updates propagate. A basis whose off-diagonal entries are already small relative to the diagonal is already size-reduced, and a test that expects the maximum to shrink there is testing nothing. To exercise a reduction, the off-diagonal entries must exceed the diagonal of the block they are reduced against.
 
 * **Size-reduction bound isn't 1/2 on the orthogonal kernels.** flatter uses a 0.51 deadband and terminates on a unit-magnitude test, so expect ~0.51 plus float error. Only `Triangular` achieves a strict 1/2. The exactly testable invariant on every path is `B2_new == B2_old + B1*U` over `BigInt`.
 
@@ -193,11 +199,33 @@ reasoning is in the code comments and docstrings.
 
 * **Two dominant costs remain, and which one leads depends on the family.** Adding up where integer matrix products happen — `matmul` plus `lift` plus `apply` — gives 65% on ideal-96 and 55% on spread-48, against a fused QR of 6-10% there. On q-ary-96 and relation-97 it inverts: fused QR 44-46%, integer products 15-24%. `lift` and `apply` were previously folded into a `finalise` total and not attributed. The levers are multi-modular integer multiplication and panel-blocking the fused QR respectively.
 
+* **Dimension-256 baseline, AMD Ryzen 7 5800H, recorded after the warm-up fix.** Ours against fpLLL in seconds: random-triangular 10.1/0.87, scrambled 104.0/82.5, knapsack 13.9/3.11, q-ary 509.7/12092.5, relation 1055.1/960.4. Phase shares, in the order fusedQR / finalise / gc / fold-in / matmul:
+
+  | family | fusedQR | (size-red, reorth, trailing) | finalise | gc | fold-in | matmul |
+  |---|---|---|---|---|---|---|
+  | random-triangular | 37.3% | 30.4, 2.1, 2.4 | 28.5% | 5.5% | 13.4% | 5.0% |
+  | scrambled | 29.1% | 15.4, 5.6, 7.3 | 15.0% | 16.5% | 18.0% | 7.6% |
+  | knapsack | 18.3% | 7.5, 3.9, 6.1 | 27.3% | 21.7% | 20.5% | 6.0% |
+  | q-ary | 35.0% | 19.8, 6.5, 7.7 | 7.7% | 22.2% | 17.1% | 5.4% |
+  | relation | 41.9% | 6.0, 15.7, 19.7 | 34.8% | 4.4% | 2.6% | 1.2% |
+
+  Everything accounts to within 10%. `lattices/reference_times.tsv` holds these and fpLLL's timings, keyed by a hash of the basis.
+
 * **At dimension 256 on q-ary we are 22x faster than fpLLL** — 536s against 12,092s — while `scrambled` and `relation` sit at parity and `random-triangular` and `knapsack` remain behind. That is the flatter result: the recursion is worth its overhead once the dimension is large enough, and the families where it wins are the ones with a profile worth compressing.
+
+* **Whether panel blocking helps depends on the family, at dimension 256.** relation's fused QR is 41.9% of which trailing is 19.7% and re-orthogonalisation 15.7% — 35% addressable — against size reduction at 6.0%. random-triangular is the exact inverse: 30.4% size reduction against 2.4% trailing. So blocking would nearly halve relation's factorisation and do almost nothing for random-triangular.
+
+* **Integer matrix products are the second cost everywhere, and no part of `Heuristic3` touches them.** `fold-in` (folding lifted transforms into the stack) plus `apply` inside `finalise` plus `matmul`: 13-21% for `fold-in` alone on four of the five families, and knapsack's `fold-in` at 20.5% exceeds its entire fused QR at 18.3%. That is the multi-modular lever.
+
+* **Benchmark timings must be warmed up.** The first case measured carried the JIT cost of the whole call graph — 7 of 17 seconds on a dimension-256 run — surfacing as unaccounted time and vanishing for every later case. `measure` in the main benchmark keeps the fastest of three attempts, which hides it for quick cases, but it stops after one attempt past `repeat_under`, so the expensive cases had no protection beyond luck. Both benchmarks now call `warm_up()`, exercising the triangular and dense entry points separately.
 
 * **The phase mix shifts with dimension, so a verdict taken at one size need not hold at another.** relation's fused QR at dim 97 is size-reduction-dominated (15.9% against 12.6% trailing); at dim 256 it inverts (6.9% against 19.9% trailing, plus 15.0% re-orthogonalisation). random-triangular goes the other way — 18.7% size reduction against 1.3% trailing at 256. So "panel blocking is not worth doing", concluded from dim 96-128 figures, is wrong for relation at 256 and right for random-triangular. Measure at the size you care about.
 
 * **`Heuristic3` targets larger bases than this package reaches, and that is measurable.** The tiled size reduction crosses over against the elementary one at dimension 128 — 1.1x below, 2x above. The driver size-reduces inside the fused QR at WINDOW dimensions, so a dim-96 run does one reduction at 96 and 573 more at 48 or below: almost entirely on the slow side of the crossover. flatter is aimed at Coppersmith and NTRU-scale bases in the hundreds to thousands of columns, where every reduction is past it. So porting `Heuristic3` would buy little here and a great deal there, which is a statement about regime rather than about the algorithm.
+
+* **Blocking arbitrary-precision code pays when it removes ALLOCATIONS, not when it improves locality.** This is the unifying result of the tiling work. The blocked size reduction won (30.4% to 12.0% on random-triangular) because it batches the `B` and `U` updates into one allocation per output entry per block instead of one per entry per row. Panelling the trailing update lost on every family tried, because a compact-WY block update and `w` rank-1 updates cost the same `2*m*w*t` multiply-adds — LAPACK's version wins on cache and SIMD, and a `Matrix{BigFloat}` is an array of pointers to scattered heap blocks, so neither is available. Hoisting the per-flush allocations bought 4% and did not change the verdict.
+
+* **Blocking the size reduction pays; panelling the trailing update does not.** `blocksize` defers the `B` and `U` updates to one batch per block of predecessors — exact, since only `R` is read during the sweep — and cut random-triangular from 10.11s to 7.86s at dimension 256, with `size-red` falling from 30.4% to 12.0%. `panelsize` defers a reflector's trailing update until its panel is flushed as one compact-WY block; measured at dimension 256 it is SLOWER at every panel width tried, and the factorisation's share of the run rises. A flush allocates a compact-WY factor, a `k` by `n` work matrix and a Strassen workspace per panel, per level, per iteration, while the trailing update it replaces is 2.9% of random-triangular and 6.5% of knapsack. Left in, defaulting to off; the relation family spends 19.7% in the trailing update and has not been measured.
 
 * **Panel blocking is not worth doing, measured.** Splitting the fused factorisation four ways shows the trailing update — the rank-1 column update blocking replaces with a matrix product — at only 3-13% of total runtime. What dominates is SIZE REDUCTION: 30% of q-ary-96, 26% of random-triangular-48. Reflector generation is under 0.5% everywhere. So a perfect blocking buys about 1.07x on q-ary and 1.14x on relation; extending it to the re-orthogonalisation, which needs per-panel compact-WY, raises the ceiling to perhaps 1.28x. `Heuristic3` would deliver the same ceiling and change the window schedule as well, invalidating every comparison. Not worth it.
 

@@ -316,6 +316,344 @@ end
     return nothing
 end
 
+
+
+# ---------------------------------------------------------------------------
+# Panel processing
+# ---------------------------------------------------------------------------
+#
+# A reflector is generated one column at a time and then pushed through every
+# column to its right, one at a time. That trailing update is a rank-1 operation
+# per column pair, and at dimension 256 it is 19.7% of the relation family's
+# runtime and 6.4% of knapsack's.
+#
+# Blocking it means deferring: within a panel of `panelsize` columns, a
+# reflector is applied only to the columns still inside the panel, since those
+# are about to be processed and need it. Once the panel is finished, its whole
+# set of reflectors goes through the remaining columns as ONE compact-WY block
+# update, which is a matrix product and reaches Strassen.
+#
+# This is exact in the same sense the blocked size reduction is: applying k
+# reflectors as a block computes the same transformation as applying them one at
+# a time, so the panelled factorisation differs from the columnwise one only by
+# floating point association.
+#
+# What this does NOT do is block the SIZE REDUCTION against earlier panels, or
+# the re-orthogonalisation that re-reads a column from `B` and re-applies every
+# earlier reflector. Both are still column-at-a-time. They are the other half of
+# `Heuristic3`'s update, and they change the order in which reductions happen,
+# so unlike this they will not produce identical results.
+
+"""
+Scratch for the panel flush, allocated ONCE per factorisation.
+
+The first version allocated a compact-WY factor, a `k` by `n` work matrix and a
+Strassen workspace on every flush — at every level, every iteration. That cost
+more than the entire trailing update it was replacing, which is why panelling
+first measured slower than doing nothing.
+"""
+struct _FusedPanelWorkspace{S<:AbstractFloat}
+    compact_T::Matrix{S}
+    inner::Vector{S}
+    work::Matrix{S}
+    multiply::_HouseholderBlockMultiplyWorkspace{S}
+end
+
+function _fused_panel_workspace(::Type{S}, panelsize::Int, m::Int, n::Int,
+                                strassen_cutoff::Int) where {S<:AbstractFloat}
+    width = min(panelsize, m, n)
+    order = max(0, min(width, m - width, n))
+    return _FusedPanelWorkspace{S}(
+        zeros(S, max(width, 1), max(width, 1)),
+        Vector{S}(undef, max(width, 1)),
+        Matrix{S}(undef, max(width, 1), max(n, 1)),
+        _householder_block_multiply_workspace(S, order, strassen_cutoff))
+end
+
+"""
+    _fused_panel_flush!(R, tau, panel_start, panel_end, m, n, cutoff, panel_work)
+
+Push a finished panel's reflectors through every column to its right, as one
+compact-WY block update rather than one rank-1 update per column pair.
+
+Does nothing when the panel is the last one, or when it holds no reflector --
+`tau` is zero for a column whose tail was already zero.
+"""
+function _fused_panel_flush!(R::AbstractMatrix{S}, tau::AbstractVector{S},
+                             panel_start::Int, panel_end::Int, m::Int, n::Int,
+                             strassen_cutoff::Int,
+                             panel_work::_FusedPanelWorkspace{S}) where {S<:AbstractFloat}
+    panel_end < n || return nothing
+    last_reflector = min(panel_end, m - 1)
+    last_reflector >= panel_start || return nothing
+    width = last_reflector - panel_start + 1
+
+    factors = view(R, panel_start:m, panel_start:last_reflector)
+    scalars = view(tau, panel_start:last_reflector)
+    all(iszero, scalars) && return nothing
+
+    target = view(R, panel_start:m, (panel_end + 1):n)
+    trailing = size(target, 2)
+
+    compact_T = view(panel_work.compact_T, 1:width, 1:width)
+    fill!(compact_T, zero(S))
+    _compact_wy_into!(compact_T, panel_work.inner, factors, scalars, width,
+                      m - panel_start + 1)
+
+    apply_Qt!(target, factors, compact_T, width,
+              view(panel_work.work, 1:width, 1:trailing),
+              panel_work.multiply, strassen_cutoff)
+    return nothing
+end
+
+"""
+`compact_wy_from_reflectors` writing into caller-supplied storage.
+
+`inner` holds the inner products for the current column. It could be folded into
+an unused part of `T`, and the iteration order happens to make that safe — but
+only by an argument about which entries are read before being overwritten, which
+is exactly the sort of thing that stops being true after an innocuous edit.
+"""
+function _compact_wy_into!(T::AbstractMatrix{S}, inner::AbstractVector{S},
+                           factors::AbstractMatrix{S}, tau::AbstractVector{S},
+                           k::Int, rows::Int) where {S<:AbstractFloat}
+    @inbounds for j in 1:k
+        if j > 1
+            # inner[c] = <v_c, v_j>, using the implicit unit leading entries.
+            for c in 1:(j - 1)
+                total = factors[j, c]
+                for r in (j + 1):rows
+                    total += factors[r, c] * factors[r, j]
+                end
+                inner[c] = total
+            end
+            for a in 1:(j - 1)
+                total = zero(S)
+                for b in a:(j - 1)                  # T is upper triangular
+                    total += T[a, b] * inner[b]
+                end
+                T[a, j] = -tau[j] * total
+            end
+        end
+        T[j, j] = tau[j]
+    end
+    return T
+end
+
+# ---------------------------------------------------------------------------
+# Blocked size reduction
+# ---------------------------------------------------------------------------
+#
+# The elementwise sweep reduces a column against its predecessors one at a time,
+# updating `B`, `U` and `R` at every step. Only `R` is READ during that sweep:
+# the quotient for row j depends on `R[j, column]`, which the steps above it have
+# already changed. `B` and `U` are written and never read.
+#
+# So their updates can be deferred and applied once per block, which is exact --
+# the quotients are unchanged, so the result is bit-identical to the elementwise
+# version. What changes is the allocation count: one `BigInt` per output entry
+# per BLOCK, rather than one per entry per row.
+#
+# `R` still needs elementwise updates within a block, since the next quotient
+# depends on them, but only across the block's own rows; everything below the
+# block is batched with `B` and `U`.
+#
+# This is the first half of what flatter's `Heuristic3` does. The second half is
+# processing a PANEL of columns at once, which turns these matrix-vector
+# products into matrix-matrix ones and is a larger restructuring.
+
+const DEFAULT_FUSED_BLOCKSIZE = 16
+
+"""
+Columns processed before a panel's reflectors are pushed through the rest of the
+matrix as one block.
+
+OFF by default, and measurement says it should stay that way. On all three
+families tried it is slower, including relation -- the case with the most to gain
+at 19.7% of its run in the trailing update -- at 92.9s unpanelled against 105.0s
+at its best panel width. Hoisting every per-flush allocation into
+`_FusedPanelWorkspace` bought only 4%; the gap is structural, not a leak.
+
+WHY IT CANNOT WIN HERE, which is the interesting part. The operation counts are
+the same: a compact-WY update computes `W = V'C`, `W = T'W`, `C -= VW`, about
+`2*m*w*t` multiply-adds, and `w` rank-1 updates cost `2*m*t` each. LAPACK's
+blocking wins through cache locality and vectorisation. A `Matrix{BigFloat}` is
+an array of POINTERS to scattered heap blocks, so there is no locality to exploit
+and nothing to vectorise. Blocking adds the `T` factor and an intermediate `W`
+and buys nothing back.
+
+Contrast `DEFAULT_FUSED_BLOCKSIZE`, which does pay. That is not a cache effect
+either: it reduces the number of ALLOCATIONS, one result per output entry per
+block instead of one per entry per row. Blocking arbitrary-precision code helps
+when it removes allocations, not when it merely reorders the same arithmetic.
+
+The implementation is kept because it is correct, tested, and demonstrates the
+point.
+"""
+const DEFAULT_FUSED_PANELSIZE = 0
+
+"`R[from:to, column] -= quotient * R[from:to, row]`, in place."
+@inline function _fused_scale_range!(R::AbstractMatrix{S}, column::Int, row::Int,
+                                     from::Int, to::Int, quotient::S,
+                                     ws::Vector{S}) where {S<:AbstractFloat}
+    @inbounds for k in from:to
+        R[k, column] -= quotient * R[k, row]
+    end
+    return nothing
+end
+
+@inline function _fused_scale_range!(R::Matrix{BigFloat}, column::Int, row::Int,
+                                     from::Int, to::Int, quotient::BigFloat,
+                                     ws::Vector{BigFloat})
+    product = ws[_WS_REDUCE_PRODUCT]
+    @inbounds for k in from:to
+        _mpfr_mul!(product, quotient, R[k, row])
+        _mpfr_sub!(R[k, column], R[k, column], product)
+    end
+    return nothing
+end
+
+"""
+`M[1:upto, column] -= M[1:upto, rows] * factors`, one accumulation per row of the
+output rather than one per (row, column) pair.
+
+Zero factors are skipped: on a nearly reduced basis most of a block contributes
+nothing, and testing is far cheaper than multiplying by zero.
+"""
+function _fused_batch_update!(M::AbstractMatrix{V}, column::Int,
+                              rows::UnitRange{Int}, factors::AbstractVector{V},
+                              upto::Int) where {V}
+    @inbounds for i in 1:upto
+        total = zero(V)
+        touched = false
+        for (k, row) in enumerate(rows)
+            iszero(factors[k]) && continue
+            total += factors[k] * M[i, row]
+            touched = true
+        end
+        touched && (M[i, column] -= total)
+    end
+    return nothing
+end
+
+function _fused_batch_update!(M::AbstractMatrix{BigInt}, column::Int,
+                              rows::UnitRange{Int}, factors::AbstractVector{BigInt},
+                              upto::Int)
+    accumulator = BigInt()
+    product = BigInt()
+    @inbounds for i in 1:upto
+        Base.GMP.MPZ.set_si!(accumulator, 0)
+        touched = false
+        for (k, row) in enumerate(rows)
+            iszero(factors[k]) && continue
+            Base.GMP.MPZ.mul!(product, factors[k], M[i, row])
+            Base.GMP.MPZ.add!(accumulator, product)
+            touched = true
+        end
+        touched || continue
+        # One allocation per output entry, and the slot is REBOUND rather than
+        # mutated: `B` and `U` belong to the caller.
+        result = BigInt()
+        Base.GMP.MPZ.sub!(result, M[i, column], accumulator)
+        M[i, column] = result
+    end
+    return nothing
+end
+
+function _fused_batch_update!(R::Matrix{BigFloat}, column::Int,
+                              rows::UnitRange{Int}, factors::AbstractVector{BigFloat},
+                              upto::Int)
+    accumulator = BigFloat()
+    product = BigFloat()
+    @inbounds for i in 1:upto
+        _mpfr_zero!(accumulator)
+        touched = false
+        for (k, row) in enumerate(rows)
+            iszero(factors[k]) && continue
+            _mpfr_mul!(product, factors[k], R[i, row])
+            _mpfr_add!(accumulator, accumulator, product)
+            touched = true
+        end
+        # R is owned by this file, so it may be mutated in place.
+        touched && _mpfr_sub!(R[i, column], R[i, column], accumulator)
+    end
+    return nothing
+end
+
+
+"""
+    _fused_reduce_column_blocked!(B, U, R, column, m, deadband, ws, blocksize, work)
+
+Size reduce a column against its predecessors, deferring the `B` and `U` updates
+until a whole block of predecessors has been processed.
+
+Exact: the quotients are computed from the same `R` values in the same order, so
+the result is bit-identical to [`_fused_reduce_column!`](@ref). Only the
+allocation count differs.
+
+`work` supplies the per-block coefficient vectors, allocated once per
+factorisation rather than once per block.
+"""
+function _fused_reduce_column_blocked!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
+                                       R::AbstractMatrix{S}, column::Int,
+                                       m::Int, deadband::S, ws::Vector{S},
+                                       blocksize::Int,
+                                       multipliers::Vector{T},
+                                       quotients::Vector{S}
+                                       ) where {T<:Integer, S<:AbstractFloat}
+    applied = false
+    largest = typemin(Int)
+    top = column - 1
+    top < 1 && return applied, largest
+
+    @inbounds while top >= 1
+        low = max(1, top - blocksize + 1)
+        span = low:top
+        width = length(span)
+
+        any_here = false
+        for k in 1:width
+            multipliers[k] = zero(T)
+            quotients[k] = zero(S)
+        end
+
+        # Elementwise across the block, high to low. `R` inside the block must be
+        # updated as we go, because the next quotient reads it.
+        for row in top:-1:low
+            diagonal = R[row, row]
+            iszero(diagonal) && throw(ArgumentError(
+                "R has a zero diagonal entry at index $row; B is rank deficient, " *
+                "or the working precision is too low"))
+
+            _fused_is_reduced(R[row, column], diagonal, deadband) && continue
+            quotient = round(R[row, column] / diagonal)
+            iszero(quotient) && continue
+
+            applied = true
+            any_here = true
+            largest = max(largest, safe_exponent(quotient))
+            index = row - low + 1
+            quotients[index] = quotient
+            multipliers[index] = T(quotient)
+
+            # Only within the block: everything below it is batched.
+            _fused_scale_range!(R, column, row, low, row, quotient, ws)
+        end
+
+        if any_here
+            # Deferred. `B` is dense so the whole column moves; `U` and `R` are
+            # upper triangular here, so nothing above row `top` is nonzero.
+            _fused_batch_update!(B, column, span, multipliers, m)
+            _fused_batch_update!(U, column, span, multipliers, top)
+            low > 1 && _fused_batch_update!(R, column, span, quotients, low - 1)
+        end
+
+        top = low - 1
+    end
+
+    return applied, largest
+end
+
 # Reduce column `column` against columns 1 .. column-1, returning
 # (any_correction_applied, largest multiplier exponent).
 function _fused_reduce_column!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
@@ -387,6 +725,9 @@ end
 function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
                             R::AbstractMatrix{S}, tau::AbstractVector{S};
                             deadband::S, max_passes::Int,
+                            blocksize::Int = DEFAULT_FUSED_BLOCKSIZE,
+                            panelsize::Int = 0,
+                            strassen_cutoff::Int = DEFAULT_STRASSEN_CUTOFF,
                             timings::Union{Nothing, Vector{Float64}} = nothing
                             ) where {T<:Integer, S<:AbstractFloat}
     m, n = size(B)
@@ -400,6 +741,22 @@ function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
     # Scratch for the in-place kernels, allocated once for the whole call.
     ws = _fused_temporaries(S, _FUSED_WORKSPACE_SIZE)
 
+    # Per-block coefficients, allocated once for the whole factorisation. A
+    # blocksize of 1 or less means the elementwise sweep, which is kept both as
+    # the reference implementation and for comparison.
+    # Without panelling, each reflector goes straight through every column to
+    # its right and nothing is deferred -- the original code path exactly, not a
+    # panel of width one, which would route single reflectors through the block
+    # machinery and be a different computation.
+    panelled = panelsize > 1
+    panel_start = 1
+    panel_work = panelled ?
+        _fused_panel_workspace(S, panelsize, m, n, strassen_cutoff) : nothing
+
+    blocked = blocksize > 1
+    multipliers = blocked ? T[zero(T) for _ in 1:blocksize] : T[]
+    quotients = blocked ? _fused_temporaries(S, blocksize) : S[]
+
     for column in 1:n
         previous = typemax(Int)
         passes = 0
@@ -411,7 +768,10 @@ function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
                 "working precision is too low for this basis"))
 
             reduce_started = _fused_tick()
-            applied, largest = _fused_reduce_column!(B, U, R, column, m, deadband, ws)
+            applied, largest = blocked ?
+                _fused_reduce_column_blocked!(B, U, R, column, m, deadband, ws,
+                                              blocksize, multipliers, quotients) :
+                _fused_reduce_column!(B, U, R, column, m, deadband, ws)
             _fused_tock!(timings, FUSED_TIME_REDUCE, reduce_started)
 
             # Nothing was out of bounds, so the column is reduced and its float
@@ -445,16 +805,29 @@ function _fused_columnwise!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
         # Generate this column's reflector and push it through the columns to
         # the right, so that the next column arrives already orthogonalized
         # against everything before it.
+        panel_end = panelled ? min(panel_start + panelsize - 1, n) : n
+
         if column < m
             reflector_started = _fused_tick()
             tau[column] = _fused_larfg!(R, column, m, ws)
             _fused_tock!(timings, FUSED_TIME_REFLECTOR, reflector_started)
 
+            # Only as far as the end of the panel: the columns beyond it are
+            # not processed until the panel is flushed, and get the whole
+            # panel's reflectors in one block update then.
             trailing_started = _fused_tick()
-            for target in (column + 1):n
+            for target in (column + 1):panel_end
                 _fused_larf_col!(R, target, column, tau[column], m, ws)
             end
             _fused_tock!(timings, FUSED_TIME_TRAILING, trailing_started)
+        end
+
+        if panelled && column == panel_end
+            trailing_started = _fused_tick()
+            _fused_panel_flush!(R, tau, panel_start, panel_end, m, n,
+                                strassen_cutoff, panel_work)
+            _fused_tock!(timings, FUSED_TIME_TRAILING, trailing_started)
+            panel_start = column + 1
         end
     end
 
@@ -539,6 +912,9 @@ function fused_qr_size_reduction!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                                   precision::Union{Nothing, Integer} = nothing,
                                   deadband::Real = FUSED_QR_DEADBAND,
                                   max_passes::Integer = FUSED_QR_MAX_PASSES,
+                                  blocksize::Integer = DEFAULT_FUSED_BLOCKSIZE,
+                                  panelsize::Integer = DEFAULT_FUSED_PANELSIZE,
+                                  strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF,
                                   timings::Union{Nothing, Vector{Float64}} = nothing
                                   ) where {T<:Integer}
     m, n = size(B)
@@ -559,6 +935,9 @@ function fused_qr_size_reduction!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             R = Matrix{BigFloat}(undef, m, n)
             tau = Vector{BigFloat}(undef, n)
             _fused_columnwise!(B, U, R, tau; timings = timings,
+                               blocksize = Int(blocksize),
+                               panelsize = Int(panelsize),
+                               strassen_cutoff = Int(strassen_cutoff),
                                deadband = BigFloat(deadband),
                                max_passes = Int(max_passes))
             (B, U, R, tau)
@@ -569,6 +948,9 @@ function fused_qr_size_reduction!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     R = Matrix{S}(undef, m, n)
     tau = Vector{S}(undef, n)
     _fused_columnwise!(B, U, R, tau; timings = timings,
+                       blocksize = Int(blocksize),
+                       panelsize = Int(panelsize),
+                       strassen_cutoff = Int(strassen_cutoff),
                        deadband = S(deadband), max_passes = Int(max_passes))
     return B, U, R, tau
 end

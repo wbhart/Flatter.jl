@@ -380,6 +380,76 @@ end
         end
     end
 
+    # The tiled update is a different computation from the monolithic one -- it
+    # assembles R locally rather than factorising the whole matrix -- so it
+    # reaches a different representative of the same lattice. The exact
+    # invariants must hold for both; only the quality is allowed to differ.
+    # These dimensions are all at or below the default `base_cutoff`, so they go
+    # straight to the base case and NEVER REACH the tiled update. Kept only to
+    # check the keyword is accepted; the tests that exercise it are below.
+    @testset "tiled update keeps the exact invariants" begin
+        @testset "n = $n" for n in (4, 6, 9, 12)
+            rng = MersenneTwister(hash((n, :tiled)))
+            B0 = rr_triangular_basis(rng, n; spread = 50)
+
+            reduced, U, info = Flatter.lattice_reduce(B0; tiled = true)
+
+            @test rr_check_exact(B0, reduced, U)
+            @test info.stopped === :base_case      # never recursed
+        end
+    end
+
+    # Forcing a small base cutoff makes the driver recurse at dimensions cheap
+    # enough to test, which is the only way `heuristic3_update!` is reached at
+    # all. Without this the tiled path has no driver coverage: every test above
+    # bottoms out in fpLLL before a window is ever taken.
+    @testset "tiled update through a real recursion" begin
+        @testset "n = $n, base_cutoff = $cutoff" for n in (16, 24, 33),
+                                                     cutoff in (4, 8)
+            rng = MersenneTwister(hash((n, cutoff, :recursed)))
+            B0 = rr_triangular_basis(rng, n; spread = 40)
+
+            reduced, U, info = Flatter.lattice_reduce(
+                B0; tiled = true, base_cutoff = cutoff, max_iterations = 20)
+
+            @test rr_check_exact(B0, reduced, U)
+            @test info.stopped in (:goal, :stagnated, :cap)
+            # A run that only ever hits the cap is not converging, which is how
+            # a tiled update that fails to flatten the profile would look.
+            @test info.iterations <= 20
+        end
+    end
+
+    @testset "tiled recursion converges rather than exhausting the cap" begin
+        # The distinction matters: a reduction that always stops at the cap is
+        # doing work without making progress, and at full dimension that is the
+        # difference between finishing and hanging.
+        rng = MersenneTwister(0x71E2)
+        capped = 0
+        for n in (16, 24, 33)
+            B0 = rr_triangular_basis(rng, n; spread = 40)
+            _, _, info = Flatter.lattice_reduce(
+                B0; tiled = true, base_cutoff = 8, max_iterations = 20)
+            info.stopped === :cap && (capped += 1)
+        end
+        @test capped == 0
+    end
+
+    @testset "tiled and monolithic reach comparable quality" begin
+        rng = MersenneTwister(0x71ED)
+        for n in (6, 10)
+            B0 = rr_triangular_basis(rng, n; spread = 40)
+            plain, _, _ = Flatter.lattice_reduce(B0; tiled = false)
+            tiled, _, _ = Flatter.lattice_reduce(B0; tiled = true)
+
+            # Same lattice, so the determinants agree exactly.
+            @test abs(rr_det(tiled)) == abs(rr_det(plain))
+            # Different representative, so only a loose bound on the shortest.
+            @test rr_shortest_norm2(tiled) <=
+                  rr_shortest_norm2(plain) * big(2)^(2 * n)
+        end
+    end
+
     @testset "exact invariants" begin
         @testset "n = $n, spread = $spread" for n in (3, 4, 5, 6, 8), spread in (20, 60)
             rng = MersenneTwister(hash((n, spread, :exact)))

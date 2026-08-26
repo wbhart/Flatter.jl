@@ -763,6 +763,17 @@ Keyword arguments:
                         released by finalizers, and a finalizable object
                         survives one cycle, so only this form can reclaim them.
                         Expensive; measure before enabling.
+  * `blocksize`      -- predecessors size-reduced before the deferred `B` and
+                        `U` updates are applied as one batch. Exact: the result
+                        is identical whatever the value. 1 is the elementwise
+                        sweep.
+  * `panelsize`      -- columns processed before a panel's reflectors are pushed
+                        through the rest of the matrix as one compact-WY block.
+                        0 applies each reflector as it is generated.
+  * `tiled`          -- use flatter's `Heuristic3` representation update, which
+                        factorises each tile separately instead of the whole
+                        matrix once. Produces a DIFFERENT basis for the same
+                        lattice, since the R factor is assembled locally.
   * `want_profile`   -- compute `info.profile`, which needs a factorisation of
                         the reduced basis. Only the outermost call can report
                         one, and on a single-level run it can cost more than the
@@ -806,6 +817,9 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                          aggressive::Bool = false,
                          schoenhage_threshold::Integer = DEFAULT_SCHOENHAGE_THRESHOLD,
                          base_cutoff::Integer = DEFAULT_BASE_CUTOFF,
+                         blocksize::Integer = DEFAULT_FUSED_BLOCKSIZE,
+                         panelsize::Integer = DEFAULT_FUSED_PANELSIZE,
+                         tiled::Bool = false,
                          want_profile::Bool = true,
                          gc_dimension::Integer = REDUCTION_GC_DIMENSION,
                          gc_interval::Integer = REDUCTION_GC_INTERVAL,
@@ -957,6 +971,9 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                             aggressive = aggressive,
                             schoenhage_threshold = schoenhage_threshold,
                             base_cutoff = base_cutoff,
+                            blocksize = blocksize,
+                            panelsize = panelsize,
+                            tiled = tiled,
                             want_profile = want_profile,
                             gc_dimension = gc_dimension,
                             gc_interval = gc_interval,
@@ -974,24 +991,50 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         # extends below their own row -- so a fresh factorisation is needed,
         # which is exactly what the fused routine provides.
         multiply_started = _tick()
-        candidate = sub_transform === nothing ? Matrix{T}(working) :
-                    _apply_window_right(working, sub_transform, window)
-        telemetry === nothing || (telemetry.time_matmul += _tock(multiply_started))
+        if tiled
+            # Heuristic3: no factorisation of the whole matrix. The columns are
+            # cut at the window boundaries, each reduced tile is factorised on
+            # its own, and the off-diagonal blocks of R come from relative size
+            # reduction between tiles.
+            telemetry === nothing || (telemetry.time_matmul += _tock(multiply_started))
+            fused_started = _tick()
+            # A window too small to recurse on contributes no transform, so the
+            # tile update folds in the identity and does size reduction alone.
+            embedded = Matrix{T}(undef, length(window), length(window))
+            if sub_transform === nothing
+                _set_identity!(embedded)
+            else
+                for j in 1:length(window), i in 1:length(window)
+                    embedded[i, j] = sub_transform[i, j]
+                end
+            end
+            candidate, window_transform, factor, _ = heuristic3_update!(
+                working, window, embedded, n, precision)
+            if telemetry !== nothing
+                telemetry.time_fused += _tock(fused_started)
+                telemetry.fused_calls += 1
+            end
+        else
+            candidate = sub_transform === nothing ? Matrix{T}(working) :
+                        _apply_window_right(working, sub_transform, window)
+            telemetry === nothing || (telemetry.time_matmul += _tock(multiply_started))
 
-        size_reduction = Matrix{T}(undef, n, n)
-        fused_started = _tick()
-        _, _, factor, _ = fused_qr_size_reduction!(
-            candidate, size_reduction; precision = precision,
-            timings = telemetry === nothing ? nothing : telemetry.fused_split)
-        if telemetry !== nothing
-            telemetry.time_fused += _tock(fused_started)
-            telemetry.fused_calls += 1
+            size_reduction = Matrix{T}(undef, n, n)
+            fused_started = _tick()
+            _, _, factor, _ = fused_qr_size_reduction!(
+                candidate, size_reduction; precision = precision,
+                blocksize = blocksize, panelsize = panelsize,
+                timings = telemetry === nothing ? nothing : telemetry.fused_split)
+            if telemetry !== nothing
+                telemetry.time_fused += _tock(fused_started)
+                telemetry.fused_calls += 1
+            end
+
+            multiply_started = _tick()
+            window_transform = sub_transform === nothing ? size_reduction :
+                               _apply_window_left(sub_transform, size_reduction, window)
+            telemetry === nothing || (telemetry.time_matmul += _tock(multiply_started))
         end
-
-        multiply_started = _tick()
-        window_transform = sub_transform === nothing ? size_reduction :
-                           _apply_window_left(sub_transform, size_reduction, window)
-        telemetry === nothing || (telemetry.time_matmul += _tock(multiply_started))
 
         # Lift and fold in immediately: the scaling this transform needs is the
         # one currently in force, and holding it unlifted would only cost memory.

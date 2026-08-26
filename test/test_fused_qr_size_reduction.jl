@@ -430,6 +430,85 @@ fqr_maxabs(A) = isempty(A) ? zero(eltype(A)) : maximum(abs, A)
         end
     end
 
+    # The blocked reduction defers the B and U updates but computes the same
+    # quotients from the same R values in the same order, so it must give the
+    # IDENTICAL answer -- not merely another valid one. That is what separates
+    # it from the blocked kernel in size_reduction_triu.jl, which reduces in a
+    # genuinely different order and reaches a different representative.
+    @testset "blocked reduction is identical to elementwise" begin
+        @testset "m = $m, n = $n, blocksize = $b" for (m, n) in ((8, 8), (12, 9), (20, 20)),
+                                                      b in (2, 4, 16, 64)
+            rng = MersenneTwister(hash((m, n, b, :blocked)))
+            B0 = fqr_random_basis(rng, m, n; bits = 80)
+
+            plain, U_plain, R_plain, tau_plain = Flatter.fused_qr_size_reduction!(
+                Matrix{BigInt}(B0), Matrix{BigInt}(undef, n, n);
+                precision = 256, blocksize = 1)
+            fast, U_fast, R_fast, tau_fast = Flatter.fused_qr_size_reduction!(
+                Matrix{BigInt}(B0), Matrix{BigInt}(undef, n, n);
+                precision = 256, blocksize = b)
+
+            @test fast == plain
+            @test U_fast == U_plain
+            @test tau_fast == tau_plain
+            @test R_fast == R_plain
+        end
+    end
+
+    @testset "blocked reduction keeps the exact contract" begin
+        rng = MersenneTwister(0xB10C)
+        for (m, n) in ((10, 6), (16, 16))
+            B0 = fqr_random_basis(rng, m, n; bits = 60)
+            reduced, U, _, _ = Flatter.fused_qr_size_reduction!(
+                Matrix{BigInt}(B0), Matrix{BigInt}(undef, n, n); precision = 200)
+            @test reduced == B0 * U
+            @test abs(fqr_det(U)) == 1
+        end
+    end
+
+    # Panelling defers a reflector's trailing update until its panel is finished,
+    # then applies the whole panel as one compact-WY block. Applying k reflectors
+    # as a block is the same transformation as applying them one at a time, so
+    # the results agree to floating point association rather than exactly.
+    @testset "panelled factorisation matches the columnwise one" begin
+        @testset "m = $m, n = $n, panel = $p" for (m, n) in ((12, 12), (20, 14), (33, 33)),
+                                                  p in (2, 4, 8, 64)
+            rng = MersenneTwister(hash((m, n, p, :panel)))
+            B0 = fqr_random_basis(rng, m, n; bits = 70)
+
+            plain, U_plain, R_plain, _ = Flatter.fused_qr_size_reduction!(
+                Matrix{BigInt}(B0), Matrix{BigInt}(undef, n, n);
+                precision = 300, panelsize = 0)
+            panelled, U_panel, R_panel, _ = Flatter.fused_qr_size_reduction!(
+                Matrix{BigInt}(B0), Matrix{BigInt}(undef, n, n);
+                precision = 300, panelsize = p)
+
+            # The integer results are exact, so these must agree exactly even
+            # though the floating point factor need not.
+            @test panelled == plain
+            @test U_panel == U_plain
+            @test panelled == B0 * U_panel
+
+            tolerance = BigFloat(2)^(-260) * max(1, maximum(abs, R_plain))
+            @test maximum(abs, triu(R_panel) - triu(R_plain)) < tolerance
+        end
+    end
+
+    @testset "panelling and blocking compose" begin
+        rng = MersenneTwister(0xC0FE)
+        for (m, n) in ((16, 16), (24, 18))
+            B0 = fqr_random_basis(rng, m, n; bits = 90)
+            reference, U_ref, _, _ = Flatter.fused_qr_size_reduction!(
+                Matrix{BigInt}(B0), Matrix{BigInt}(undef, n, n);
+                precision = 320, panelsize = 0, blocksize = 1)
+            both, U_both, _, _ = Flatter.fused_qr_size_reduction!(
+                Matrix{BigInt}(B0), Matrix{BigInt}(undef, n, n);
+                precision = 320, panelsize = 8, blocksize = 16)
+            @test both == reference
+            @test U_both == U_ref
+        end
+    end
+
     @testset "in-place form" begin
         rng = MersenneTwister(0x1409)
         m, n = 9, 5

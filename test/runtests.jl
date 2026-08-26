@@ -12,4 +12,5 @@ using Flatter
     include("test_goal.jl")
     include("test_recursive_reduction.jl")
     include("test_irregular.jl")
+    include("test_heuristic3.jl")
 end

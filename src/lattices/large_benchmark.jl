@@ -204,13 +204,32 @@ Time the large cases, reusing cached reference timings where they exist.
 Do that once, on the current implementation, BEFORE changing anything — a
 baseline captured afterwards measures nothing.
 
-`refresh_baseline` appends a fresh row even when one already exists, which is
-what to use when the OLD baseline is known to be wrong rather than when the
-implementation has changed. The first baselines taken here were measured without
-a warm-up and so included JIT compilation; `find_reference` returns the first
-matching row, so a refreshed row must be added with the stale one deleted from
-the file by hand.
+`refresh_baseline` appends a fresh row even when one already exists.  Use it
+when the existing baseline is known to be stale (for example, because it was
+recorded before the recursive path was warmed).  `find_reference` deliberately
+uses the last matching row, so the refreshed row supersedes the old one without
+editing the TSV by hand.
 """
+function _warm_large_benchmark!()
+    rng = MersenneTwister(7)
+
+    # Exercise the base triangular entry path.
+    Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 24).basis;
+                         want_profile = false)
+
+    # Dimension 48 is above the default base cutoff of 32.  This is essential:
+    # warming only dimension 24 leaves recursion, the fused update, compression,
+    # transform folding and finalisation cold, so the first large timing can be
+    # dominated by JIT compilation.
+    Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
+                         want_profile = false)
+
+    # The dense/irregular entry path compiles independently.
+    Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
+                         want_profile = false)
+    return nothing
+end
+
 function run_large(; cases = LARGE_CASES, record_baseline::Bool = false,
                    refresh_baseline::Bool = false,
                    force_fplll::Bool = false, skip_fplll::Bool = false,
@@ -219,12 +238,10 @@ function run_large(; cases = LARGE_CASES, record_baseline::Bool = false,
     entries = load_references()
     families = Dict(f.name => f for f in Flatter.lattice_families())
 
-    # Compile everything on a small instance first. Without this the FIRST case
-    # measured carries the JIT cost of the whole call graph -- 7 of 17 seconds
-    # on a dimension-256 run -- which shows up as unaccounted time and vanishes
-    # for every later case.
-    Flatter.reduce_basis(Flatter.random_triangular_lattice(
-        MersenneTwister(7), 24).basis; want_profile = false)
+    # Compile the base, recursive and dense entry paths before timing anything.
+    # In particular, the recursive warm-up must cross DEFAULT_BASE_CUTOFF = 32;
+    # otherwise the first dimension-256 case pays the recursive JIT cost.
+    _warm_large_benchmark!()
 
     println("Large cases, dimension ~256. Machine: ", machine)
     println("Cached timings in ", REFERENCE_FILE, "\n")
@@ -302,9 +319,10 @@ function run_large(; cases = LARGE_CASES, record_baseline::Bool = false,
         end
     end
 
-    println("\nRecord a baseline with `run_large(record_baseline = true)` BEFORE")
-    println("changing the implementation; afterwards the change column is what")
-    println("the work bought. A quality warning means the reduction got worse,")
+    println("\nRecord the first baseline with `run_large(record_baseline = true)` BEFORE")
+    println("changing the implementation. Replace a stale existing baseline with")
+    println("`run_large(refresh_baseline = true)`. Afterwards the change column is")
+    println("what the work bought. A quality warning means the reduction got worse,")
     println("which no amount of speed makes acceptable.")
 end
 

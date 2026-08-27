@@ -84,14 +84,17 @@ Modest sizes for comparing the tiled representation update against the
 monolithic one.
 
 The tiled route is a different computation and may be far slower before it is
-tuned, so the first comparison should be at a size where a tenfold loss still
-finishes in under a minute. `CHEAP_CASES` at dimension 256 is not that: a run
-that takes twenty minutes is indistinguishable from a hang, because nothing is
-printed until the first row completes.
+tuned, so the comparison should be at a size where a tenfold loss still finishes
+in reasonable time. `CHEAP_CASES` at dimension 256 is not that: a run taking
+twenty minutes is indistinguishable from a hang.
+
+Dimension 128 rather than 64: at 64 every configuration finished in under a
+tenth of a second, which is below the noise floor and says nothing about which
+is faster.
 """
 const TILED_PROBE = [
-    (family = "random-triangular", size = 64),
-    (family = "knapsack",          size = 63),
+    (family = "random-triangular", size = 128),
+    (family = "knapsack",          size = 127),
 ]
 
 """
@@ -343,61 +346,102 @@ function print_fused_split(t, total)
 end
 
 """
-    tiled_compare(; cases, seed)
+    schedule_compare(; cases, seed, budget)
 
-The `Heuristic3` representation update against the monolithic one, on the same
-instances, writing nothing to disk.
+All four combinations of schedule and representation update, on one instance
+each, writing nothing to disk.
 
-They are different computations: the tiled version factorises each tile on its
-own and assembles `R` locally, so it reaches a different representative of the
-same lattice. Time and quality both have to be read, since a faster route to a
-worse basis is not an improvement.
+The two settings are not independent, which is why they belong on the same line
+rather than in two separate comparisons:
+
+  * `:legacy` is the hand-rolled middle/left/right cycle, which yields ONE
+    window per iteration. The tiled update then sees one reduced tile with a gap
+    either side — barely any structure to exploit.
+  * `:split` is flatter's phase 3 tree, which yields TWO windows on odd
+    iterations, covering the matrix with no gap between them. That is the shape
+    `Heuristic3` was written around, and until now nothing has measured it.
+
+Quality is reported alongside, because the tiled update assembles `R` locally
+and reaches a different representative: a faster route to a longer vector is not
+an improvement.
 """
-function tiled_compare(; cases = TILED_PROBE, seed::Integer = 1,
-                       budget::Real = 300.0)
+function schedule_compare(; cases = TILED_PROBE, seed::Integer = 1,
+                          budget::Real = 300.0)
     families = Dict(f.name => f for f in Flatter.lattice_families())
-    Flatter.reduce_basis(Flatter.random_triangular_lattice(
-        MersenneTwister(7), 24).basis; want_profile = false)
 
-    @printf("%-18s %5s %11s %11s %8s %11s %11s\n",
-            "family", "dim", "plain(s)", "tiled(s)", "change", "plain|b1|", "tiled|b1|")
-    println(repeat("-", 82))
-    println("(a run over the budget is skipped rather than waited on)")
+    # Warm up EVERY keyword combination that will be timed. Julia specialises
+    # per combination, so a warm-up with different keywords compiles a different
+    # method and leaves the measured one cold. That is not a small effect here:
+    # it made a dimension-64 run read 0.79s where the compiled figure is 0.06s,
+    # and produced two reported "speedups" that were entirely compilation.
+    warm = Flatter.random_triangular_lattice(MersenneTwister(7), 24).basis
+    for schedule in (:legacy, :split), tiled in (false, true)
+        Flatter.reduce_basis(warm; schedule = schedule, tiled = tiled,
+                             want_profile = false)
+    end
+
+    @printf("%-18s %5s %9s %9s %11s %11s\n",
+            "family", "dim", "schedule", "update", "time(s)", "log2|b1|")
+    println(repeat("-", 70))
 
     for case in cases
         family = get(families, case.family, nothing)
         family === nothing && continue
         bundle = family.generate(MersenneTwister(hash((seed, case.family, case.size))),
                                  case.size)
+        columns = Base.size(bundle.basis, 2)
+        best = Inf
 
-        # Announce before each half. The tiled route can be much the slower, and
-        # a silent wait gives no way to tell slow from stuck.
-        print(stderr, "    [", case.family, " dim ",
-              Base.size(bundle.basis, 2), "] plain ...\n"); flush(stderr)
-        GC.gc()
-        plain_time = @elapsed plain, _, _ = Flatter.reduce_basis(
-            bundle.basis; tiled = false, want_profile = false)
+        for schedule in (:legacy, :split), tiled in (false, true)
+            print(stderr, "    [", case.family, " dim ", columns, "] ",
+                  schedule, "/", tiled ? "tiled" : "plain", " ...\n")
+            flush(stderr)
+            # Best of three. At these sizes a single timing varies by more than
+            # the differences being measured -- one earlier run showed a 3.98x
+            # ratio where a repeat gave 2.28x, with nothing changed between
+            # them, because the reference half happened to be slow.
+            # A configuration can fail rather than merely be slow: the tiled
+            # update assembles `R` locally, so the profile it yields can
+            # under-state the spread and the precision derived from it is then
+            # too low for a sub-problem. That is a result about the
+            # configuration, so it is reported and the sweep continues.
+            elapsed = Inf
+            local reduced
+            failure = nothing
+            for _ in 1:3
+                GC.gc()
+                try
+                    attempt = @elapsed reduced, _, _ = Flatter.reduce_basis(
+                        bundle.basis; schedule = schedule, tiled = tiled,
+                        want_profile = false)
+                    elapsed = min(elapsed, attempt)
+                catch problem
+                    failure = problem
+                    break
+                end
+            end
 
-        if plain_time > budget
-            @printf("%-18s %5d %11.2f %11s %8s %11.2f %11s\n",
-                    case.family, Base.size(bundle.basis, 2), plain_time,
-                    "skipped", "-", shortest_norm_log2(plain), "-")
-            continue
+            if failure !== nothing
+                @printf("%-18s %5d %9s %9s %11s %11s\n",
+                        case.family, columns, schedule,
+                        tiled ? "tiled" : "plain", "FAILED", "-")
+                println("        ", first(sprint(showerror, failure), 100))
+                continue
+            end
+
+            shortest = shortest_norm_log2(reduced)
+            best = min(best, elapsed)
+
+            @printf("%-18s %5d %9s %9s %11.2f %11.2f\n",
+                    case.family, columns, schedule, tiled ? "tiled" : "plain",
+                    elapsed, shortest)
+            elapsed > budget && break
         end
-
-        print(stderr, "    [", case.family, " dim ",
-              Base.size(bundle.basis, 2), "] tiled ...\n"); flush(stderr)
-        GC.gc()
-        tiled_time = @elapsed tiled, _, _ = Flatter.reduce_basis(
-            bundle.basis; tiled = true, want_profile = false)
-
-        @printf("%-18s %5d %11.2f %11.2f %7.2fx %11.2f %11.2f\n",
-                case.family, Base.size(bundle.basis, 2), plain_time, tiled_time,
-                plain_time / tiled_time,
-                shortest_norm_log2(plain), shortest_norm_log2(tiled))
+        println()
     end
 
-    println("\nA shorter time with a longer vector is not an improvement.")
+    println("All four are the same lattice; only the route and the")
+    println("representative differ. Compare within a family, not across runs.")
 end
 
 """

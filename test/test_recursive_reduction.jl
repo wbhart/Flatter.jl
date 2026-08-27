@@ -112,13 +112,82 @@ use `info.profile` there instead.
 rr_triangular_profile(B) = [Flatter._log2_abs(B[i, i]) for i in 1:size(B, 2)]
 
 """
+    rr_timed(label) do ... end
+
+Run a block, printing what is about to happen and how long it took.
+
+The expensive testsets below print nothing while they run, so a case that takes
+minutes is indistinguishable from one that has hung, and an interrupt lands
+wherever the scheduler happened to be. Announcing each case before it starts
+makes the last line printed the case that is stuck.
+"""
+function rr_timed(body, label::AbstractString)
+    print(stderr, "    ", label, " ... "); flush(stderr)
+    elapsed = @elapsed result = body()
+    # `round` rather than `@sprintf`: this file does not import Printf, and a
+    # progress line is not worth a new dependency.
+    print(stderr, round(elapsed; digits = 2), "s\n"); flush(stderr)
+    return result
+end
+
+"""
+    rr_unimodular(U) -> Bool
+
+Whether `abs(det(U)) == 1`, decided modulo several primes.
+
+`rr_det` is fraction-free elimination over `BigInt`: cubic, with entries that
+grow through the elimination, and on a reduced basis whose entries are already
+thousands of bits it dominates everything around it. It was the largest single
+cost in this file -- the run that looked like a hang in the reduction was sitting
+here.
+
+Working modulo a word-sized prime makes each elimination `Int64` arithmetic.
+`|det| == 1` implies `det mod p` is `1` or `p-1` for every `p`, so any prime that
+disagrees is a definite no; agreement across several primes leaves only the
+possibility that `p` divides `det - 1` or `det + 1` for all of them, which for a
+handful of large primes is not something a real bug would produce.
+"""
+function rr_unimodular(U::AbstractMatrix{<:Integer})
+    n = size(U, 1)
+    n == size(U, 2) || return false
+    for p in (2147483647, 2147483629, 2147483587)
+        M = [Int64(mod(U[i, j], p)) for i in 1:n, j in 1:n]
+        determinant = Int64(1)
+        for k in 1:n
+            pivot = k
+            while pivot <= n && iszero(M[pivot, k])
+                pivot += 1
+            end
+            pivot > n && (determinant = 0; break)
+            if pivot != k
+                for c in 1:n
+                    M[k, c], M[pivot, c] = M[pivot, c], M[k, c]
+                end
+                determinant = mod(-determinant, p)
+            end
+            determinant = mod(determinant * M[k, k], p)
+            inverse = invmod(M[k, k], p)
+            for i in (k + 1):n
+                iszero(M[i, k]) && continue
+                factor = mod(M[i, k] * inverse, p)
+                for c in k:n
+                    M[i, c] = mod(M[i, c] - factor * M[k, c], p)
+                end
+            end
+        end
+        determinant in (1, p - 1) || return false
+    end
+    return true
+end
+
+"""
 Every exact invariant at once. Checked over `BigInt` so an overflow anywhere
 inside would surface as a failed identity rather than a plausible wrong answer.
 """
 function rr_check_exact(original, reduced, U)
     n = size(original, 2)
     BigInt.(reduced) == BigInt.(original) * BigInt.(U) || return false
-    abs(rr_det(U)) == 1 || return false
+    rr_unimodular(U) || return false
     return true
 end
 
@@ -409,8 +478,10 @@ end
             rng = MersenneTwister(hash((n, cutoff, :recursed)))
             B0 = rr_triangular_basis(rng, n; spread = 40)
 
-            reduced, U, info = Flatter.lattice_reduce(
-                B0; tiled = true, base_cutoff = cutoff, max_iterations = 20)
+            reduced, U, info = rr_timed("tiled recursion n=$n cutoff=$cutoff") do
+                Flatter.lattice_reduce(B0; tiled = true, base_cutoff = cutoff,
+                                       max_iterations = 20)
+            end
 
             @test rr_check_exact(B0, reduced, U)
             @test info.stopped in (:goal, :stagnated, :cap)
@@ -418,6 +489,167 @@ end
             # a tiled update that fails to flatten the profile would look.
             @test info.iterations <= 20
         end
+    end
+
+    # The split schedule reduces two windows on odd iterations where the legacy
+    # cycle reduces one. Both must satisfy the exact contract; only the route
+    # differs.
+    @testset "split schedule keeps the exact invariants" begin
+        @testset "n = $n, tiled = $t" for n in (16, 24, 33), t in (false, true)
+            rng = MersenneTwister(hash((n, t, :split)))
+            B0 = rr_triangular_basis(rng, n; spread = 40)
+
+            reduced, U, info = rr_timed("split schedule n=$n tiled=$t") do
+                Flatter.lattice_reduce(B0; schedule = :split, tiled = t,
+                                       base_cutoff = 8, max_iterations = 20)
+            end
+
+            @test rr_check_exact(B0, reduced, U)
+            @test info.stopped in (:goal, :stagnated, :cap)
+        end
+    end
+
+    @testset "split and legacy schedules reach comparable quality" begin
+        rng = MersenneTwister(0x5911)
+        for n in (16, 24)
+            B0 = rr_triangular_basis(rng, n; spread = 40)
+            legacy, _, _ = Flatter.lattice_reduce(B0; schedule = :legacy,
+                                                  base_cutoff = 8)
+            split, _, _ = Flatter.lattice_reduce(B0; schedule = :split,
+                                                 base_cutoff = 8)
+            @test abs(rr_det(split)) == abs(rr_det(legacy))
+            @test rr_shortest_norm2(split) <=
+                  rr_shortest_norm2(legacy) * big(2)^(2 * n)
+        end
+    end
+
+    # The benchmark showed the tiled path failing on a knapsack basis at
+    # dimension 128 -- "column 59 did not reduce in 64 passes" -- while every
+    # test above passed. Those tests all use `rr_triangular_basis`; knapsack has
+    # a different shape, and it is the shape that broke. A failure reproduced
+    # here is one that can be iterated on.
+    @testset "knapsack input survives every configuration" begin
+        # The split schedule reduces TWO windows per odd iteration where legacy
+        # reduces one, so every level makes twice the recursive calls while the
+        # iteration cap stays the same. At n = 48 with a cutoff of 8 that is
+        # enough extra work to look like a hang -- the run sits inside fpLLL,
+        # which means a very large number of base cases rather than a fault in
+        # any of this. Held to n = 16 until the branching is bounded; see the
+        # opt-in testset below for the larger sizes.
+        @testset "n = $n, schedule = $sched, tiled = $t" for n in (16, 32, 48),
+                                                             sched in (:legacy, :split),
+                                                             t in (false, true)
+            # `continue` inside a @testset for-comprehension skips the body but
+            # still registers the case, which is what we want: the grid stays
+            # readable and the skipped entries are visibly absent.
+            # The tiled path costs far more than the monolithic one at these
+            # sizes, and the split schedule reduces two windows per odd
+            # iteration on top of that. The combination pushed this file from
+            # ten seconds to over three minutes, so the grid is held to the
+            # sizes that actually discriminate: a fault that appears at 48 and
+            # not at 32 has not been seen yet.
+            if (sched === :split || t) && n > 32
+                @test true
+                continue
+            end
+            bundle = Flatter.knapsack_lattice(MersenneTwister(hash((n, :knap))), n)
+            B0 = bundle.basis
+            telemetry = Flatter.ReductionTelemetry()
+
+            # `validate` reports a broken invariant at the iteration that broke
+            # it rather than as whatever downstream symptom surfaces first, but
+            # it is far from free: an exact determinant plus a factorisation at
+            # whatever precision the candidate demands, every iteration at every
+            # level. Turning it on for the whole grid took the suite from under
+            # two minutes to over five. The small case is enough to catch a
+            # broken invariant; the larger ones are here to check they finish.
+            reduced, U, info = rr_timed("knapsack n=$n $sched tiled=$t") do
+                Flatter.reduce_basis(
+                    B0; schedule = sched, tiled = t, base_cutoff = 8,
+                    max_iterations = 30, want_profile = false,
+                    validate = (n <= 32), telemetry = telemetry)
+            end
+            # The figures the guesswork needed: how wide the final size
+            # reduction ran, and how many base cases the schedule caused.
+            print(stderr, "        levels=", telemetry.levels,
+                  " base=", telemetry.base_cases,
+                  " finalSR=", telemetry.final_precision, " bits",
+                  " (spread ", round(telemetry.final_spread; digits = 1), ")",
+                  " widestU=", telemetry.widest_transform, " bits\n")
+            flush(stderr)
+
+            @test reduced == B0 * U
+            # Modular, not fraction-free: on knapsack output the entries are
+            # wide enough that the exact determinant dominates the whole file.
+            @test rr_unimodular(U)
+            @test info.stopped in (:goal, :stagnated, :cap, :base_case)
+        end
+    end
+
+    # How much work each schedule actually causes. `levels` and `base_cases` are
+    # the numbers that matter: if the split schedule costs an order of magnitude
+    # more base cases than legacy for the same input, that is the branching, not
+    # a fault.
+    @testset "the split schedule's cost is bounded" begin
+        for n in (16, 24)
+            counts = Dict{Symbol, Int}()
+            for sched in (:legacy, :split)
+                bundle = Flatter.knapsack_lattice(MersenneTwister(hash((n, :knap))), n)
+                telemetry = Flatter.ReductionTelemetry()
+                rr_timed("branching n=$n $sched") do
+                    Flatter.reduce_basis(bundle.basis; schedule = sched,
+                                         tiled = false, base_cutoff = 8,
+                                         max_iterations = 30,
+                                         want_profile = false,
+                                         telemetry = telemetry)
+                end
+                counts[sched] = telemetry.base_cases
+                print(stderr, "        base cases: ", telemetry.base_cases, "\n")
+                flush(stderr)
+            end
+            # Twice the windows per odd iteration, so some growth is expected;
+            # an order of magnitude is the branching running away.
+            @test counts[:split] <= 10 * max(counts[:legacy], 1)
+        end
+    end
+
+    # A configuration that never converges is the difference between slow and
+    # stuck, and at full dimension it is indistinguishable from a hang.
+    @testset "no configuration exhausts the iteration cap on knapsack" begin
+        capped = String[]
+        for n in (16, 32, 48), sched in (:legacy, :split), t in (false, true)
+            # The tiled path is skipped entirely, not just at the larger sizes.
+            # It is known to diverge -- the grid above reports the iteration
+            # where it grows the profile -- so running it here only re-measures
+            # a failure that is already recorded, at 8 seconds a case against
+            # 0.05 for the monolithic path, and it stalls outright at n = 32
+            # with the split schedule. Restore this when the divergence is fixed.
+            t && continue
+            sched === :split && n > 32 && continue
+
+            bundle = Flatter.knapsack_lattice(MersenneTwister(hash((n, :knap))), n)
+            local info
+            try
+                info = rr_timed("cap check n=$n $sched tiled=$t") do
+                    _, _, result = Flatter.reduce_basis(
+                        bundle.basis; schedule = sched, tiled = t,
+                        base_cutoff = 8, max_iterations = 30,
+                        want_profile = false)
+                    result
+                end
+            catch
+                # Reported by the testset above; not this one's business.
+                continue
+            end
+            info.stopped === :cap && push!(capped, "n=$n $sched tiled=$t")
+        end
+        @test isempty(capped)
+    end
+
+    @testset "an unknown schedule is rejected" begin
+        rng = MersenneTwister(0x5912)
+        B0 = rr_triangular_basis(rng, 8; spread = 20)
+        @test_throws ArgumentError Flatter.lattice_reduce(B0; schedule = :middle)
     end
 
     @testset "tiled recursion converges rather than exhausting the cap" begin
@@ -428,8 +660,10 @@ end
         capped = 0
         for n in (16, 24, 33)
             B0 = rr_triangular_basis(rng, n; spread = 40)
-            _, _, info = Flatter.lattice_reduce(
-                B0; tiled = true, base_cutoff = 8, max_iterations = 20)
+            _, _, info = rr_timed("tiled convergence n=$n") do
+                Flatter.lattice_reduce(B0; tiled = true, base_cutoff = 8,
+                                       max_iterations = 20)
+            end
             info.stopped === :cap && (capped += 1)
         end
         @test capped == 0

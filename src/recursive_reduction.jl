@@ -267,6 +267,9 @@ Base.@kwdef mutable struct ReductionTelemetry
     time_profile::Float64 = 0.0
     time_gc::Float64 = 0.0
     time_setup::Float64 = 0.0
+    final_precision::Int = 0
+    final_spread::Float64 = 0.0
+    widest_transform::Int = 0
     fused_split::Vector{Float64} = zeros(Float64, FUSED_TIME_SLOTS)
 end
 
@@ -309,6 +312,13 @@ function Base.show(io::IO, t::ReductionTelemetry)
                 " s  (a parent's view of its children, so NOT part of any total)")
     println(io, "  time collecting garbage  : ", round(t.time_gc; digits = 3), " s")
     println(io, "  time in per-level setup  : ", round(t.time_setup; digits = 3), " s")
+    if t.final_precision > 0
+        println(io, "  widest final size red.   : ", t.final_precision, " bits, from a ",
+                    round(t.final_spread; digits = 1), " bit spread")
+    end
+    if t.widest_transform > 0
+        println(io, "  widest accumulated U     : ", t.widest_transform, " bits")
+    end
     if t.profile_calls > 0
         println(io, "  time reporting profiles  : ", round(t.time_profile; digits = 3),
                     " s (", t.profile_calls, " factorisations)")
@@ -526,6 +536,348 @@ function held_bytes(A::AbstractArray)
     return total
 end
 held_bytes(items::Vector{<:AbstractArray}) = sum(held_bytes, items; init = 0)
+
+"""
+    _ReductionSettings
+
+Everything the recursion passes down unchanged, gathered so that adding a
+setting does not mean editing every call site.
+
+There were fifteen of these threaded through by hand; a list that long is one
+where a forgotten entry silently changes a sub-problem's behaviour rather than
+failing to compile.
+"""
+struct _ReductionSettings
+    max_iterations::Int
+    aggressive::Bool
+    schoenhage_threshold::Int
+    base_cutoff::Int
+    blocksize::Int
+    panelsize::Int
+    tiled::Bool
+    want_profile::Bool
+    gc_dimension::Int
+    gc_interval::Int
+    low_memory::Union{Nothing, Bool}
+    gc_full::Bool
+    trim_memory::Bool
+    schedule::Symbol
+    validate::Bool
+end
+
+"""
+Extra bits the validator's reference factorisation may use beyond the driver's
+working precision.
+
+Enough to resolve a genuine disagreement -- the ones seen were 4 to 112 bits --
+without letting an uncompressed candidate drive the reference to thousands.
+"""
+const VALIDATION_PRECISION_HEADROOM = 512
+
+"""
+How much a single update may widen the profile spread before it counts as having
+made the basis worse rather than better.
+
+An iteration can legitimately move the profile around while working towards a
+flatter one, so this is deliberately loose. It exists to catch an update that is
+diverging, not one that is merely not converging yet.
+"""
+const PROFILE_GROWTH_ALLOWANCE = 64.0
+
+"""
+    _validate_update(working, candidate, transform, factor, iteration, depth)
+
+Check the invariants a representation update must maintain, at the iteration
+that breaks them.
+
+Every failure seen from the tiled update so far has surfaced downstream -- a
+zero diagonal in a later factorisation, a non-finite profile entry in the
+compression -- several steps after the step that caused it. These are the
+properties that must hold on EVERY iteration, so a break is reported where it
+happens:
+
+  * `candidate == working * transform`, exactly. Integer arithmetic, so there is
+    no tolerance to argue about.
+  * `transform` unimodular, checked by an exact determinant.
+  * the reported profile finite and nonzero, since the working precision for the
+    next iteration is derived from it.
+
+Off by default, and expensive when on: an exact determinant and a full
+high-precision factorisation on every iteration at every level. The last run
+with it enabled was killed, so keep it to the small dimensions used for
+debugging rather than turning it on for a benchmark.
+"""
+function _validate_update(working::AbstractMatrix{T}, candidate::AbstractMatrix{T},
+                          transform::AbstractMatrix{T}, factor::AbstractMatrix{S},
+                          iteration::Int, depth::Int,
+                          precision::Integer,
+                          windows::Vector{UnitRange{Int}}) where {T<:Integer, S<:AbstractFloat}
+    n = size(working, 2)
+    where_ = "iteration $iteration at depth $depth"
+
+    expected = _reduction_mul(Matrix{T}(working), Matrix{T}(transform))
+    expected == candidate || throw(ErrorException(
+        "$where_: the update does not satisfy candidate == working * transform"))
+
+    _exact_determinant(transform) in (one(T), -one(T)) || throw(ErrorException(
+        "$where_: the update's transform is not unimodular"))
+
+    for i in 1:n
+        value = factor[i, i]
+        iszero(value) && throw(ErrorException(
+            "$where_: R has a zero diagonal entry at index $i"))
+        isfinite(_log2_abs(value)) || throw(ErrorException(
+            "$where_: R has a non-finite diagonal entry at index $i"))
+    end
+
+    # And R must actually DESCRIBE the candidate. The diagonal being finite is
+    # not enough: the next iteration's working precision is derived from it, so
+    # an R that is well formed but belongs to a different matrix sends a wrong
+    # number downstream and the failure appears somewhere else entirely.
+    #
+    # The reference needs the precision the CANDIDATE demands, not the driver's.
+    # Factorising at too few bits cannot resolve the cancellation that makes a
+    # small diagonal small, so it OVERSTATES it -- and the tiled update already
+    # factorises each tile at whatever that tile requires, which can be far more
+    # than the driver's figure. Comparing the two then reports a disagreement
+    # caused entirely by the reference being the less accurate of the pair.
+    widest = 0
+    for value in candidate
+        iszero(value) || (widest = max(widest, ndigits(value; base = 2)))
+    end
+    # Bounded: the candidate is uncompressed, so `widest` can be many thousands
+    # of bits and a factorisation at that precision, run every iteration at every
+    # level, took the test suite from under two minutes to over five. Well past
+    # the driver's own precision is enough to tell a real disagreement from one
+    # caused by an under-precise reference, which is all this has to do.
+    bits = clamp(householder_precision(n, Float64(widest)),
+                 Int(precision), Int(precision) + VALIDATION_PRECISION_HEADROOM)
+    truth = with_precision(bits) do
+        factors, _ = householder_block(bigfloat_matrix(candidate, bits))
+        [_log2_abs(factors[i, i]) for i in 1:n]
+    end
+    for i in 1:n
+        reported = _log2_abs(factor[i, i])
+        abs(reported - truth[i]) < 1.0 || throw(ErrorException(
+            "$where_: R's diagonal disagrees with a true factorisation at " *
+            "index $i: reported $(round(reported; digits = 2)) bits against " *
+            "$(round(truth[i]; digits = 2))"))
+    end
+
+    # And the update has to REDUCE. Every check above is satisfied by a
+    # transform that makes the basis catastrophically worse: the tiled update
+    # took a knapsack basis from an 8.6 bit profile spread to 61,326 while
+    # keeping `candidate == working * transform` exactly, unimodular, with an R
+    # matching a true factorisation. The precision demanded downstream then rose
+    # to 122,750 bits, and every symptom looked like a precision problem.
+    entering = [_log2_abs(working[i, i]) for i in 1:n]
+
+    # A block diagonal transform mixes only a window's own columns, so every
+    # leading sublattice OUTSIDE the windows keeps its determinant, and size
+    # reduction cannot move any of them either. The profile outside the windows
+    # is therefore an invariant of the whole update -- if it moves, the transform
+    # is reaching columns it has no business touching.
+    inside = falses(n)
+    for w in windows, i in w
+        inside[i] = true
+    end
+    for i in 1:n
+        inside[i] && continue
+        abs(truth[i] - entering[i]) < 1.0 || throw(ErrorException(
+            "$where_: the profile moved OUTSIDE the reduced windows, at index " *
+            "$i: $(round(entering[i]; digits = 2)) bits became " *
+            "$(round(truth[i]; digits = 2)). A block diagonal transform cannot " *
+            "do that, so the transform is not block diagonal over these tiles"))
+    end
+
+    # And within each window the sub-reduction is supposed to FLATTEN the
+    # profile. Reporting per window separates "the sub-transform is bad" from
+    # "the update mishandles a good one", which the overall spread cannot.
+    for w in windows
+        length(w) >= 2 || continue
+        window_before = profile_spread(entering[w])
+        window_after = profile_spread(truth[w])
+        window_after <= window_before + PROFILE_GROWTH_ALLOWANCE || throw(ErrorException(
+            "$where_: window $(first(w)):$(last(w)) came back WORSE, spread " *
+            "$(round(window_before; digits = 1)) to " *
+            "$(round(window_after; digits = 1)); the sub-reduction returned a " *
+            "transform that flattens nothing"))
+    end
+
+    before = profile_spread(entering)
+    after = profile_spread(truth)
+    after <= before + PROFILE_GROWTH_ALLOWANCE || throw(ErrorException(
+        "$where_: the update GREW the profile spread from " *
+        "$(round(before; digits = 1)) bits to $(round(after; digits = 1)); " *
+        "the transform is valid but the basis is worse. Windows: " *
+        "$(join([string(first(w), ":", last(w)) for w in windows], ", "))"))
+    return nothing
+end
+
+"Exact determinant by fraction-free elimination."
+function _exact_determinant(A::AbstractMatrix{T}) where {T<:Integer}
+    n = size(A, 1)
+    M = Matrix{T}(A)
+    sign = one(T)
+    previous = one(T)
+    for k in 1:(n - 1)
+        if iszero(M[k, k])
+            pivot = findfirst(r -> !iszero(M[r, k]), (k + 1):n)
+            pivot === nothing && return zero(T)
+            row = k + pivot
+            for c in 1:n
+                M[k, c], M[row, c] = M[row, c], M[k, c]
+            end
+            sign = -sign
+        end
+        for i in (k + 1):n, j in (k + 1):n
+            M[i, j] = div(M[i, j] * M[k, k] - M[i, k] * M[k, j], previous)
+        end
+        previous = M[k, k]
+    end
+    return sign * M[n, n]
+end
+
+"""
+    _window_transforms(T, windows, transforms, n) -> (embedded, tiles, reducible)
+
+The block-diagonal transform that reduces every window at once.
+
+`transforms` may hold `nothing` for a window too narrow to have been reduced;
+those blocks become the identity. Returns the tile decomposition alongside, since
+every caller that wants the transform also wants the tiles it was built from.
+"""
+function _window_transforms(::Type{T}, windows::Vector{UnitRange{Int}},
+                            transforms::Vector, n::Int) where {T<:Integer}
+    tiles, reducible = tile_partition(windows, n)
+    blocks = Matrix{T}[]
+    for (slot, w) in enumerate(windows)
+        block = transforms[slot]
+        if block === nothing
+            block = Matrix{T}(undef, length(w), length(w))
+            _set_identity!(block)
+        end
+        push!(blocks, Matrix{T}(block))
+    end
+    embedded = Matrix{T}(undef, n, n)
+    embed_transforms!(embedded, tiles, reducible, blocks)
+    return embedded, tiles, reducible
+end
+
+"""
+    _apply_windows(working, windows, transforms, n)
+
+`working` times the block-diagonal transform of all the windows.
+
+With a single window this is the existing block-aware product, which never
+materialises the embedded matrix. With several it goes through the tiled update,
+which exploits the same structure a tile at a time.
+"""
+function _apply_windows(working::AbstractMatrix{T}, windows::Vector{UnitRange{Int}},
+                        transforms::Vector, n::Int) where {T<:Integer}
+    if length(windows) == 1
+        transforms[1] === nothing && return Matrix{T}(working)
+        return _apply_window_right(working, transforms[1], windows[1])
+    end
+    embedded, tiles, _ = _window_transforms(T, windows, transforms, n)
+    product = zeros(T, n, n)
+    tiled_basis_update!(product, working, embedded, tiles)
+    return product
+end
+
+"""
+    _compose_windows(windows, transforms, size_reduction, n)
+
+The window transforms followed by the size reduction, as one matrix.
+"""
+function _compose_windows(windows::Vector{UnitRange{Int}}, transforms::Vector,
+                          size_reduction::AbstractMatrix{T}, n::Int) where {T<:Integer}
+    if length(windows) == 1
+        transforms[1] === nothing && return size_reduction
+        return _apply_window_left(transforms[1], size_reduction, windows[1])
+    end
+    embedded, _, _ = _window_transforms(T, windows, transforms, n)
+    return _reduction_mul(embedded, Matrix{T}(size_reduction))
+end
+
+"""
+    _reduce_window(working, window, goal, current_drop, held_above, settings, telemetry, depth)
+
+Reduce one window recursively, returning its transform, or `nothing` when the
+window is too narrow to have one.
+
+Extracted from the reduction loop unchanged. The loop currently calls it once
+per iteration; flatter's phase 3 schedule wants it called once per window, of
+which there are two on odd iterations.
+"""
+function _reduce_window(working::AbstractMatrix{T}, window::UnitRange{Int},
+                        goal, current_drop::Real, held_above::Int,
+                        settings::_ReductionSettings,
+                        telemetry::Union{Nothing, ReductionTelemetry},
+                        depth::Int, child = nothing) where {T<:Integer}
+    width = length(window)
+    if width < 2
+        child_profile = [_log2_abs(working[i, i]) for i in window]
+        return (transform = nothing, profile = child_profile)
+    end
+
+    # Extracting the sub-basis copies a window of the working matrix and
+    # allocating the sub-transform fills n^2 slots. Individually small, but paid
+    # at every level of a recursion that reaches thousands of levels, so worth
+    # seeing rather than inferring.
+    setup_started = _tick()
+    sub_basis = Matrix{T}(working[window, window])
+    sub_transform = Matrix{T}(undef, width, width)
+    telemetry === nothing || (telemetry.time_setup += _tock(setup_started))
+
+    # flatter's Heuristic3 deliberately throttles child reductions.  The
+    # parent's inherited subgoal can be much stricter than useful early in a
+    # reduction, so compare it with a second goal derived from one sixth of the
+    # current whole-profile drop and use the looser one.  `get_slope()` in
+    # flatter returns the raw quality scalar for heuristic goals; `goal_slope`
+    # preserves that convention.
+    inherited_goal = subgoal(goal, first(window) - 1, last(window))
+    drop_goal = goal_from_drop(width, Float64(current_drop) / 6)
+    child_goal = goal_slope(inherited_goal) < goal_slope(drop_goal) ?
+                 drop_goal : inherited_goal
+
+    recursion_started = _tick()
+    _, _, child_info = lattice_reduce!(sub_basis, sub_transform;
+                    goal = child_goal,
+                    max_iterations = settings.max_iterations,
+                    aggressive = settings.aggressive,
+                    schoenhage_threshold = settings.schoenhage_threshold,
+                    base_cutoff = settings.base_cutoff,
+                    blocksize = settings.blocksize,
+                    panelsize = settings.panelsize,
+                    tiled = settings.tiled,
+                    want_profile = settings.want_profile,
+                    gc_dimension = settings.gc_dimension,
+                    gc_interval = settings.gc_interval,
+                    low_memory = settings.low_memory,
+                    gc_full = settings.gc_full,
+                    trim_memory = settings.trim_memory,
+                    schedule = settings.schedule,
+                    validate = settings.validate,
+                    _held_above = held_above,
+                    # The sub-problem gets ITS node of the schedule tree, not a
+                    # fresh one: the tree carries iteration state, and rebuilding
+                    # it per call would restart every sub-schedule from zero.
+                    _split = child,
+                    telemetry = telemetry,
+                    _depth = depth + 1)
+    telemetry === nothing || (telemetry.time_recursion += _tock(recursion_started))
+
+    # Heuristic3 uses the profiles returned by the child reductions to choose
+    # the precision for THIS iteration's tiled QR/size-reduction stage.  The
+    # recursive driver normally suppresses profiles from fplll base cases, so
+    # recover that small profile here when necessary.
+    child_profile = child_info.profile
+    if settings.tiled && isempty(child_profile)
+        child_profile = _basis_profile(sub_basis, settings.aggressive)
+    end
+    return (transform = sub_transform, profile = child_profile)
+end
 
 # ---------------------------------------------------------------------------
 # Lifting the accumulated transforms
@@ -770,6 +1122,12 @@ Keyword arguments:
   * `panelsize`      -- columns processed before a panel's reflectors are pushed
                         through the rest of the matrix as one compact-WY block.
                         0 applies each reflector as it is generated.
+  * `validate`       -- check the update's invariants every iteration, so a
+                        break is reported where it happens rather than as a
+                        downstream symptom. Cubic per iteration; for debugging.
+  * `schedule`       -- `:legacy` for the hand-rolled middle/left/right cycle,
+                        `:split` for flatter's phase 3 tree, which reduces TWO
+                        windows on odd iterations rather than one.
   * `tiled`          -- use flatter's `Heuristic3` representation update, which
                         factorises each tile separately instead of the whole
                         matrix once. Produces a DIFFERENT basis for the same
@@ -820,6 +1178,8 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                          blocksize::Integer = DEFAULT_FUSED_BLOCKSIZE,
                          panelsize::Integer = DEFAULT_FUSED_PANELSIZE,
                          tiled::Bool = false,
+                         schedule::Symbol = :legacy,
+                         validate::Bool = false,
                          want_profile::Bool = true,
                          gc_dimension::Integer = REDUCTION_GC_DIMENSION,
                          gc_interval::Integer = REDUCTION_GC_INTERVAL,
@@ -827,10 +1187,17 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                          gc_full::Bool = false,
                          trim_memory::Bool = false,
                          _held_above::Int = 0,
+                         _split = nothing,
                          telemetry::Union{Nothing, ReductionTelemetry} = nothing,
                          _depth::Integer = 0) where {T<:Integer}
     n = _check_reduction_input(B)
     size(U) == (n, n) || throw(DimensionMismatch("U must be $n x $n, got $(size(U))"))
+    # Validated here rather than beside the code that reads it: a dimension at or
+    # below `base_cutoff` returns from the base case long before the schedule is
+    # consulted, and an argument that is wrong should be rejected whichever path
+    # the call happens to take.
+    schedule in (:legacy, :split) || throw(ArgumentError(
+        "schedule must be :legacy or :split, got $schedule"))
     max_iterations >= 1 || throw(ArgumentError("max_iterations must be at least one"))
 
     resolved_goal = goal === nothing ? goal_from_rhf(n, rhf) : goal
@@ -892,7 +1259,24 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     # --- initialise and compress -------------------------------------------
     original = Matrix{T}(B)
     profile = [_log2_abs(B[i, i]) for i in 1:n]
+    # A genuine profile on the way in: `_check_reduction_input` has already
+    # required `B` upper triangular with a nonzero diagonal, so its diagonal IS
+    # the R factor's. That is not true of the basis on the way out. Copied
+    # because `profile` is mutated throughout.
+    entry_profile = validate ? copy(profile) : Float64[]
     offsets = zeros(Float64, n)
+
+    # Gathered once and handed down unchanged, rather than listed at each
+    # recursive call site.
+    split_node = schedule === :split ?
+                 (_split === nothing ? SplitPhase3(n) : _split) : nothing
+
+    settings = _ReductionSettings(Int(max_iterations), aggressive,
+                                  Int(schoenhage_threshold), Int(base_cutoff),
+                                  Int(blocksize), Int(panelsize), tiled,
+                                  want_profile, Int(gc_dimension),
+                                  Int(gc_interval), low_memory, gc_full,
+                                  trim_memory, schedule, validate)
 
     bounded = low_memory === nothing ? n >= REDUCTION_LOW_MEMORY_DIMENSION :
                                        low_memory
@@ -939,7 +1323,13 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             break
         end
 
-        window = _reduction_window(iteration, n)
+        # flatter's phase 3 schedule yields TWO windows on odd iterations, the
+        # left and right halves, and one -- the middle -- on even ones. The
+        # hand-rolled cycle it replaces only ever produced a single window, so
+        # the tiled update never saw more than one reduced tile.
+        windows = schedule === :split ? split_windows(split_node) :
+                                        [_reduction_window(iteration, n)]
+        window = first(windows)
         width = length(window)
 
         # Reduce the window recursively. A window of one column has nothing to
@@ -953,38 +1343,39 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                      _held_above + held_bytes(working) + held_bytes(B) +
                      held_bytes(original) + held_bytes(stack.factors) : 0
 
-        sub_transform = nothing
-        if width >= 2
-            # Extracting the sub-basis copies a window of the working matrix and
-            # allocating the sub-transform fills n^2 slots. Individually small,
-            # but paid at every level of a recursion that reaches thousands of
-            # levels, so worth seeing rather than inferring.
-            setup_started = _tick()
-            sub_basis = Matrix{T}(working[window, window])
-            sub_transform = Matrix{T}(undef, width, width)
-            telemetry === nothing || (telemetry.time_setup += _tock(setup_started))
+        children = schedule === :split ? split_children(split_node) :
+                                        [nothing for _ in windows]
+        # Heuristic3 uses the drop of the CURRENT WHOLE profile to throttle
+        # every child created in this iteration.  In particular, both disjoint
+        # windows of a split iteration see the same value.
+        current_drop = profile_drop(profile)
+        sub_results = [_reduce_window(working, w, resolved_goal, current_drop,
+                                      held_above, settings, telemetry,
+                                      Int(_depth), children[slot])
+                       for (slot, w) in enumerate(windows)]
+        sub_transforms = Any[result.transform for result in sub_results]
+        sub_transform = sub_transforms[1]
 
-            recursion_started = _tick()
-            lattice_reduce!(sub_basis, sub_transform;
-                            goal = subgoal(resolved_goal, first(window) - 1, last(window)),
-                            max_iterations = max_iterations,
-                            aggressive = aggressive,
-                            schoenhage_threshold = schoenhage_threshold,
-                            base_cutoff = base_cutoff,
-                            blocksize = blocksize,
-                            panelsize = panelsize,
-                            tiled = tiled,
-                            want_profile = want_profile,
-                            gc_dimension = gc_dimension,
-                            gc_interval = gc_interval,
-                            low_memory = low_memory,
-                            gc_full = gc_full,
-                            trim_memory = trim_memory,
-                            _held_above = held_above,
-                            telemetry = telemetry,
-                            _depth = Int(_depth) + 1)
-            telemetry === nothing || (telemetry.time_recursion += _tock(recursion_started))
+        # flatter's Heuristic3 does not choose this iteration's precision from
+        # the old profile.  It starts with the old profile, substitutes the
+        # profiles returned by all child reductions, and uses that profile_next
+        # for the tiled QR/size-reduction precision.
+        tiled_precision = precision
+        if tiled
+            profile_next = copy(profile)
+            for (slot, w) in enumerate(windows)
+                child_profile = sub_results[slot].profile
+                length(child_profile) == length(w) || throw(ErrorException(
+                    "child profile has length $(length(child_profile)) for window $w"))
+                for (k, i) in enumerate(w)
+                    profile_next[i] = child_profile[k]
+                end
+            end
+            tiled_precision = lll_precision(profile_spread(profile_next), n;
+                                            aggressive = aggressive)
         end
+
+        schedule === :split && split_advance!(split_node)
 
         # Apply it, then re-triangularise and size reduce. The product is not
         # triangular -- the window transform mixes columns whose support
@@ -1000,23 +1391,23 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             fused_started = _tick()
             # A window too small to recurse on contributes no transform, so the
             # tile update folds in the identity and does size reduction alone.
-            embedded = Matrix{T}(undef, length(window), length(window))
-            if sub_transform === nothing
-                _set_identity!(embedded)
-            else
-                for j in 1:length(window), i in 1:length(window)
-                    embedded[i, j] = sub_transform[i, j]
+            blocks = Matrix{T}[]
+            for (slot, w) in enumerate(windows)
+                block = sub_transforms[slot]
+                if block === nothing
+                    block = Matrix{T}(undef, length(w), length(w))
+                    _set_identity!(block)
                 end
+                push!(blocks, Matrix{T}(block))
             end
             candidate, window_transform, factor, _ = heuristic3_update!(
-                working, window, embedded, n, precision)
+                working, windows, blocks, n, tiled_precision)
             if telemetry !== nothing
                 telemetry.time_fused += _tock(fused_started)
                 telemetry.fused_calls += 1
             end
         else
-            candidate = sub_transform === nothing ? Matrix{T}(working) :
-                        _apply_window_right(working, sub_transform, window)
+            candidate = _apply_windows(working, windows, sub_transforms, n)
             telemetry === nothing || (telemetry.time_matmul += _tock(multiply_started))
 
             size_reduction = Matrix{T}(undef, n, n)
@@ -1031,10 +1422,18 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             end
 
             multiply_started = _tick()
-            window_transform = sub_transform === nothing ? size_reduction :
-                               _apply_window_left(sub_transform, size_reduction, window)
+            window_transform = _compose_windows(windows, sub_transforms,
+                                                size_reduction, n)
             telemetry === nothing || (telemetry.time_matmul += _tock(multiply_started))
         end
+
+        # Check the update where it happened, not where its consequences show
+        # up. Every tiled-path failure so far has surfaced downstream: a zero
+        # diagonal in a later factorisation, a non-finite profile in the
+        # compression, several steps after whatever caused them.
+        validation_precision = tiled ? tiled_precision : precision
+        validate && _validate_update(working, candidate, window_transform, factor,
+                                     iteration, Int(_depth), validation_precision, windows)
 
         # Lift and fold in immediately: the scaling this transform needs is the
         # one currently in force, and holding it unlifted would only cost memory.
@@ -1141,9 +1540,33 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     end
 
     final_transform = Matrix{T}(undef, n, n)
-    # (c) One size reduction at true scale. The precision comes from the
-    #     UNcompressed spread, so this is the widest fused QR in the whole run.
-    final_precision = lll_precision(profile_spread(profile), n; aggressive = aggressive)
+    # (c) One size reduction at true scale, so this is the widest fused QR in the
+    #     whole run. The precision has to come from the MATRIX, not from the
+    #     profile: the profile records diagonal magnitudes, and a basis whose
+    #     off-diagonal entries are large relative to its diagonal needs more bits
+    #     than any profile-derived figure will give. The monolithic path never
+    #     shows this because its own iterations leave `B` well size reduced; the
+    #     tiled update reduces across tiles only, and the difference surfaces
+    #     here as "column N did not reduce in 64 passes".
+    #     The figure must stay a RATIO. `householder_precision` of the widest
+    #     entry is proportional to its absolute width, which on an uncompressed
+    #     basis runs to tens of thousands of bits and turns the failure into a
+    #     run that never finishes. What the size reduction actually needs is the
+    #     span between the largest entry it must remove and the smallest
+    #     diagonal it removes against -- bounded, and larger than the profile's
+    #     own spread exactly when the off-diagonal entries are the problem.
+    widest_entry = 0
+    for value in B
+        iszero(value) || (widest_entry = max(widest_entry, ndigits(value; base = 2)))
+    end
+    entry_spread = Float64(widest_entry) - minimum(profile)
+    final_precision = lll_precision(max(profile_spread(profile), entry_spread), n;
+                                    aggressive = aggressive)
+    if telemetry !== nothing
+        telemetry.final_precision = max(telemetry.final_precision, final_precision)
+        telemetry.final_spread = max(telemetry.final_spread,
+                                     max(profile_spread(profile), entry_spread))
+    end
     final_sr_started = _tick()
     _, _, final_factor, _ = fused_qr_size_reduction!(B, final_transform;
                                                      precision = final_precision)
@@ -1160,12 +1583,65 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     for j in 1:n, i in 1:n
         U[i, j] = result[i, j]
     end
+
+    # Measured HERE, after `U` is written. `U` arrives as
+    # `Matrix{BigInt}(undef, n, n)`, whose entries are undefined references
+    # until assigned, so iterating it any earlier throws `UndefRefError` --
+    # which is exactly what an earlier version of this did.
+    if telemetry !== nothing
+        for value in result
+            iszero(value) || (telemetry.widest_transform = max(
+                telemetry.widest_transform, ndigits(value; base = 2)))
+        end
+    end
     telemetry === nothing || (telemetry.time_apply += _tock(compose_started))
     for i in 1:n
         profile[i] = _log2_abs(final_factor[i, i])
     end
 
     telemetry === nothing || (telemetry.time_finalise += _tock(finalise_started))
+
+    # Validate what is RETURNED, not just each iteration. A reduction whose every
+    # update checks out can still hand back a worse basis than it was given: the
+    # loop is not the whole function, and `finalise` runs after it. This is the
+    # one stage never isolated, and a sub-problem whose iterations all passed was
+    # still returning a transform that made its window worse.
+    if validate
+        # `profile` was just set from `final_factor`'s diagonal, which is the R
+        # factor of the returned basis. NOT `B`'s own diagonal: `lattice_reduce!`
+        # returns a GENERAL basis, so its diagonal is not a profile at all and a
+        # zero there reads as a spread of Inf. A helper in the test file carries
+        # this warning; I wrote it and then walked into it here.
+        opening = profile_spread(entry_profile)
+        closing = profile_spread(profile)
+        if closing > opening + PROFILE_GROWTH_ALLOWANCE
+            # The accumulated transform is the thing finalise builds its result
+            # from, so report how wide it got. Each iteration's transform is
+            # valid in COMPRESSED coordinates, but the stack stores it lifted:
+            # `conjugate_transform` multiplies entry (i,j) by 2^(shift[j]-shift[i]),
+            # which is exact but amplifying. That is safe only while the size
+            # reduction bounds each coefficient against the matching diagonal
+            # ratio. If the tiled transform is orders of magnitude wider than the
+            # monolithic one here, the block-wise reduction is not bounding them
+            # tightly enough for the lift.
+            # `telemetry.widest_transform` already holds this, measured from
+            # `result` after `U` was written. Reading `U` here would work, but
+            # only by accident of position: it is `Matrix{BigInt}(undef, ...)`
+            # and iterating it before it is filled throws.
+            widest_u = telemetry === nothing ? 0 : telemetry.widest_transform
+            widest_b = 0
+            for value in B
+                iszero(value) ||
+                    (widest_b = max(widest_b, ndigits(value; base = 2)))
+            end
+            throw(ErrorException(
+                "depth $(Int(_depth)): the reduction RETURNED a worse basis than " *
+                "it was given, spread $(round(opening; digits = 1)) to " *
+                "$(round(closing; digits = 1)), after $iteration iterations that " *
+                "each validated. Accumulated transform is $widest_u bits wide, " *
+                "returned basis $widest_b bits. The loss is in finalise"))
+        end
+    end
 
     return B, U, (iterations = iteration, goal_met = goal_met,
                   stopped = stopped, profile = profile)

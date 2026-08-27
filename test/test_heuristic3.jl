@@ -450,3 +450,330 @@ end
         @test transform != BigInt[i == j ? 1 : 0 for i in 1:n, j in 1:n]
     end
 end
+
+@testset "heuristic3 on a badly scaled tile" begin
+    # A knapsack basis is mostly unit diagonal entries beside one enormous one.
+    # Factorising such a tile at the driver's precision -- chosen for the whole
+    # matrix rather than for the tile -- cancels a diagonal to zero on the first
+    # iteration, which is what broke the driver at dimension 48.
+    @testset "a tile with a huge entry keeps its diagonal, n = $n" for n in (12, 16, 24)
+        rng = MersenneTwister(hash((n, :scaled)))
+        window = div(n, 2):n
+
+        working = zeros(BigInt, n, n)
+        for j in 1:n
+            working[j, j] = big(1)
+            for i in 1:(j - 1)
+                working[i, j] = rand(rng, -5:5)
+            end
+        end
+        # One column far larger than everything else, as a knapsack weight is.
+        working[1, n] = big(1) << 200
+        working[n, n] = big(1) << 180
+
+        sub = BigInt[i == j ? 1 : 0
+                     for i in 1:length(window), j in 1:length(window)]
+
+        # A deliberately modest precision: the tile has to ask for more itself.
+        basis, transform, R, _ = Flatter.heuristic3_update!(
+            working, [window], [sub], n, 64)
+
+        @test basis == working * transform
+        for i in 1:n
+            @test !iszero(R[i, i])
+        end
+        @test Flatter.uniform_precision(R) == 64
+    end
+end
+
+@testset "heuristic3 R against a true factorisation" begin
+
+    "A triangular basis with a controlled diagonal spread."
+    function h3r_basis(rng, n::Int; spread::Int = 60)
+        B = zeros(BigInt, n, n)
+        for j in 1:n
+            shift = n == 1 ? 0 : div(spread * (n - j), n - 1)
+            B[j, j] = (big(rand(rng, 1:100)) + 1) << shift
+            for i in 1:(j - 1)
+                B[i, j] = rand(rng, -1000:1000)
+            end
+        end
+        return B
+    end
+
+    function h3r_unimodular(rng, k::Int)
+        U = BigInt[i == j ? 1 : 0 for i in 1:k, j in 1:k]
+        for _ in 1:(4k)
+            a, b = rand(rng, 1:k), rand(rng, 1:k)
+            a == b && continue
+            c = rand(rng, -2:2)
+            iszero(c) && continue
+            for r in 1:k
+                U[r, a] += c * U[r, b]
+            end
+        end
+        return U
+    end
+
+    # The driver takes its working precision from this diagonal. If it disagrees
+    # with a genuine factorisation of the same basis, every precision decision
+    # downstream is made on a wrong number -- which is the difference between a
+    # design compromise and a bug.
+    @testset "the diagonal matches a global QR, n = $n, window = $window" for
+            (n, window) in ((12, 5:12), (16, 1:8), (16, 9:16), (20, 6:15))
+        rng = MersenneTwister(hash((n, window, :truth)))
+        working = h3r_basis(rng, n; spread = 80)
+        sub = h3r_unimodular(rng, length(window))
+
+        basis, transform, R, _ = Flatter.heuristic3_update!(
+            working, [window], [sub], n, 512)
+
+        @test basis == working * transform
+
+        # A genuine factorisation of the basis the tiled update produced.
+        truth = setprecision(BigFloat, 512) do
+            factors, _ = Flatter.householder_block(
+                Flatter.bigfloat_matrix(basis, 512))
+            factors
+        end
+
+        for i in 1:n
+            @test abs(Float64(log2(abs(R[i, i]))) -
+                      Float64(log2(abs(truth[i, i])))) < 1e-6
+        end
+    end
+
+    # The basis the tiled update returns must be reducible at the precision its
+    # own profile implies. A basis whose off-diagonal entries are far larger than
+    # the profile suggests will exhaust the size reduction's passes downstream.
+    @testset "the result is size reducible at its own precision" begin
+        rng = MersenneTwister(0x7121)
+        for (n, window) in ((16, 9:16), (20, 1:10))
+            working = h3r_basis(rng, n; spread = 60)
+            sub = h3r_unimodular(rng, length(window))
+
+            basis, _, R, _ = Flatter.heuristic3_update!(
+                working, [window], [sub], n, 400)
+
+            profile = [Float64(log2(abs(R[i, i]))) for i in 1:n]
+            spread = maximum(profile) - minimum(profile)
+            bits = Flatter.lll_precision(spread, n)
+
+            U = Matrix{BigInt}(undef, n, n)
+            reduced, _, _, _ = Flatter.fused_qr_size_reduction!(
+                Matrix{BigInt}(basis), U; precision = bits)
+            @test reduced == basis * U
+        end
+    end
+end
+
+@testset "heuristic3 over repeated updates" begin
+    # A single update keeps R's diagonal exact -- the tests above check that.
+    # The driver fails only after seven to sixteen iterations, so whatever goes
+    # wrong needs the output of one update fed into the next. This reproduces
+    # that loop without the driver around it.
+
+    function h3rep_basis(rng, n::Int; spread::Int = 80)
+        B = zeros(BigInt, n, n)
+        for j in 1:n
+            shift = n == 1 ? 0 : div(spread * (n - j), n - 1)
+            B[j, j] = (big(rand(rng, 1:100)) + 1) << shift
+            for i in 1:(j - 1)
+                B[i, j] = rand(rng, -1000:1000)
+            end
+        end
+        return B
+    end
+
+    function h3rep_unimodular(rng, k::Int)
+        U = BigInt[i == j ? 1 : 0 for i in 1:k, j in 1:k]
+        for _ in 1:(4k)
+            a, b = rand(rng, 1:k), rand(rng, 1:k)
+            a == b && continue
+            c = rand(rng, -2:2)
+            iszero(c) && continue
+            for r in 1:k
+                U[r, a] += c * U[r, b]
+            end
+        end
+        return U
+    end
+
+    "The true profile of a basis, from a global factorisation."
+    function h3rep_truth(B, n, bits)
+        Flatter.with_precision(bits) do
+            factors, _ = Flatter.householder_block(Flatter.bigfloat_matrix(B, bits))
+            [Flatter._log2_abs(factors[i, i]) for i in 1:n]
+        end
+    end
+
+    # Feeding one update's raw output into the next is NOT what the driver
+    # does, and `heuristic3_update!` does not support it: the output is only
+    # BLOCK upper triangular, while the update requires a fully triangular
+    # basis. The driver satisfies that by compressing every iteration. An
+    # earlier version of this file chained the raw output and reported the exact
+    # contract failing, which was the test violating a precondition rather than
+    # the update being wrong -- the compressed variant below passed throughout.
+    @testset "the update rejects a basis that is not upper triangular" begin
+        rng = MersenneTwister(0x7A11)
+        n = 12
+        working = h3rep_basis(rng, n)
+        working[3, 1] = big(7)          # one entry below the diagonal
+        window = 1:div(n, 2)
+        sub = h3rep_unimodular(rng, length(window))
+
+        @test_throws ArgumentError Flatter.heuristic3_update!(
+            working, [window], [sub], n, 400)
+    end
+
+    # The chained test above passes, so the update is sound when its own output
+    # is fed straight back in. The driver does one thing in between: it
+    # compresses `R` into the next iteration's integer basis. This adds exactly
+    # that step and nothing else.
+    @testset "R stays exact with compression between updates, n = $n" for n in (12, 16, 24)
+        rng = MersenneTwister(hash((n, :compressed)))
+        working = h3rep_basis(rng, n)
+        bits = 400
+
+        profile = [Flatter._log2_abs(working[i, i]) for i in 1:n]
+        offsets = zeros(Float64, n)
+        working, _, precision = Flatter._compress_integer(working, profile, offsets,
+                                                          n, false)
+
+        cycle = [div(n, 4):div(3n, 4), 1:div(n, 2), (div(n, 2) + 1):n]
+
+        for round in 1:10
+            window = cycle[mod1(round, length(cycle))]
+            sub = h3rep_unimodular(rng, length(window))
+
+            basis, transform, R, _ = Flatter.heuristic3_update!(
+                working, [window], [sub], n, precision)
+
+            @test basis == working * transform
+
+            truth = h3rep_truth(basis, n, max(precision, 400))
+            for i in 1:n
+                reported = Flatter._log2_abs(R[i, i])
+                @test abs(reported - truth[i]) < 1.0
+            end
+
+            # As the driver does it: the raw diagonal, with `_compress_factor`
+            # owning the offset bookkeeping. Adding `offsets` here as well would
+            # count the accumulated shift twice.
+            for i in 1:n
+                profile[i] = Flatter._log2_abs(R[i, i])
+            end
+            working, _, precision = Flatter._compress_factor(R, profile, offsets,
+                                                             n, BigInt, false)
+        end
+    end
+
+    # Update and compression chained both hold. The last difference from the
+    # driver is where the sub-transform comes from: these tests use a product of
+    # small transvections, the driver uses the output of an actual reduction.
+    # Those are not alike -- a real transform has large, strongly structured
+    # entries, and the tile it produces is conditioned quite differently.
+    @testset "R stays exact with a real sub-transform, n = $n" for n in (12, 16, 24)
+        rng = MersenneTwister(hash((n, :realsub)))
+        working = h3rep_basis(rng, n)
+
+        profile = [Flatter._log2_abs(working[i, i]) for i in 1:n]
+        offsets = zeros(Float64, n)
+        working, _, precision = Flatter._compress_integer(working, profile, offsets,
+                                                          n, false)
+
+        cycle = [div(n, 4):div(3n, 4), 1:div(n, 2), (div(n, 2) + 1):n]
+
+        for round in 1:10
+            window = cycle[mod1(round, length(cycle))]
+            width = length(window)
+
+            # The transform an actual reduction of the window produces.
+            sub_basis = Matrix{BigInt}(working[window, window])
+            sub = Matrix{BigInt}(undef, width, width)
+            Flatter.lattice_reduce!(sub_basis, sub; base_cutoff = 4,
+                                    max_iterations = 20, want_profile = false)
+
+            basis, transform, R, _ = Flatter.heuristic3_update!(
+                working, [window], [sub], n, precision)
+
+            @test basis == working * transform
+
+            truth = h3rep_truth(basis, n, max(precision, 400))
+            for i in 1:n
+                reported = Flatter._log2_abs(R[i, i])
+                @test abs(reported - truth[i]) < 1.0
+            end
+
+            for i in 1:n
+                profile[i] = Flatter._log2_abs(R[i, i])
+            end
+            working, _, precision = Flatter._compress_factor(R, profile, offsets,
+                                                             n, BigInt, false)
+        end
+    end
+end
+
+@testset "heuristic3 which stage moves the profile" begin
+    # The update has two stages: apply the block-diagonal transform, then size
+    # reduce across tiles. Size reduction adds multiples of earlier columns to
+    # later ones, which leaves every leading sublattice determinant alone -- so
+    # it CANNOT change the profile. If the profile moves, it moved in the basis
+    # update. This measures both rather than assuming.
+
+    function h3s_profile(B, n, bits)
+        Flatter.with_precision(bits) do
+            factors, _ = Flatter.householder_block(Flatter.bigfloat_matrix(B, bits))
+            [Flatter._log2_abs(factors[i, i]) for i in 1:n]
+        end
+    end
+
+    @testset "size reduction leaves the profile alone, n = $n" for n in (12, 16, 20)
+        rng = MersenneTwister(hash((n, :stages)))
+        window = div(n, 3):n
+        bits = 512
+
+        working = zeros(BigInt, n, n)
+        for j in 1:n
+            working[j, j] = big(1) << rand(rng, 5:40)
+            for i in 1:(j - 1)
+                working[i, j] = rand(rng, -(big(1) << 30):(big(1) << 30))
+            end
+        end
+
+        # Reduce the window for real, as the driver does.
+        width = length(window)
+        sub_basis = Matrix{BigInt}(working[window, window])
+        sub = Matrix{BigInt}(undef, width, width)
+        Flatter.lattice_reduce!(sub_basis, sub; base_cutoff = 4,
+                                max_iterations = 20, want_profile = false)
+
+        before = h3s_profile(working, n, bits)
+
+        # Stage one on its own: the block-diagonal product.
+        tiles, reducible = Flatter.tile_partition([window], n)
+        embedded = Matrix{BigInt}(undef, n, n)
+        Flatter.embed_transforms!(embedded, tiles, reducible, [sub])
+        updated = zeros(BigInt, n, n)
+        Flatter.tiled_basis_update!(updated, working, embedded, tiles)
+        @test updated == working * embedded
+        after_update = h3s_profile(updated, n, bits)
+
+        # Stage two: the whole update, which adds the size reduction.
+        final, transform, _, _ = Flatter.heuristic3_update!(
+            working, [window], [sub], n, bits)
+        @test final == working * transform
+        after_all = h3s_profile(final, n, bits)
+
+        spread(p) = maximum(p) - minimum(p)
+
+        # Size reduction must not move the profile at all.
+        for i in 1:n
+            @test abs(after_all[i] - after_update[i]) < 1.0
+        end
+
+        # And the whole update must not make the basis worse. If this fails
+        # while the check above passes, the fault is in the basis update.
+        @test spread(after_all) <= spread(before) + 64.0
+    end
+end

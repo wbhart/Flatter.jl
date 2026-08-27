@@ -199,23 +199,27 @@ reasoning is in the code comments and docstrings.
 
 * **Two dominant costs remain, and which one leads depends on the family.** Adding up where integer matrix products happen — `matmul` plus `lift` plus `apply` — gives 65% on ideal-96 and 55% on spread-48, against a fused QR of 6-10% there. On q-ary-96 and relation-97 it inverts: fused QR 44-46%, integer products 15-24%. `lift` and `apply` were previously folded into a `finalise` total and not attributed. The levers are multi-modular integer multiplication and panel-blocking the fused QR respectively.
 
-* **Dimension-256 baseline, AMD Ryzen 7 5800H, recorded after the warm-up fix.** Ours against fpLLL in seconds: random-triangular 10.1/0.87, scrambled 104.0/82.5, knapsack 13.9/3.11, q-ary 509.7/12092.5, relation 1055.1/960.4. Phase shares, in the order fusedQR / finalise / gc / fold-in / matmul:
+* **Dimension-256 baseline, AMD Ryzen 7 5800H, after stage 1 (blocked size reduction).** Ours against fpLLL in seconds: random-triangular 8.1/0.87, scrambled 87.3/82.5, knapsack 14.4/3.11, q-ary 424.8/12092.5, relation 981.2/960.4. Against the pre-blocking baseline that is 1.24x, 1.19x, 0.96x, 1.20x and 1.08x, and `size-red` roughly halved on every family. q-ary is 28.5x faster than fpLLL.
 
   | family | fusedQR | (size-red, reorth, trailing) | finalise | gc | fold-in | matmul |
   |---|---|---|---|---|---|---|
-  | random-triangular | 37.3% | 30.4, 2.1, 2.4 | 28.5% | 5.5% | 13.4% | 5.0% |
-  | scrambled | 29.1% | 15.4, 5.6, 7.3 | 15.0% | 16.5% | 18.0% | 7.6% |
-  | knapsack | 18.3% | 7.5, 3.9, 6.1 | 27.3% | 21.7% | 20.5% | 6.0% |
-  | q-ary | 35.0% | 19.8, 6.5, 7.7 | 7.7% | 22.2% | 17.1% | 5.4% |
-  | relation | 41.9% | 6.0, 15.7, 19.7 | 34.8% | 4.4% | 2.6% | 1.2% |
+  | random-triangular | 28.9% | 15.9, 2.4, 2.9 | 30.9% | 5.6% | 16.1% | 5.0% |
+  | scrambled | 25.3% | 9.2, 6.4, 8.4 | 17.0% | 14.1% | 19.7% | 9.0% |
+  | knapsack | 15.0% | 4.6, 3.7, 5.9 | 28.8% | 21.9% | 22.7% | 6.6% |
+  | q-ary | 31.4% | 12.1, 8.2, 9.7 | 9.1% | 19.8% | 21.0% | 6.1% |
+  | relation | 41.7% | 3.9, 16.2, 21.2 | 37.6% | 2.9% | 2.6% | 1.2% |
 
-  Everything accounts to within 10%. `lattices/reference_times.tsv` holds these and fpLLL's timings, keyed by a hash of the basis.
+  `lattices/reference_times.tsv` holds these and fpLLL's timings, keyed by a hash of the basis. The `tiled` path is NOT what this measures: it is off by default.
+
+* **Integer matrix products are now the dominant cost on most families.** Adding `fold-in`, `apply` inside `finalise`, and `matmul`: 58% of knapsack, 52% of random-triangular, 46% of scrambled, 41% of relation, 36% of q-ary. No part of `Heuristic1/2/3` touches any of it — that is the multi-modular lever. `gc` is a further 14-22% on three families, from the collection interval chosen at dimension 128 and never re-swept at 256.
 
 * **At dimension 256 on q-ary we are 22x faster than fpLLL** — 536s against 12,092s — while `scrambled` and `relation` sit at parity and `random-triangular` and `knapsack` remain behind. That is the flatter result: the recursion is worth its overhead once the dimension is large enough, and the families where it wins are the ones with a profile worth compressing.
 
 * **Whether panel blocking helps depends on the family, at dimension 256.** relation's fused QR is 41.9% of which trailing is 19.7% and re-orthogonalisation 15.7% — 35% addressable — against size reduction at 6.0%. random-triangular is the exact inverse: 30.4% size reduction against 2.4% trailing. So blocking would nearly halve relation's factorisation and do almost nothing for random-triangular.
 
 * **Integer matrix products are the second cost everywhere, and no part of `Heuristic3` touches them.** `fold-in` (folding lifted transforms into the stack) plus `apply` inside `finalise` plus `matmul`: 13-21% for `fold-in` alone on four of the five families, and knapsack's `fold-in` at 20.5% exceeds its entire fused QR at 18.3%. That is the multi-modular lever.
+
+* **A warm-up must use the SAME keyword arguments as the timed call.** Julia specialises per keyword combination, so warming `reduce_basis(B)` leaves `reduce_basis(B; tiled = true)` cold. Measured: a dimension-64 case read 0.79s on its first timed call and 0.06s once compiled — an order of magnitude, which was reported twice as a speedup of the tiled update before best-of-three exposed it. Warm every combination that will be measured, and take the best of several runs so a stray specialisation cannot masquerade as a result.
 
 * **Benchmark timings must be warmed up.** The first case measured carried the JIT cost of the whole call graph — 7 of 17 seconds on a dimension-256 run — surfacing as unaccounted time and vanishing for every later case. `measure` in the main benchmark keeps the fastest of three attempts, which hides it for quick cases, but it stops after one attempt past `repeat_under`, so the expensive cases had no protection beyond luck. Both benchmarks now call `warm_up()`, exercising the triangular and dense entry points separately.
 

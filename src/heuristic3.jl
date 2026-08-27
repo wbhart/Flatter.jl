@@ -28,12 +28,27 @@
 # optimisation, not a threading device -- `Threaded3` is the threaded variant and
 # `heuristic_3.cpp` contains no OpenMP at all.
 #
-# WHAT IT COSTS
+# WHAT IT COSTS, MEASURED
 #
 # The R factor is no longer a single global factorisation, so it is only as good
-# as the tile decomposition. flatter accepts this: the profile it reads back is
-# used to steer the reduction, not to certify it, and the exact invariants live
-# in the integer matrices regardless.
+# as the tile decomposition. flatter accepts this: the exact invariants live in
+# the integer matrices regardless, and `B_next == B * U` holds however the tiles
+# are cut.
+#
+# What that costs here, at dimension 128 with compilation excluded:
+#
+#   * SLOWER. random-triangular: 0.69s monolithic against 1.21s tiled on the
+#     legacy schedule, 0.89s against 1.42s on the split schedule, with identical
+#     shortest vectors.
+#   * WORSE. knapsack at dimension 64, log2|b1|: 2.43 monolithic against 2.64
+#     tiled; on the split schedule 2.35 against 2.90. The split schedule gives
+#     the tiling two reduced tiles covering the matrix rather than one with gaps
+#     either side -- the shape it was designed for -- and the quality gap widens
+#     rather than closing.
+# Those figures predate a precision bug in `tiled_diagonal_qr!` and should be
+# re-measured. Each tile was factorised at the driver's precision rather than at
+# the precision its own conditioning demands, which cancelled a diagonal to zero
+# on knapsack input; the timings above were taken with that fault present.
 
 """
     Tile
@@ -194,17 +209,34 @@ function tiled_diagonal_qr!(R::AbstractMatrix{S}, tau::AbstractVector{S},
             end
             continue
         end
-        block = with_precision(bits) do
-            factors, scalars = householder_block(
-                bigfloat_matrix(view(B_next, range, range), bits))
-            (factors, scalars)
+        # A tile's factorisation needs the precision ITS conditioning demands,
+        # not the driver's, which is chosen for the whole matrix. The monolithic
+        # fused QR never meets this because it size reduces each column before
+        # taking its reflector, so entries stay small; here the raw block is
+        # factorised as it stands. On a knapsack basis -- mostly unit diagonal
+        # entries beside one enormous one -- the driver's figure is far too
+        # little and a diagonal cancels to zero on the very first iteration.
+        window = view(B_next, range, range)
+        widest = 0
+        for value in window
+            iszero(value) || (widest = max(widest, ndigits(value; base = 2)))
         end
-        factors, scalars = block
-        for (j, column) in enumerate(range), (i, row) in enumerate(range)
-            R[row, column] = factors[i, j]
+        tile_bits = max(bits, householder_precision(length(range), Float64(widest)))
+
+        factors, scalars = with_precision(tile_bits) do
+            householder_block(bigfloat_matrix(window, tile_bits))
         end
-        for (i, row) in enumerate(range)
-            tau[row] = scalars[i]
+
+        # Converted down, so `R` stays uniform at the driver's precision: a
+        # matrix holding entries of two widths is what `assert_precision`
+        # refuses, and the profile would be read off a mixture.
+        with_precision(bits) do
+            for (j, column) in enumerate(range), (i, row) in enumerate(range)
+                R[row, column] = S(factors[i, j])
+            end
+            for (i, row) in enumerate(range)
+                tau[row] = S(scalars[i])
+            end
         end
     end
     return R, tau
@@ -396,16 +428,35 @@ rather than certifying it, and the exact invariants live in the integer matrices
 either way -- `basis == working * transform` holds regardless of how the tiles
 are cut.
 """
-function heuristic3_update!(working::AbstractMatrix{T}, window::UnitRange{Int},
-                            sub_transform::AbstractMatrix{T}, n::Int,
-                            precision::Integer;
+function heuristic3_update!(working::AbstractMatrix{T},
+                            windows::AbstractVector{UnitRange{Int}},
+                            sub_transforms::AbstractVector{<:AbstractMatrix{T}},
+                            n::Int, precision::Integer;
                             float_type::Type{S} = BigFloat,
                             strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF
                             ) where {T<:Integer, S<:AbstractFloat}
-    tiles, reducible = tile_partition([window], n)
+    # PRECONDITION, and not a mild one. `tiled_basis_update!` writes only the
+    # blocks at or above the tile diagonal, and `tiled_size_reduction!` tells
+    # `relative_size_reduction!` that a gap tile's diagonal block is triangular.
+    # Both are true only for an upper triangular `working`. Given anything else
+    # the update silently discards the blocks below the diagonal, so
+    # `basis == working * transform` fails -- which is how this was found.
+    #
+    # The driver satisfies it because it compresses every iteration, and
+    # compression rebuilds a triangular basis from `R`. Feeding the raw output
+    # of one update straight into the next does NOT satisfy it.
+    for j in 1:n, i in (j + 1):n
+        iszero(working[i, j]) || throw(ArgumentError(
+            "the working basis must be upper triangular; working[$i,$j] is " *
+            "nonzero. The tiled update reads only the blocks at or above the " *
+            "tile diagonal, so anything below would be lost."))
+    end
+
+    tiles, reducible = tile_partition(windows, n)
 
     transform = Matrix{T}(undef, n, n)
-    embed_transforms!(transform, tiles, reducible, [Matrix{T}(sub_transform)])
+    embed_transforms!(transform, tiles, reducible,
+                      [Matrix{T}(u) for u in sub_transforms])
 
     basis = Matrix{T}(undef, n, n)
     for j in 1:n, i in 1:n
@@ -431,3 +482,13 @@ function heuristic3_update!(working::AbstractMatrix{T}, window::UnitRange{Int},
 
     return basis, transform, R, tau
 end
+
+"""
+Single-window form, for the schedule that only ever reduces one window at a
+time. flatter's phase 3 yields two on odd iterations, which is the case the
+tiling was designed around.
+"""
+heuristic3_update!(working::AbstractMatrix{T}, window::UnitRange{Int},
+                   sub_transform::AbstractMatrix{T}, n::Int, precision::Integer;
+                   kwargs...) where {T<:Integer} =
+    heuristic3_update!(working, [window], [sub_transform], n, precision; kwargs...)

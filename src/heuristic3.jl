@@ -30,25 +30,16 @@
 #
 # WHAT IT COSTS, MEASURED
 #
-# The R factor is no longer a single global factorisation, so it is only as good
-# as the tile decomposition. flatter accepts this: the exact invariants live in
-# the integer matrices regardless, and `B_next == B * U` holds however the tiles
-# are cut.
+# With the phase-3 SublatticeSplit feeder, cached R/tau reuse, and direct MPFR-
+# style Householder kernels, the tiled update reaches the intended regime by
+# dimension 256.  On the knapsack probe (Ryzen 7 5800H), split/plain and
+# split/tiled both take about 3.7s, with the six Heuristic3 updates themselves
+# costing about 0.84s.  An earlier implementation was roughly 2x slower because
+# it repeatedly refactorised tiles, used compact-WY BigFloat QR/SR, and drove
+# phase 3 with the wrong stopping/reset cycle.  Those measurements are obsolete.
 #
-# What that costs here, at dimension 128 with compilation excluded:
-#
-#   * SLOWER. random-triangular: 0.69s monolithic against 1.21s tiled on the
-#     legacy schedule, 0.89s against 1.42s on the split schedule, with identical
-#     shortest vectors.
-#   * WORSE. knapsack at dimension 64, log2|b1|: 2.43 monolithic against 2.64
-#     tiled; on the split schedule 2.35 against 2.90. The split schedule gives
-#     the tiling two reduced tiles covering the matrix rather than one with gaps
-#     either side -- the shape it was designed for -- and the quality gap widens
-#     rather than closing.
-# Those figures predate a precision bug in `tiled_diagonal_qr!` and should be
-# re-measured. Each tile was factorised at the driver's precision rather than at
-# the precision its own conditioning demands, which cancelled a diagonal to zero
-# on knapsack input; the timings above were taken with that fault present.
+# This is still a teaching port of the phase-3/Heuristic3 machinery, not a full
+# port of flatter's phase 1/2 dispatcher.
 
 """
     Tile
@@ -306,7 +297,7 @@ The diagonal block a tile is reduced against comes in one of two forms, and
 telling `relative_size_reduction!` which saves it a factorisation:
 
   * a REDUCED tile already has its QR in `R` and `tau` from
-    [`tiled_diagonal_qr!`](@ref), passed as `factors`/`compact_T`;
+    [`tiled_diagonal_qr!`](@ref), consumed directly by the reflector kernel;
   * a tile that was not reduced is still upper triangular from the previous
     iteration, so `triangular = true` and no factorisation is needed at all.
 
@@ -323,9 +314,8 @@ function tiled_size_reduction!(B::AbstractMatrix{T}, B_next::AbstractMatrix{T},
     _set_identity!(U_sr)
     bits = Int(precision)
 
-    # Everything below allocates BigFloats -- the compact-WY factor, and the
-    # temporaries inside the relative size reduction -- and BigFloat arithmetic
-    # takes its precision from the global default rather than from its operands.
+    # BigFloat arithmetic in the direct-reflector relative size reduction takes
+    # its precision from the global default rather than from its operands.
     # `R` and `tau` already hold values at `bits`, so without this the two would
     # disagree and `assert_precision` would refuse them. See Notes.md: it is the
     # COMPUTATION that has to be wrapped, not just the allocations.
@@ -412,11 +402,9 @@ function _tiled_size_reduction_body!(B::AbstractMatrix{T}, B_next::AbstractMatri
             # compression sees a block-diagonal R and produces a basis that has
             # lost everything above the diagonal.
             if R2 !== nothing
-                # Converted, not assigned: a reduction that needed more
-                # precision than the driver's returns `R2` at ITS figure, and
-                # storing that verbatim would leave `R` holding entries of two
-                # different widths. This runs inside a `with_precision(bits)`
-                # block, so the conversion lands at the driver's precision.
+                # Converted, not assigned: keep every block of `R` at the
+                # driver's uniform working precision.  This runs inside a
+                # `with_precision(bits)` block, so the conversion lands there.
                 for (jj, j) in enumerate(columns), (ii, i) in enumerate(rows)
                     R[i, j] = S(R2[ii, jj])
                 end

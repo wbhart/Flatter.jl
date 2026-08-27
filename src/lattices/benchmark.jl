@@ -328,14 +328,28 @@ the cost of compiling them.
 anything quick — but it stops after one attempt once a run exceeds
 `repeat_under`, so the expensive cases get a single timing. Those are protected
 only by some earlier case happening to compile the same path first, which is
-luck. Both entry points are exercised here, since they compile separately.
+luck. The base triangular, recursive triangular and dense entry paths are all
+exercised here, since they compile separately.
 """
 function warm_up()
     rng = MersenneTwister(7)
+
+    # Base triangular path.
     Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 24).basis;
-                         want_profile = false)                       # triangular
+                         want_profile = false)
+
+    # Recursive triangular path.  The default base cutoff is 32, so dimension
+    # 24 above does not compile recursion, the fused update, transform folding,
+    # compression or finalisation.  Dimension 48 is the first standard
+    # benchmark size above that boundary; without this warm-up its first timing
+    # can consist mostly of JIT compilation and then exceed `repeat_under`,
+    # preventing the clean repeat that would otherwise hide compilation.
+    Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
+                         want_profile = false)
+
+    # Dense entry path, which compiles independently of the triangular driver.
     Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
-                         want_profile = false)                       # dense
+                         want_profile = false)
     return nothing
 end
 

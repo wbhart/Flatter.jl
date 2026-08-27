@@ -114,21 +114,11 @@ rr_triangular_profile(B) = [Flatter._log2_abs(B[i, i]) for i in 1:size(B, 2)]
 """
     rr_timed(label) do ... end
 
-Run a block, printing what is about to happen and how long it took.
-
-The expensive testsets below print nothing while they run, so a case that takes
-minutes is indistinguishable from one that has hung, and an interrupt lands
-wherever the scheduler happened to be. Announcing each case before it starts
-makes the last line printed the case that is stuck.
+Historical wrapper kept so the regression cases remain easy to identify in the
+source.  Timing/progress output was useful while debugging the recursive driver,
+but the normal test suite should be quiet.
 """
-function rr_timed(body, label::AbstractString)
-    print(stderr, "    ", label, " ... "); flush(stderr)
-    elapsed = @elapsed result = body()
-    # `round` rather than `@sprintf`: this file does not import Printf, and a
-    # progress line is not worth a new dependency.
-    print(stderr, round(elapsed; digits = 2), "s\n"); flush(stderr)
-    return result
-end
+rr_timed(body, ::AbstractString) = body()
 
 """
     rr_unimodular(U) -> Bool
@@ -533,31 +523,17 @@ end
         end
     end
 
-    # The benchmark showed the tiled path failing on a knapsack basis at
-    # dimension 128 -- "column 59 did not reduce in 64 passes" -- while every
-    # test above passed. Those tests all use `rr_triangular_basis`; knapsack has
-    # a different shape, and it is the shape that broke. A failure reproduced
-    # here is one that can be iterated on.
+    # Knapsack is the regression shape that exposed the Heuristic3 profile,
+    # cached-tau and relative-size-reduction bugs. Exercise both schedulers and
+    # both representation updates explicitly rather than relying only on the
+    # synthetic triangular bases above.
     @testset "knapsack input survives every configuration" begin
-        # The split schedule reduces TWO windows per odd iteration where legacy
-        # reduces one, so every level makes twice the recursive calls while the
-        # iteration cap stays the same. At n = 48 with a cutoff of 8 that is
-        # enough extra work to look like a hang -- the run sits inside fpLLL,
-        # which means a very large number of base cases rather than a fault in
-        # any of this. Held to n = 16 until the branching is bounded; see the
-        # opt-in testset below for the larger sizes.
         @testset "n = $n, schedule = $sched, tiled = $t" for n in (16, 32, 48),
                                                              sched in (:legacy, :split),
                                                              t in (false, true)
-            # `continue` inside a @testset for-comprehension skips the body but
-            # still registers the case, which is what we want: the grid stays
-            # readable and the skipped entries are visibly absent.
-            # The tiled path costs far more than the monolithic one at these
-            # sizes, and the split schedule reduces two windows per odd
-            # iteration on top of that. The combination pushed this file from
-            # ten seconds to over three minutes, so the grid is held to the
-            # sizes that actually discriminate: a fault that appears at 48 and
-            # not at 32 has not been seen yet.
+            # The full n = 48 split/tiled combinations are left to the larger
+            # benchmark so the unit suite stays bounded. The n = 16/32 grid is
+            # enough to cover the regressions that originally appeared here.
             if (sched === :split || t) && n > 32
                 @test true
                 continue
@@ -579,15 +555,6 @@ end
                     max_iterations = 30, want_profile = false,
                     validate = (n <= 32), telemetry = telemetry)
             end
-            # The figures the guesswork needed: how wide the final size
-            # reduction ran, and how many base cases the schedule caused.
-            print(stderr, "        levels=", telemetry.levels,
-                  " base=", telemetry.base_cases,
-                  " finalSR=", telemetry.final_precision, " bits",
-                  " (spread ", round(telemetry.final_spread; digits = 1), ")",
-                  " widestU=", telemetry.widest_transform, " bits\n")
-            flush(stderr)
-
             @test reduced == B0 * U
             # Modular, not fraction-free: on knapsack output the entries are
             # wide enough that the exact determinant dominates the whole file.
@@ -614,8 +581,6 @@ end
                                          telemetry = telemetry)
                 end
                 counts[sched] = telemetry.base_cases
-                print(stderr, "        base cases: ", telemetry.base_cases, "\n")
-                flush(stderr)
             end
             # Twice the windows per odd iteration, so some growth is expected;
             # an order of magnitude is the branching running away.
@@ -628,13 +593,9 @@ end
     @testset "no configuration exhausts the iteration cap on knapsack" begin
         capped = String[]
         for n in (16, 32, 48), sched in (:legacy, :split), t in (false, true)
-            # The tiled path is skipped entirely, not just at the larger sizes.
-            # It is known to diverge -- the grid above reports the iteration
-            # where it grows the profile -- so running it here only re-measures
-            # a failure that is already recorded, at 8 seconds a case against
-            # 0.05 for the monolithic path, and it stalls outright at n = 32
-            # with the split schedule. Restore this when the divergence is fixed.
-            t && continue
+            # Keep the most expensive n = 48 split case out of the unit suite,
+            # but do include the tiled path: the old divergence that justified
+            # skipping it has been fixed and this test should guard that result.
             sched === :split && n > 32 && continue
 
             bundle = Flatter.knapsack_lattice(MersenneTwister(hash((n, :knap))), n)

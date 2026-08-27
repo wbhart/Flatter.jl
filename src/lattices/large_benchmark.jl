@@ -345,6 +345,37 @@ function print_fused_split(t, total)
     return nothing
 end
 
+function print_heuristic3_split(t, total)
+    t.h3_calls > 0 || return nothing
+    h3_total = t.h3_time_precheck + t.h3_time_setup + t.h3_time_basis +
+               t.h3_time_qr + t.h3_time_sr_setup + t.h3_time_sr
+    @printf("        H3 %d calls, %.2fs (%.1f%% wall): pre %.2f  setup %.2f  basis %.2f  QR %.2f  SRsetup %.2f  SR %.2f\n",
+            t.h3_calls, h3_total, 100 * h3_total / total,
+            t.h3_time_precheck, t.h3_time_setup, t.h3_time_basis,
+            t.h3_time_qr, t.h3_time_sr_setup, t.h3_time_sr)
+    if t.h3_time_basis > 0
+        @printf("           basis: materialise %.2f (%.0f%%)  multiply %.2f (%.0f%%)  write %.2f (%.0f%%)\n",
+                t.h3_time_basis_materialise, 100 * t.h3_time_basis_materialise / t.h3_time_basis,
+                t.h3_time_basis_mul, 100 * t.h3_time_basis_mul / t.h3_time_basis,
+                t.h3_time_basis_write, 100 * t.h3_time_basis_write / t.h3_time_basis)
+    end
+    @printf("           SR pairs %d: reuseQR %d  refactor %d  triangular %d\n",
+            t.h3_sr_pairs, t.h3_sr_reuse_qr, t.h3_sr_refactor, t.h3_sr_triangular)
+    if t.h3_time_sr > 0
+        @printf("           SR: materialise %.2f (%.0f%%)  prec %.2f (%.0f%%)  WY %.2f (%.0f%%)\n",
+                t.h3_time_sr_materialise, 100 * t.h3_time_sr_materialise / t.h3_time_sr,
+                t.h3_time_sr_precision, 100 * t.h3_time_sr_precision / t.h3_time_sr,
+                t.h3_time_sr_factorprep, 100 * t.h3_time_sr_factorprep / t.h3_time_sr)
+        @printf("               reduce %.2f (%.0f%%): orth %.2f  triangular %.2f\n",
+                t.h3_time_sr_reduce, 100 * t.h3_time_sr_reduce / t.h3_time_sr,
+                t.h3_time_sr_orthogonal, t.h3_time_sr_triangular)
+        @printf("               write %.2f (%.0f%%)  propagate %.2f (%.0f%%)\n",
+                t.h3_time_sr_writeback, 100 * t.h3_time_sr_writeback / t.h3_time_sr,
+                t.h3_time_sr_propagate, 100 * t.h3_time_sr_propagate / t.h3_time_sr)
+    end
+    return nothing
+end
+
 """
     schedule_compare(; cases, seed, budget)
 
@@ -406,15 +437,20 @@ function schedule_compare(; cases = TILED_PROBE, seed::Integer = 1,
             # too low for a sub-problem. That is a result about the
             # configuration, so it is reported and the sweep continues.
             elapsed = Inf
+            best_telemetry = nothing
             local reduced
             failure = nothing
             for _ in 1:3
                 GC.gc()
+                telemetry = Flatter.ReductionTelemetry()
                 try
                     attempt = @elapsed reduced, _, _ = Flatter.reduce_basis(
                         bundle.basis; schedule = schedule, tiled = tiled,
-                        want_profile = false)
-                    elapsed = min(elapsed, attempt)
+                        telemetry = telemetry, want_profile = false)
+                    if attempt < elapsed
+                        elapsed = attempt
+                        best_telemetry = telemetry
+                    end
                 catch problem
                     failure = problem
                     break
@@ -435,6 +471,13 @@ function schedule_compare(; cases = TILED_PROBE, seed::Integer = 1,
             @printf("%-18s %5d %9s %9s %11.2f %11.2f\n",
                     case.family, columns, schedule, tiled ? "tiled" : "plain",
                     elapsed, shortest)
+            if best_telemetry !== nothing
+                if tiled
+                    print_heuristic3_split(best_telemetry, elapsed)
+                else
+                    print_fused_split(best_telemetry, elapsed)
+                end
+            end
             elapsed > budget && break
         end
         println()

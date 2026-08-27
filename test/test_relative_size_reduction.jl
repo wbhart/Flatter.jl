@@ -145,6 +145,36 @@ rsr_maxabs(A) = isempty(A) ? zero(eltype(A)) : maximum(abs, A)
         end
     end
 
+    @testset "direct reflector orthogonal kernel" begin
+        bits = 256
+        rng = MersenneTwister(0xD1EC7)
+        m, n1, n2 = 14, 5, 4
+        B1 = rsr_random_matrix(rng, m, n1; bits = 30)
+        B2 = rsr_random_matrix(rng, m, n2; bits = 60)
+        original = copy(B2)
+
+        setprecision(BigFloat, bits) do
+            factors, wy = Flatter.householder_block(Flatter.bigfloat_matrix(B1, bits))
+            tau = BigFloat[wy[i, i] for i in 1:n1]
+            reduced = copy(B2)
+            U = zeros(BigInt, n1, n2)
+            R2 = Matrix{BigFloat}(undef, m, n2)
+
+            Flatter._relative_orthogonal_reflectors!(
+                B1, reduced, U, factors, tau, R2;
+                deadband = Flatter.RELATIVE_SIZE_REDUCTION_DEADBAND,
+                max_passes = Flatter.RELATIVE_SIZE_REDUCTION_MAX_PASSES)
+
+            @test rsr_identity_holds(B1, original, reduced, U)
+            @test rsr_worst_mu(B1, reduced) <= 51 // 100 + 1 // 1000
+
+            fresh = Flatter.bigfloat_matrix(reduced, bits)
+            Flatter.apply_Qt!(fresh, factors, wy; reflectors = n1)
+            scale = max(one(BigFloat), rsr_maxabs(fresh))
+            @test rsr_maxabs(R2 - fresh) <= scale * BigFloat(2)^(-bits + 40)
+        end
+    end
+
     @testset "orthogonal kernel, supplied BigFloat factors" begin
         bits = 256
 

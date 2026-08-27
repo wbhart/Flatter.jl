@@ -150,7 +150,9 @@ A port of `Heuristic3::update_b`.
 """
 function tiled_basis_update!(B_next::AbstractMatrix{T}, B::AbstractMatrix{T},
                              U::AbstractMatrix{T},
-                             tiles::Vector{Tile}) where {T<:Integer}
+                             tiles::Vector{Tile};
+                             telemetry::Union{Nothing, ReductionTelemetry} = nothing
+                             ) where {T<:Integer}
     for (c, column_tile) in enumerate(tiles)
         columns = column_tile.range
         for r in 1:c
@@ -159,16 +161,29 @@ function tiled_basis_update!(B_next::AbstractMatrix{T}, B::AbstractMatrix{T},
                 # Nothing acted on this tile, so its columns pass straight
                 # through. This is where the saving is: a run with one window
                 # per iteration leaves most tiles untouched.
+                write_started = _tick()
                 for j in columns, i in rows
                     B_next[i, j] = B[i, j]
                 end
+                telemetry === nothing ||
+                    (telemetry.h3_time_basis_write += _tock(write_started))
                 continue
             end
-            product = _reduction_mul(Matrix{T}(view(B, rows, columns)),
-                                     Matrix{T}(view(U, columns, columns)))
+            materialise_started = _tick()
+            left = Matrix{T}(view(B, rows, columns))
+            right = Matrix{T}(view(U, columns, columns))
+            telemetry === nothing ||
+                (telemetry.h3_time_basis_materialise += _tock(materialise_started))
+            mul_started = _tick()
+            product = _reduction_mul(left, right)
+            telemetry === nothing ||
+                (telemetry.h3_time_basis_mul += _tock(mul_started))
+            write_started = _tick()
             for (jj, j) in enumerate(columns), (ii, i) in enumerate(rows)
                 B_next[i, j] = product[ii, jj]
             end
+            telemetry === nothing ||
+                (telemetry.h3_time_basis_write += _tock(write_started))
         end
     end
     return B_next
@@ -186,6 +201,26 @@ not reduced keep whatever `R` already held for them.
 
 A port of `Heuristic3::qr`.
 """
+# Direct packed Householder QR used by Heuristic3 tiles.  flatter sends MPFR
+# QRFactorization to its unblocked HouseholderMPFR implementation; it does not
+# build a compact-WY factor here.  Reuse the allocation-controlled reflector
+# primitives from fused QR so BigFloat arithmetic mutates MPFR values in place.
+function _heuristic3_direct_qr!(factors::Matrix{S}) where {S<:AbstractFloat}
+    m, n = size(factors)
+    r = min(m, n)
+    tau = Vector{S}(undef, r)
+    ws = _fused_temporaries(S, _FUSED_WORKSPACE_SIZE)
+
+    for k in 1:r
+        tau_k = _fused_larfg!(factors, k, m, ws)
+        tau[k] = tau_k
+        for j in (k + 1):n
+            _fused_larf_col!(factors, j, k, tau_k, m, ws)
+        end
+    end
+    return factors, tau
+end
+
 function tiled_diagonal_qr!(R::AbstractMatrix{S}, tau::AbstractVector{S},
                             B_next::AbstractMatrix{T}, tiles::Vector{Tile},
                             precision::Integer) where {T<:Integer, S<:AbstractFloat}
@@ -223,8 +258,12 @@ function tiled_diagonal_qr!(R::AbstractMatrix{S}, tau::AbstractVector{S},
         end
         tile_bits = max(bits, householder_precision(length(range), Float64(widest)))
 
-        factors, scalars = with_precision(tile_bits) do
-            householder_block(bigfloat_matrix(window, tile_bits))
+        factors, tile_tau = with_precision(tile_bits) do
+            F = Matrix{S}(undef, length(range), length(range))
+            for (j, column) in enumerate(range), (i, row) in enumerate(range)
+                F[i, j] = S(B_next[row, column])
+            end
+            _heuristic3_direct_qr!(F)
         end
 
         # Converted down, so `R` stays uniform at the driver's precision: a
@@ -235,7 +274,7 @@ function tiled_diagonal_qr!(R::AbstractMatrix{S}, tau::AbstractVector{S},
                 R[row, column] = S(factors[i, j])
             end
             for (i, row) in enumerate(range)
-                tau[row] = S(scalars[i])
+                tau[row] = S(tile_tau[i])
             end
         end
     end
@@ -278,7 +317,8 @@ function tiled_size_reduction!(B::AbstractMatrix{T}, B_next::AbstractMatrix{T},
                                R::AbstractMatrix{S}, tau::AbstractVector{S},
                                tiles::Vector{Tile};
                                precision::Integer,
-                               strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF
+                               strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF,
+                               telemetry::Union{Nothing, ReductionTelemetry} = nothing
                                ) where {T<:Integer, S<:AbstractFloat}
     _set_identity!(U_sr)
     bits = Int(precision)
@@ -291,7 +331,7 @@ function tiled_size_reduction!(B::AbstractMatrix{T}, B_next::AbstractMatrix{T},
     # COMPUTATION that has to be wrapped, not just the allocations.
     return with_precision(bits) do
         _tiled_size_reduction_body!(B, B_next, U_i, U_sr, R, tau, tiles, bits,
-                                    Int(strassen_cutoff))
+                                    Int(strassen_cutoff), telemetry)
     end
 end
 
@@ -299,7 +339,9 @@ function _tiled_size_reduction_body!(B::AbstractMatrix{T}, B_next::AbstractMatri
                                      U_i::AbstractMatrix{T}, U_sr::AbstractMatrix{T},
                                      R::AbstractMatrix{S}, tau::AbstractVector{S},
                                      tiles::Vector{Tile}, bits::Int,
-                                     strassen_cutoff::Int) where {T<:Integer, S<:AbstractFloat}
+                                     strassen_cutoff::Int,
+                                     telemetry::Union{Nothing, ReductionTelemetry}
+                                     ) where {T<:Integer, S<:AbstractFloat}
     for column_index in 1:length(tiles)
         columns = tiles[column_index].range
 
@@ -309,44 +351,57 @@ function _tiled_size_reduction_body!(B::AbstractMatrix{T}, B_next::AbstractMatri
             row_tile = tiles[row_index]
             rows = row_tile.range
 
+            telemetry === nothing || (telemetry.h3_sr_pairs += 1)
+            materialise_started = _tick()
             B1 = Matrix{T}(view(B, rows, rows))
             B2 = Matrix{T}(view(B_next, rows, columns))
             block = Matrix{T}(undef, length(rows), length(columns))
+            telemetry === nothing ||
+                (telemetry.h3_time_sr_materialise += _tock(materialise_started))
 
-            # The precision this reduction needs is set by the tile pair, not by
-            # the driver: it depends on the ratio between the block being reduced
-            # and the smallest diagonal it is reduced against. Forcing the
-            # driver's figure on it -- chosen for the WHOLE matrix -- can leave
-            # it short, and an under-provisioned relative size reduction does not
-            # fail. It runs every refinement pass on every column without
-            # converging, which reads as an unaccountably slow run.
-            required = relative_size_reduction_precision(B1)
-
-            if row_tile.reduce && required <= bits
-                # Its QR is already in R and tau at `bits`, which is enough, so
-                # hand those over rather than recomputing them.
-                factors = Matrix{S}(view(R, rows, rows))
-                scalars = Vector{S}(view(tau, rows))
-                compact = compact_wy_from_reflectors(factors, scalars)
-                _, _, R2 = relative_size_reduction!(B1, B2, block;
-                                                    factors = factors,
-                                                    compact_T = compact,
-                                                    precision = bits,
-                                                    strassen_cutoff = strassen_cutoff)
-            elseif row_tile.reduce
-                # The stored factorisation is too coarse for this pair, so let
-                # the reduction build its own at the precision it needs.
-                _, _, R2 = relative_size_reduction!(B1, B2, block;
-                                                    strassen_cutoff = strassen_cutoff)
+            if row_tile.reduce
+                # This is flatter's Heuristic3 rule: a reduced row tile has just
+                # been factorised at the iteration's working precision, so pass
+                # that R/tau factorisation straight to RelativeSizeReduction.
+                # Do not compare it with relative_size_reduction_precision(B1):
+                # that generic policy is based on absolute integer bit-length,
+                # whereas Heuristic3 deliberately chooses precision from the
+                # compressed post-child profile spread.
+                telemetry === nothing || (telemetry.h3_sr_reuse_qr += 1)
+                factorprep_started = _tick()
+                # Keep these as views: flatter passes submatrices of its
+                # persistent R/tau storage directly to RelativeSizeReduction.
+                factors = view(R, rows, rows)
+                scalars = view(tau, rows)
+                R2 = Matrix{S}(undef, length(rows), length(columns))
+                telemetry === nothing ||
+                    (telemetry.h3_time_sr_factorprep += _tock(factorprep_started))
+                reduce_started = _tick()
+                _relative_orthogonal_reflectors!(B1, B2, block, factors, scalars, R2;
+                    deadband = RELATIVE_SIZE_REDUCTION_DEADBAND,
+                    max_passes = RELATIVE_SIZE_REDUCTION_MAX_PASSES)
+                elapsed = _tock(reduce_started)
+                if telemetry !== nothing
+                    telemetry.h3_time_sr_reduce += elapsed
+                    telemetry.h3_time_sr_orthogonal += elapsed
+                end
             else
+                telemetry === nothing || (telemetry.h3_sr_triangular += 1)
                 # Untouched since the previous iteration, so still triangular;
-                # no factorisation is needed at any precision.
+                # no floating-point factorisation is needed at all.
+                reduce_started = _tick()
                 _, _, R2 = relative_size_reduction!(B1, B2, block;
                                                     triangular = true,
-                                                    precision = max(bits, required),
+                                                    precision = bits,
                                                     strassen_cutoff = strassen_cutoff)
+                elapsed = _tock(reduce_started)
+                if telemetry !== nothing
+                    telemetry.h3_time_sr_reduce += elapsed
+                    telemetry.h3_time_sr_triangular += elapsed
+                end
             end
 
+            writeback_started = _tick()
             for (jj, j) in enumerate(columns), (ii, i) in enumerate(rows)
                 B_next[i, j] = B2[ii, jj]
                 U_sr[i, j] = block[ii, jj]
@@ -366,9 +421,12 @@ function _tiled_size_reduction_body!(B::AbstractMatrix{T}, B_next::AbstractMatri
                     R[i, j] = S(R2[ii, jj])
                 end
             end
+            telemetry === nothing ||
+                (telemetry.h3_time_sr_writeback += _tock(writeback_started))
 
             # Propagate: the same transform applies to every tile above this one
             # in the same column, for the basis and for the running transform.
+            propagate_started = _tick()
             _tiled_accumulate!(B_next, B, U_sr, tiles, row_index, column_index,
                                1:(row_index - 1))
             _tiled_accumulate!(U_i, U_i, U_sr, tiles, row_index, column_index,
@@ -377,6 +435,8 @@ function _tiled_size_reduction_body!(B::AbstractMatrix{T}, B_next::AbstractMatri
             for j in columns, i in 1:last(rows)
                 B[i, j] = B_next[i, j]
             end
+            telemetry === nothing ||
+                (telemetry.h3_time_sr_propagate += _tock(propagate_started))
         end
     end
     return B_next, U_sr
@@ -433,7 +493,8 @@ function heuristic3_update!(working::AbstractMatrix{T},
                             sub_transforms::AbstractVector{<:AbstractMatrix{T}},
                             n::Int, precision::Integer;
                             float_type::Type{S} = BigFloat,
-                            strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF
+                            strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF,
+                            telemetry::Union{Nothing, ReductionTelemetry} = nothing
                             ) where {T<:Integer, S<:AbstractFloat}
     # PRECONDITION, and not a mild one. `tiled_basis_update!` writes only the
     # blocks at or above the tile diagonal, and `tiled_size_reduction!` tells
@@ -445,25 +506,34 @@ function heuristic3_update!(working::AbstractMatrix{T},
     # The driver satisfies it because it compresses every iteration, and
     # compression rebuilds a triangular basis from `R`. Feeding the raw output
     # of one update straight into the next does NOT satisfy it.
+    telemetry === nothing || (telemetry.h3_calls += 1)
+    precheck_started = _tick()
     for j in 1:n, i in (j + 1):n
         iszero(working[i, j]) || throw(ArgumentError(
             "the working basis must be upper triangular; working[$i,$j] is " *
             "nonzero. The tiled update reads only the blocks at or above the " *
             "tile diagonal, so anything below would be lost."))
     end
+    telemetry === nothing ||
+        (telemetry.h3_time_precheck += _tock(precheck_started))
 
+    setup_started = _tick()
     tiles, reducible = tile_partition(windows, n)
 
     transform = Matrix{T}(undef, n, n)
     embed_transforms!(transform, tiles, reducible,
                       [Matrix{T}(u) for u in sub_transforms])
+    telemetry === nothing || (telemetry.h3_time_setup += _tock(setup_started))
 
+    basis_started = _tick()
     basis = Matrix{T}(undef, n, n)
     for j in 1:n, i in 1:n
         basis[i, j] = zero(T)
     end
-    tiled_basis_update!(basis, working, transform, tiles)
+    tiled_basis_update!(basis, working, transform, tiles; telemetry = telemetry)
+    telemetry === nothing || (telemetry.h3_time_basis += _tock(basis_started))
 
+    qr_started = _tick()
     # Allocated INSIDE the precision block: a `zeros(BigFloat, ...)` outside it
     # would hold entries at the default precision, and the tiles written by the
     # factorisation would then disagree with the ones left untouched.
@@ -471,14 +541,21 @@ function heuristic3_update!(working::AbstractMatrix{T},
         (zeros(S, n, n), zeros(S, n))
     end
     tiled_diagonal_qr!(R, tau, basis, tiles, precision)
+    telemetry === nothing || (telemetry.h3_time_qr += _tock(qr_started))
 
+    sr_setup_started = _tick()
     # `tiled_size_reduction!` reads the previous iterate from its first argument
     # and writes the current one to its second, so they start equal.
     previous = Matrix{T}(basis)
     scratch = Matrix{T}(undef, n, n)
+    telemetry === nothing ||
+        (telemetry.h3_time_sr_setup += _tock(sr_setup_started))
+    sr_started = _tick()
     tiled_size_reduction!(previous, basis, transform, scratch, R, tau, tiles;
                           precision = precision,
-                          strassen_cutoff = strassen_cutoff)
+                          strassen_cutoff = strassen_cutoff,
+                          telemetry = telemetry)
+    telemetry === nothing || (telemetry.h3_time_sr += _tock(sr_started))
 
     return basis, transform, R, tau
 end

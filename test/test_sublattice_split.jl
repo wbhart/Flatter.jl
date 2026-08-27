@@ -80,6 +80,30 @@
             Flatter.split_advance!(node.mid.left)
             @test node.left.right.iter == before + 1
         end
+
+        @testset "advancing phase 3 resets the half trees" begin
+            node = Flatter.SplitPhase3(8)
+
+            # Exercise state at several depths, including a subtree shared with
+            # the middle schedule.  flatter resets left and right recursively
+            # before incrementing the parent, but does not reset mid.iter.
+            Flatter.split_advance!(node.left)
+            Flatter.split_advance!(node.left.left)
+            Flatter.split_advance!(node.right)
+            node.mid.iter = 7
+
+            @test node.left.iter != 0
+            @test node.left.left.iter != 0
+            @test node.right.iter != 0
+
+            Flatter.split_advance!(node)
+
+            @test node.iter == 1
+            @test node.left.iter == 0
+            @test node.left.left.iter == 0
+            @test node.right.iter == 0
+            @test node.mid.iter == 7
+        end
     end
 
     @testset "phase 2" begin

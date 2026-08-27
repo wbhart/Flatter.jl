@@ -138,10 +138,19 @@
                 range = tile.range
                 if tile.reduce
                     # The block's own factorisation, independent of the rest.
-                    reference, _ = Flatter.householder_block(
+                    reference, reference_T = Flatter.householder_block(
                         Flatter.bigfloat_matrix(B[range, range], 200))
                     @test maximum(abs, triu(R[range, range]) - triu(reference)) <
                           BigFloat(2)^(-180) * max(1, maximum(abs, reference))
+
+                    # `tau` is the diagonal of the compact-WY T factor.  This
+                    # catches the easy-to-miss mistake of treating the second
+                    # return value of `householder_block` as a vector and
+                    # linearly indexing its first column.
+                    for (k, row) in enumerate(range)
+                        @test abs(tau[row] - reference_T[k, k]) <
+                              BigFloat(2)^(-180) * max(1, abs(reference_T[k, k]))
+                    end
                 else
                     # A gap tile is still upper triangular, so it is its own R
                     # factor and is copied rather than factorised.

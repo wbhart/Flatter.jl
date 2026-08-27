@@ -204,6 +204,103 @@ function _reduce_relative_column!(r::AbstractVector{S},
     return largest
 end
 
+# Apply the packed Householder reflectors directly to one coordinate column.
+#
+# This is the representation used by flatter's Orthogonal relative-size-
+# reduction kernel: the lower triangle of `factors` stores the reflector tails,
+# the leading entry of reflector k is implicitly one, and `tau[k]` is its
+# scalar coefficient.  It deliberately does NOT build compact-WY T.  For a
+# single column, applying the reflectors one at a time performs less BigFloat
+# work than forming T and doing three triangular matrix products, and it mirrors
+# flatter's `larf` loop exactly.
+function _apply_reflectors_Qt_column!(r::AbstractVector{S},
+                                      factors::AbstractMatrix{S},
+                                      tau::AbstractVector{S},
+                                      n1::Int) where {S<:AbstractFloat}
+    m = length(r)
+    @inbounds for k in 1:n1
+        tau_k = tau[k]
+        iszero(tau_k) && continue
+
+        inner = r[k]
+        for i in (k + 1):m
+            inner += factors[i, k] * r[i]
+        end
+        inner *= tau_k
+
+        r[k] -= inner
+        for i in (k + 1):m
+            r[i] -= factors[i, k] * inner
+        end
+    end
+    return r
+end
+
+# Flatter-style orthogonal relative size reduction using the saved reflector
+# scalars directly.  The public generic orthogonal kernel remains compact-WY so
+# its existing API and tests are unchanged; Heuristic3 uses this specialised
+# path because it already owns exactly the `(R, tau)` representation flatter
+# passes to RelativeSizeReduction.
+function _relative_orthogonal_reflectors!(B1::AbstractMatrix{T},
+                                           B2::AbstractMatrix{T},
+                                           U::AbstractMatrix{T},
+                                           factors::AbstractMatrix{S},
+                                           tau::AbstractVector{S},
+                                           R2::Union{Nothing, AbstractMatrix{S}};
+                                           deadband::Float64,
+                                           max_passes::Int) where {T<:Integer, S<:AbstractFloat}
+    m, n1 = size(B1)
+    n2 = size(B2, 2)
+
+    _zero_transform!(U)
+    (iszero(n1) || iszero(n2)) && return B2, U
+
+    length(tau) >= n1 || throw(DimensionMismatch(
+        "tau has $(length(tau)) entries but $n1 reflectors are required"))
+    for j in 1:n1
+        isfinite(factors[j, j]) && !iszero(factors[j, j]) || throw(ArgumentError(
+            "the R factor of B1 has a zero or non-finite diagonal entry at " *
+            "index $j; B1 is rank deficient, or the factorization precision " *
+            "is too low"))
+    end
+
+    # Flatter handles one exact target column at a time. Reuse the floating
+    # coordinate vector across columns; each refinement pass starts by copying
+    # the CURRENT exact B2 column into it, so floating error never accumulates
+    # from one pass to the next.
+    r = Vector{S}(undef, m)
+    for column in 1:n2
+        previous = typemax(Int)
+        passes = 0
+        while true
+            passes += 1
+            passes <= max_passes || throw(ErrorException(
+                "relative size reduction failed to converge in $max_passes passes; " *
+                "the working precision is too low for this block"))
+
+            @inbounds for i in 1:m
+                r[i] = _to_float(S, B2[i, column])
+            end
+            _apply_reflectors_Qt_column!(r, factors, tau, n1)
+
+            largest = _reduce_relative_column!(
+                r, factors, B1, B2, U, column, n1, deadband)
+
+            if R2 !== nothing
+                @inbounds for i in 1:m
+                    R2[i, column] = r[i]
+                end
+            end
+
+            largest <= 0 && break
+            largest >= previous && break
+            previous = largest
+        end
+    end
+
+    return B2, U
+end
+
 # The refinement loop.
 #
 #     until every column has converged:

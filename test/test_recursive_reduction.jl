@@ -316,13 +316,23 @@ end
             end
         end
 
-        @testset "the goal is only checked at the end of a cycle" begin
-            @test !Flatter._should_check_goal(0)
-            @test !Flatter._should_check_goal(1)
-            @test !Flatter._should_check_goal(2)
-            @test Flatter._should_check_goal(3)
-            @test !Flatter._should_check_goal(4)
-            @test Flatter._should_check_goal(6)
+        @testset "goal checks follow the active schedule" begin
+            # The legacy Proved3-style schedule remains a three-step cycle.
+            @test !Flatter._should_check_goal(0, :legacy, nothing)
+            @test !Flatter._should_check_goal(1, :legacy, nothing)
+            @test !Flatter._should_check_goal(2, :legacy, nothing)
+            @test Flatter._should_check_goal(3, :legacy, nothing)
+            @test !Flatter._should_check_goal(4, :legacy, nothing)
+            @test Flatter._should_check_goal(6, :legacy, nothing)
+
+            # Heuristic3 asks its split tree. Phase 3 starts at a stopping
+            # point, then alternates non-stopping and stopping states.
+            node = Flatter.SplitPhase3(8)
+            @test Flatter._should_check_goal(0, :split, node)
+            Flatter.split_advance!(node)
+            @test !Flatter._should_check_goal(1, :split, node)
+            Flatter.split_advance!(node)
+            @test Flatter._should_check_goal(2, :split, node)
         end
     end
 

@@ -253,6 +253,33 @@ Base.@kwdef mutable struct ReductionTelemetry
     schoenhage_calls::Int = 0
     fplll_calls::Int = 0
     fused_calls::Int = 0
+
+    # Heuristic3-only profiling.  `time_fused` still measures the entire tiled
+    # update; these counters divide it into optimisation targets without
+    # changing the algorithm.
+    h3_calls::Int = 0
+    h3_sr_pairs::Int = 0
+    h3_sr_reuse_qr::Int = 0
+    h3_sr_refactor::Int = 0
+    h3_sr_triangular::Int = 0
+    h3_time_precheck::Float64 = 0.0
+    h3_time_setup::Float64 = 0.0
+    h3_time_basis::Float64 = 0.0
+    h3_time_basis_materialise::Float64 = 0.0
+    h3_time_basis_mul::Float64 = 0.0
+    h3_time_basis_write::Float64 = 0.0
+    h3_time_qr::Float64 = 0.0
+    h3_time_sr_setup::Float64 = 0.0
+    h3_time_sr::Float64 = 0.0
+    h3_time_sr_materialise::Float64 = 0.0
+    h3_time_sr_precision::Float64 = 0.0
+    h3_time_sr_factorprep::Float64 = 0.0
+    h3_time_sr_reduce::Float64 = 0.0
+    h3_time_sr_orthogonal::Float64 = 0.0
+    h3_time_sr_triangular::Float64 = 0.0
+    h3_time_sr_writeback::Float64 = 0.0
+    h3_time_sr_propagate::Float64 = 0.0
+
     time_fused::Float64 = 0.0
     time_matmul::Float64 = 0.0
     time_compress::Float64 = 0.0
@@ -304,6 +331,30 @@ function Base.show(io::IO, t::ReductionTelemetry)
                         round(t.fused_split[slot]; digits = 3), " s (",
                         round(100 * t.fused_split[slot] / t.time_fused; digits = 1), "%)")
         end
+    end
+    if t.h3_calls > 0
+        println(io, "  Heuristic3 updates       : ", t.h3_calls)
+        println(io, "    precondition scan      : ", round(t.h3_time_precheck; digits = 3), " s")
+        println(io, "    tile/embed setup       : ", round(t.h3_time_setup; digits = 3), " s")
+        println(io, "    tiled basis update     : ", round(t.h3_time_basis; digits = 3), " s")
+        println(io, "      materialise views    : ", round(t.h3_time_basis_materialise; digits = 3), " s")
+        println(io, "      integer products     : ", round(t.h3_time_basis_mul; digits = 3), " s")
+        println(io, "      copy/write blocks    : ", round(t.h3_time_basis_write; digits = 3), " s")
+        println(io, "    diagonal tile QR       : ", round(t.h3_time_qr; digits = 3), " s")
+        println(io, "    size-red setup         : ", round(t.h3_time_sr_setup; digits = 3), " s")
+        println(io, "    tiled size reduction   : ", round(t.h3_time_sr; digits = 3), " s")
+        println(io, "      materialise views    : ", round(t.h3_time_sr_materialise; digits = 3), " s")
+        println(io, "      precision scans      : ", round(t.h3_time_sr_precision; digits = 3), " s")
+        println(io, "      compact-WY prep      : ", round(t.h3_time_sr_factorprep; digits = 3), " s")
+        println(io, "      relative reduction   : ", round(t.h3_time_sr_reduce; digits = 3), " s")
+        println(io, "        orthogonal/reuse   : ", round(t.h3_time_sr_orthogonal; digits = 3), " s")
+        println(io, "        triangular         : ", round(t.h3_time_sr_triangular; digits = 3), " s")
+        println(io, "      writeback            : ", round(t.h3_time_sr_writeback; digits = 3), " s")
+        println(io, "      propagation          : ", round(t.h3_time_sr_propagate; digits = 3), " s")
+        println(io, "    SR tile pairs          : ", t.h3_sr_pairs,
+                    " (reuse QR ", t.h3_sr_reuse_qr,
+                    ", refactor ", t.h3_sr_refactor,
+                    ", triangular ", t.h3_sr_triangular, ")")
     end
     println(io, "  time in matrix products  : ", round(t.time_matmul; digits = 3), " s")
     println(io, "  time in compression      : ", round(t.time_compress; digits = 3), " s")
@@ -402,11 +453,15 @@ function _reduction_window(iteration::Int, n::Int)
     return (div(n, 2) + 1):n
 end
 
-# A goal check only makes sense at the end of a full cycle, once every window
-# has had a turn. flatter's `Proved3::is_reduced` says the same with
-# `iterations % 3 == 0`, and refuses at iteration zero so at least one cycle
-# always runs.
-_should_check_goal(iteration::Int) = iteration > 0 && mod(iteration, 3) == 0
+# Goal checks happen only at schedule stopping points.  The legacy cycle is a
+# three-step middle/left/right schedule.  flatter's Heuristic3 instead asks its
+# split tree whether the CURRENT state is a stopping point; phase 3 says yes on
+# even iterations, including the initial state.
+function _should_check_goal(iteration::Int, schedule::Symbol,
+                            split_node::Union{Nothing, SplitPhase3})
+    schedule === :split && return split_stopping_point(split_node::SplitPhase3)
+    return iteration > 0 && mod(iteration, 3) == 0
+end
 
 # ---------------------------------------------------------------------------
 # Compression
@@ -1298,7 +1353,7 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     cycle_profile = profile .+ offsets
 
     while true
-        if _should_check_goal(iteration)
+        if _should_check_goal(iteration, schedule, split_node)
             if goal_check(resolved_goal, profile)
                 goal_met = true
                 stopped = :goal
@@ -1306,17 +1361,19 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             end
 
             # Nothing moved over a whole cycle of windows, so no further cycle
-            # will move anything either: the reduction has converged on
-            # something short of the goal. flatter has this test in
-            # `Proved3::is_reduced` but leaves it commented out.
-            current = profile .+ offsets
-            if all(i -> abs(current[i] - cycle_profile[i]) <= REDUCTION_STAGNATION_TOLERANCE,
-                   1:n)
-                stopped = :stagnated
-                telemetry === nothing || (telemetry.stagnated += 1)
-                break
+            # will move anything either.  A split schedule is a stopping point
+            # at iteration zero, before anything has had a chance to move, so
+            # the stagnation test starts only after at least one iteration.
+            if iteration > 0
+                current = profile .+ offsets
+                if all(i -> abs(current[i] - cycle_profile[i]) <= REDUCTION_STAGNATION_TOLERANCE,
+                       1:n)
+                    stopped = :stagnated
+                    telemetry === nothing || (telemetry.stagnated += 1)
+                    break
+                end
+                cycle_profile = current
             end
-            cycle_profile = current
         end
         if iteration >= max_iterations
             telemetry === nothing || (telemetry.capped += 1)
@@ -1401,7 +1458,7 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                 push!(blocks, Matrix{T}(block))
             end
             candidate, window_transform, factor, _ = heuristic3_update!(
-                working, windows, blocks, n, tiled_precision)
+                working, windows, blocks, n, tiled_precision; telemetry = telemetry)
             if telemetry !== nothing
                 telemetry.time_fused += _tock(fused_started)
                 telemetry.fused_calls += 1

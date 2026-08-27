@@ -120,7 +120,24 @@ end
 "A stopping point is an iteration after which the schedule may be halted."
 split_stopping_point(node::SplitPhase3) = iseven(node.iter)
 
-split_advance!(node::SplitPhase3) = (node.iter += 1; node)
+"Reset a phase 3 subtree exactly as flatter does: this node, then left/right."
+function split_reset!(node::SplitPhase3)
+    node.iter = 0
+    node.left === nothing || split_reset!(node.left)
+    node.right === nothing || split_reset!(node.right)
+    return node
+end
+
+function split_advance!(node::SplitPhase3)
+    # flatter resets the two half trees before advancing the parent.  The
+    # middle node itself is deliberately NOT reset: its children are shared
+    # with the half trees, but its own iteration counter persists until that
+    # middle schedule is used again.
+    node.left === nothing || split_reset!(node.left)
+    node.right === nothing || split_reset!(node.right)
+    node.iter += 1
+    return node
+end
 
 """
     SplitPhase2

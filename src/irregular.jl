@@ -328,6 +328,11 @@ together with `rounds` (dense path only) and the fields
 
 Keyword arguments beyond those of [`lattice_reduce!`](@ref):
 
+  * `algorithm`  -- `:teaching` (the existing reducer) or `:heuristic` (flatter's
+                    heuristic phase dispatcher where it has been ported).  The
+                    heuristic path currently accepts triangular/reoriented
+                    bases and starts them in Heuristic2; dense input still needs
+                    `CondUnknown` and is rejected explicitly.
   * `max_rounds` -- iterations of the dense path. Each round re-factorises an
                     already improved basis, so its integer approximation is a
                     better one; the loop stops early when a round produces the
@@ -340,6 +345,7 @@ than handled; flatter's `CondUnknown` is what deals with that case and is not
 ported.
 """
 function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
+                       algorithm::Symbol = :teaching,
                        max_rounds::Integer = DEFAULT_DENSE_ROUNDS,
                        aggressive::Bool = false,
                        telemetry::Union{Nothing, ReductionTelemetry} = nothing,
@@ -347,6 +353,8 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                        want_profile::Bool = true,
                        kwargs...) where {T<:Integer}
     m, n = size(B)
+    algorithm in (:teaching, :heuristic) || throw(ArgumentError(
+        "unknown reduction algorithm $algorithm; expected :teaching or :heuristic"))
     m >= n || throw(DimensionMismatch(
         "expected at least as many rows as columns, got $m x $n"))
     size(U) == (n, n) || throw(DimensionMismatch("U must be $n x $n, got $(size(U))"))
@@ -358,9 +366,30 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         flip_rows, flip_columns = orientation
         _flip!(B, flip_rows, flip_columns)
 
-        _, _, info = lattice_reduce!(B, U; aggressive = aggressive,
-                                     want_profile = want_profile,
-                                     telemetry = telemetry, kwargs...)
+        if algorithm === :heuristic
+            # flatter's Irregular::solve_triangular performs an exact triangular
+            # size reduction before entering phase 2.  This step is required
+            # even when Heuristic2 accepts the profile immediately at iteration
+            # zero: size reduction does not change the diagonal profile, but it
+            # is part of the returned reduced representative.
+            U_sr = Matrix{T}(undef, n, n)
+            size_reduction_triu!(B, U_sr)
+
+            U_h2 = Matrix{T}(undef, n, n)
+            _, _, info = heuristic2_reduce!(B, U_h2; aggressive = aggressive,
+                                             telemetry = telemetry, kwargs...)
+
+            # Q*B0*P is first changed by U_sr and then by U_h2, so the
+            # transform in the oriented coordinates is U_sr * U_h2.
+            combined = strassen(U_sr, U_h2)
+            for j in 1:n, i in 1:n
+                U[i, j] = combined[i, j]
+            end
+        else
+            _, _, info = lattice_reduce!(B, U; aggressive = aggressive,
+                                         want_profile = want_profile,
+                                         telemetry = telemetry, kwargs...)
+        end
 
         # Undo the row reversal on the basis, and apply the column reversal to
         # the transform: reducing `Q B P` to `Q B P U'` means the transform for
@@ -370,6 +399,12 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
 
         path = (flip_rows || flip_columns) ? :reoriented : :triangular
         return B, U, (; path, rounds = 0, info...)
+    end
+
+    if algorithm === :heuristic
+        throw(ArgumentError(
+            "algorithm=:heuristic currently supports triangular/reoriented bases only; " *
+            "dense input needs CondUnknown, which is not yet ported"))
     end
 
     return _reduce_dense!(B, U, Int(max_rounds), aggressive, telemetry,

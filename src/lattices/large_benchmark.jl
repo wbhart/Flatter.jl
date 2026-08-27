@@ -68,6 +68,15 @@ const CHEAP_CASES = [
     (family = "knapsack",          size = 255),
 ]
 
+# Square triangular/reoriented families that can enter the heuristic dispatcher
+# before CondUnknown is ported.  `scrambled` is dense and `relation` is
+# rectangular, so both still belong to the teaching/dense path for now.
+const HEURISTIC2_LARGE_CASES = [
+    (family = "random-triangular", size = 256),
+    (family = "knapsack",          size = 255),
+    (family = "q-ary",             size = 128),
+]
+
 """
 `relation` at a dimension small enough to sweep but large enough to be
 representative — the full case at 256 takes about 1050 seconds, this one a
@@ -337,16 +346,17 @@ function shortest_norm_log2(B)
     return Float64(log2(big(best))) / 2
 end
 
-function print_fused_split(t, total)
+function print_fused_split(t, total; extra_accounted::Real = 0.0,
+                           extra_label::AbstractString = "")
     total > 0 && t.time_fused > 0 || return nothing
     @printf("      fusedQR %5.1f%%  = size-red %4.1f%%  reorth %4.1f%%  trailing %4.1f%%\n",
             100 * t.time_fused / total,
             100 * t.fused_split[Flatter.FUSED_TIME_REDUCE] / total,
             100 * t.fused_split[Flatter.FUSED_TIME_REORTH] / total,
             100 * t.fused_split[Flatter.FUSED_TIME_TRAILING] / total)
-    accounted = t.time_fused + t.time_matmul + t.time_finalise + t.time_base +
-                t.time_compress + t.time_dense_qr + t.time_gc + t.time_setup +
-                t.time_push
+    generic_accounted = t.time_fused + t.time_matmul + t.time_finalise + t.time_base +
+                        t.time_compress + t.time_dense_qr + t.time_gc + t.time_setup +
+                        t.time_push
     @printf("      matmul %5.1f%%  finalise %5.1f%%  base %5.1f%%  compress %5.1f%%",
             100 * t.time_matmul / total, 100 * t.time_finalise / total,
             100 * t.time_base / total, 100 * t.time_compress / total)
@@ -356,10 +366,17 @@ function print_fused_split(t, total)
     @printf("\n      gc %5.1f%%  setup %5.1f%%  fold-in %5.1f%%",
             100 * t.time_gc / total, 100 * t.time_setup / total,
             100 * t.time_push / total)
-    if accounted < 0.9 * total
-        @printf("  [%.0f%% unaccounted]", 100 * (1 - accounted / total))
-    end
     println()
+    combined_accounted = generic_accounted + Float64(extra_accounted)
+    if extra_accounted > 0
+        @printf("      accounted %5.1f%% = generic %5.1f%% + %s %5.1f%%; residual %5.1f%%\n",
+                100 * combined_accounted / total,
+                100 * generic_accounted / total, extra_label,
+                100 * Float64(extra_accounted) / total,
+                100 * (1 - combined_accounted / total))
+    elseif generic_accounted < 0.9 * total
+        @printf("      [%.0f%% unaccounted]\n", 100 * (1 - generic_accounted / total))
+    end
     return nothing
 end
 
@@ -391,6 +408,27 @@ function print_heuristic3_split(t, total)
                 t.h3_time_sr_writeback, 100 * t.h3_time_sr_writeback / t.h3_time_sr,
                 t.h3_time_sr_propagate, 100 * t.h3_time_sr_propagate / t.h3_time_sr)
     end
+    return nothing
+end
+
+function heuristic2_local_time(t)
+    return t.h2_time_qr + t.h2_time_wrapper_qr + t.h2_time_relative +
+           t.h2_time_u2_compose + t.h2_time_top_right + t.h2_time_collect +
+           t.h2_time_compress + t.h2_time_apply
+end
+
+function print_heuristic2_split(t, total)
+    t.h2_calls > 0 || return nothing
+    h2_total = heuristic2_local_time(t)
+    @printf("        H2 %d calls, %d/%d/%d L/R/all, %d H3 handoffs, %.2fs measured (%.1f%% wall)\n",
+            t.h2_calls, t.h2_left_steps, t.h2_right_steps, t.h2_all_steps,
+            t.h2_phase3_calls, h2_total, 100 * h2_total / total)
+    @printf("           repQR %.2f  relQR %.2f  relative-B2 %.2f  U2mul %.2f\n",
+            t.h2_time_qr, t.h2_time_wrapper_qr, t.h2_time_relative,
+            t.h2_time_u2_compose)
+    @printf("           topR %.2f  collectU %.2f  compress %.2f  exact-apply %.2f\n",
+            t.h2_time_top_right, t.h2_time_collect,
+            t.h2_time_compress, t.h2_time_apply)
     return nothing
 end
 
@@ -503,6 +541,107 @@ function schedule_compare(; cases = TILED_PROBE, seed::Integer = 1,
 
     println("All four are the same lattice; only the route and the")
     println("representative differ. Compare within a family, not across runs.")
+end
+
+
+"""
+    heuristic2_compare(; cases = CHEAP_CASES, seed = 1, repeats = 3)
+
+Compare the existing teaching reducer with the opt-in heuristic dispatcher on
+triangular/reoriented inputs, writing nothing to disk.
+
+This is deliberately separate from `run_large`: the latter is the stable
+reference benchmark whose cached `ours` rows belong to the teaching reducer.
+Until `CondUnknown` is ported, `algorithm=:heuristic` only supports the square
+triangular families, so the default comparison uses the two cheap 256-column
+cases.  Pass `cases = HEURISTIC2_LARGE_CASES` to add q-ary.
+"""
+function heuristic2_compare(; cases = CHEAP_CASES, seed::Integer = 1,
+                            repeats::Integer = 3)
+    repeats >= 1 || throw(ArgumentError("repeats must be positive"))
+    families = Dict(f.name => f for f in Flatter.lattice_families())
+
+    # Julia specialises the two algorithm keywords independently.  Cross the
+    # recursive cutoff for both before timing either one.
+    warm = Flatter.random_triangular_lattice(MersenneTwister(7), 48).basis
+    Flatter.reduce_basis(warm; algorithm = :teaching, want_profile = false)
+    Flatter.reduce_basis(warm; algorithm = :heuristic)
+
+    @printf("%-18s %5s %11s %11s %9s %11s %11s\n",
+            "family", "dim", "teaching(s)", "heuristic(s)", "speedup",
+            "plain b1", "heur b1")
+    println(repeat("-", 92))
+
+    for case in cases
+        family = get(families, case.family, nothing)
+        family === nothing && continue
+        bundle = family.generate(MersenneTwister(hash((seed, case.family, case.size))),
+                                 case.size)
+
+        teaching_time = Inf
+        heuristic_time = Inf
+        teaching_reduced = nothing
+        heuristic_reduced = nothing
+        heuristic_info = nothing
+        heuristic_telemetry = nothing
+
+        for algorithm in (:teaching, :heuristic)
+            for _ in 1:Int(repeats)
+                GC.gc()
+                telemetry = Flatter.ReductionTelemetry()
+                local reduced, info
+                elapsed = @elapsed reduced, _, info = Flatter.reduce_basis(
+                    bundle.basis; algorithm = algorithm,
+                    telemetry = telemetry, want_profile = false)
+                if algorithm === :teaching
+                    if elapsed < teaching_time
+                        teaching_time = elapsed
+                        teaching_reduced = reduced
+                    end
+                elseif elapsed < heuristic_time
+                    heuristic_time = elapsed
+                    heuristic_reduced = reduced
+                    heuristic_info = info
+                    heuristic_telemetry = telemetry
+                end
+            end
+        end
+
+        plain_b1 = shortest_norm_log2(teaching_reduced)
+        heur_b1 = shortest_norm_log2(heuristic_reduced)
+        speedup = teaching_time / heuristic_time
+        # Heuristic2 follows flatter and may legitimately stop at iteration
+        # zero when the requested RHF/profile goal is already met.  The
+        # teaching reducer does not check its legacy goal at entry and can
+        # therefore over-reduce the same input.  A longer b1 than the teaching
+        # result is informative, but is not a quality failure if the requested
+        # flatter goal was met.
+        quality = if heur_b1 <= plain_b1 + 1e-9
+            ""
+        elseif heuristic_info !== nothing && heuristic_info.goal_met
+            " GOAL MET"
+        else
+            " QUALITY WORSE"
+        end
+
+        @printf("%-18s %5d %11.2f %11.2f %8.2fx %11.2f %11.2f%s\n",
+                case.family, Base.size(bundle.basis, 2), teaching_time,
+                heuristic_time, speedup, plain_b1, heur_b1, quality)
+        if heuristic_telemetry !== nothing
+            h2_local = heuristic2_local_time(heuristic_telemetry)
+            print_heuristic2_split(heuristic_telemetry, heuristic_time)
+            print_heuristic3_split(heuristic_telemetry, heuristic_time)
+            print_fused_split(heuristic_telemetry, heuristic_time;
+                              extra_accounted = h2_local, extra_label = "H2-local")
+            if heuristic_telemetry.time_recursion > 0
+                @printf("        recursive-call wall %.2fs (overlapping parent views; diagnostic only)\n",
+                        heuristic_telemetry.time_recursion)
+            end
+        end
+    end
+
+    println("\nNo reference rows are read or written.  A speedup above 1 favours the")
+    println("Heuristic2 -> Heuristic3 dispatcher; quality must remain comparable.")
 end
 
 """

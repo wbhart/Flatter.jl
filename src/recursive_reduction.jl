@@ -280,6 +280,23 @@ Base.@kwdef mutable struct ReductionTelemetry
     h3_time_sr_writeback::Float64 = 0.0
     h3_time_sr_propagate::Float64 = 0.0
 
+    # Heuristic2 phase/schedule counters.  H2 is a fixed left/right/all cycle;
+    # the all step hands the full window to Heuristic3.
+    h2_calls::Int = 0
+    h2_left_steps::Int = 0
+    h2_right_steps::Int = 0
+    h2_all_steps::Int = 0
+    h2_phase3_calls::Int = 0
+    h2_relative_calls::Int = 0
+    h2_time_qr::Float64 = 0.0
+    h2_time_wrapper_qr::Float64 = 0.0
+    h2_time_relative::Float64 = 0.0
+    h2_time_u2_compose::Float64 = 0.0
+    h2_time_top_right::Float64 = 0.0
+    h2_time_collect::Float64 = 0.0
+    h2_time_compress::Float64 = 0.0
+    h2_time_apply::Float64 = 0.0
+
     time_fused::Float64 = 0.0
     time_matmul::Float64 = 0.0
     time_compress::Float64 = 0.0
@@ -331,6 +348,21 @@ function Base.show(io::IO, t::ReductionTelemetry)
                         round(t.fused_split[slot]; digits = 3), " s (",
                         round(100 * t.fused_split[slot] / t.time_fused; digits = 1), "%)")
         end
+    end
+    if t.h2_calls > 0
+        println(io, "  Heuristic2 calls         : ", t.h2_calls)
+        println(io, "    phase-2 steps          : left ", t.h2_left_steps,
+                    ", right ", t.h2_right_steps, ", all ", t.h2_all_steps)
+        println(io, "    phase-3 handoffs       : ", t.h2_phase3_calls)
+        println(io, "    relative-B2 wrappers   : ", t.h2_relative_calls)
+        println(io, "    representation QR      : ", round(t.h2_time_qr; digits = 3), " s")
+        println(io, "    LatRedRelSR QR         : ", round(t.h2_time_wrapper_qr; digits = 3), " s")
+        println(io, "    relative size reduction: ", round(t.h2_time_relative; digits = 3), " s")
+        println(io, "    U2 composition         : ", round(t.h2_time_u2_compose; digits = 3), " s")
+        println(io, "    top-right product      : ", round(t.h2_time_top_right; digits = 3), " s")
+        println(io, "    structured collect_U   : ", round(t.h2_time_collect; digits = 3), " s")
+        println(io, "    scalar compression     : ", round(t.h2_time_compress; digits = 3), " s")
+        println(io, "    final exact apply      : ", round(t.h2_time_apply; digits = 3), " s")
     end
     if t.h3_calls > 0
         println(io, "  Heuristic3 updates       : ", t.h3_calls)

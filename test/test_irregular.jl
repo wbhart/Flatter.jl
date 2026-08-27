@@ -95,6 +95,78 @@ end
         end
     end
 
+    @testset "opt-in heuristic dispatcher" begin
+        @testset "triangular input starts in Heuristic2" begin
+            rng = MersenneTwister(0xA212)
+            B0 = rr_triangular_basis(rng, 8; spread = 50)
+            telemetry = Flatter.ReductionTelemetry()
+
+            reduced, U, info = Flatter.reduce_basis(
+                B0; algorithm = :heuristic, base_cutoff = 4,
+                max_iterations = 20, telemetry = telemetry)
+
+            @test rr_check_exact(B0, reduced, U)
+            @test info.path === :triangular
+            # The public dispatcher only needs to enter Heuristic2 here.  This
+            # fixture can already satisfy the RHF goal at H2 entry, in which
+            # case the phase-2 cycle (and hence the phase-3 handoff) is skipped.
+            # Dedicated Heuristic2 tests exercise the full L/R/all cycle.
+            @test telemetry.h2_calls >= 1
+        end
+
+        @testset "entry size reduction precedes Heuristic2" begin
+            # A flat diagonal profile already meets the default heuristic goal,
+            # so H2 itself should return immediately.  flatter nevertheless
+            # performs triangular size reduction in Irregular before entering
+            # H2; exercise exactly that case so the dispatcher cannot silently
+            # omit the pre-pass again.
+            B0 = BigInt[
+                16  100    0    0;
+                 0   16  100    0;
+                 0    0   16  100;
+                 0    0    0   16
+            ]
+            expected, _ = Flatter.size_reduction_triu(B0)
+            telemetry = Flatter.ReductionTelemetry()
+
+            reduced, U, info = Flatter.reduce_basis(
+                B0; algorithm = :heuristic, base_cutoff = 2,
+                max_iterations = 20, telemetry = telemetry)
+
+            @test rr_check_exact(B0, reduced, U)
+            @test reduced == expected
+            @test info.goal_met
+            @test telemetry.h2_calls == 1
+            @test telemetry.h2_left_steps == 0
+            @test telemetry.h2_right_steps == 0
+            @test telemetry.h2_all_steps == 0
+        end
+
+        @testset "reorientation is transparent to Heuristic2" begin
+            rng = MersenneTwister(0xA213)
+            upper = rr_triangular_basis(rng, 8; spread = 50)
+            lower = permutedims(upper)
+            telemetry = Flatter.ReductionTelemetry()
+
+            reduced, U, info = Flatter.reduce_basis(
+                lower; algorithm = :heuristic, base_cutoff = 4,
+                max_iterations = 20, telemetry = telemetry)
+
+            @test rr_check_exact(lower, reduced, U)
+            @test info.path === :reoriented
+            @test telemetry.h2_calls >= 1
+        end
+
+        @testset "dense input waits for CondUnknown" begin
+            dense = BigInt[3 1 2; 4 5 6; 7 8 10]
+            @test Flatter.triangular_orientation(dense) === nothing
+            @test_throws ArgumentError Flatter.reduce_basis(dense; algorithm = :heuristic)
+        end
+
+        @test_throws ArgumentError Flatter.reduce_basis(
+            BigInt[3 1; 0 5]; algorithm = :unknown)
+    end
+
     @testset "dense input" begin
         @testset "exact contract, n = $n" for n in (4, 6, 8, 12)
             rng = MersenneTwister(hash((n, :dense)))

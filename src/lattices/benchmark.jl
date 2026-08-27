@@ -75,6 +75,7 @@ Failures are caught rather than thrown: one bad instance should not abandon the
 sweep, and a timeout or a stall is itself a result worth recording.
 """
 function measure(bundle; max_iterations = 120, aggressive = false,
+                 algorithm::Symbol = :teaching,
                  run_fplll = true, verbose = false, repeat_under = 2.0,
                  progress = true, measure_memory = false, low_memory = nothing,
                  gc_dimension = Flatter.REDUCTION_GC_DIMENSION,
@@ -111,11 +112,21 @@ function measure(bundle; max_iterations = 120, aggressive = false,
             live_before = Base.gc_live_bytes()
             rss_before = Sys.maxrss()
             started = time_ns()
-            basis, _, attempt_info = Flatter.reduce_basis(
-                B; max_iterations = max_iterations, aggressive = aggressive,
-                low_memory = low_memory, gc_dimension = gc_dimension,
-                gc_full = gc_full,
-                telemetry = attempt_telemetry)
+            if algorithm === :teaching
+                basis, _, attempt_info = Flatter.reduce_basis(
+                    B; algorithm = :teaching, max_iterations = max_iterations,
+                    aggressive = aggressive, low_memory = low_memory,
+                    gc_dimension = gc_dimension, gc_full = gc_full,
+                    telemetry = attempt_telemetry)
+            else
+                # low_memory/gc_dimension/gc_full are controls for the teaching
+                # recursive driver.  Heuristic2 has its own recursion and does
+                # not accept those keywords; only pass the controls shared by
+                # the two algorithms here.
+                basis, _, attempt_info = Flatter.reduce_basis(
+                    B; algorithm = :heuristic, max_iterations = max_iterations,
+                    aggressive = aggressive, telemetry = attempt_telemetry)
+            end
             elapsed = (time_ns() - started) / 1e9
             attempt_live = Base.gc_live_bytes() - live_before
             attempt_rss = Sys.maxrss() - rss_before
@@ -242,6 +253,13 @@ function print_goal_diagnosis(r)
             report.mid_drop, report.mid_budget, report.middle_ok ? "ok" : "FAIL")
 end
 
+"H2-local kernel time which is disjoint from the generic driver stage timers."
+function heuristic2_local_time(t)
+    return t.h2_time_qr + t.h2_time_wrapper_qr + t.h2_time_relative +
+           t.h2_time_u2_compose + t.h2_time_top_right + t.h2_time_collect +
+           t.h2_time_compress + t.h2_time_apply
+end
+
 "Where the time went, as a share of the driver's wall clock."
 function print_time_breakdown(r)
     t = r.telemetry
@@ -250,9 +268,11 @@ function print_time_breakdown(r)
     @printf("    levels=%d depth=%d windows=%d capped=%d base=%d (L%d/S%d/F%d) fusedQR=%d\n",
             t.levels, t.max_depth, t.iterations, t.capped, t.base_cases,
             t.lagrange_calls, t.schoenhage_calls, t.fplll_calls, t.fused_calls)
-    accounted = t.time_fused + t.time_matmul + t.time_compress + t.time_base +
-                t.time_finalise + t.time_dense_qr + t.time_profile +
-                t.time_gc + t.time_setup + t.time_push
+    generic_accounted = t.time_fused + t.time_matmul + t.time_compress + t.time_base +
+                        t.time_finalise + t.time_dense_qr + t.time_profile +
+                        t.time_gc + t.time_setup + t.time_push
+    h2_local = heuristic2_local_time(t)
+    accounted = generic_accounted + h2_local
     @printf("    fusedQR %5.1f%%  matmul %5.1f%%  compress %5.1f%%  base %5.1f%%  finalise %5.1f%%\n",
             100 * t.time_fused / total, 100 * t.time_matmul / total,
             100 * t.time_compress / total, 100 * t.time_base / total,
@@ -281,8 +301,17 @@ function print_time_breakdown(r)
         @printf("    dense path: %d rounds, QR %5.1f%% of total\n",
                 t.dense_rounds, 100 * t.time_dense_qr / total)
     end
-    # Anything unaccounted is worth seeing: it has hidden a dominant cost twice.
-    if accounted < 0.75 * total
+    # H2's local representation/update kernels are disjoint from the generic
+    # recursive-driver timers above.  Include them before calling anything
+    # residual; H3 update time is already inside `time_fused` and must not be
+    # added again.
+    if t.h2_calls > 0
+        @printf("    H2 local %5.1f%%  accounted %5.1f%% = generic %5.1f%% + H2-local %5.1f%%; residual %5.1f%%\n",
+                100 * h2_local / total, 100 * accounted / total,
+                100 * generic_accounted / total, 100 * h2_local / total,
+                100 * max(0.0, 1 - accounted / total))
+    elseif accounted < 0.75 * total
+        # Anything unaccounted is worth seeing: it has hidden a dominant cost twice.
         @printf("    (%.0f%% of the time is unaccounted for)\n",
                 100 * (1 - accounted / total))
     end
@@ -331,28 +360,35 @@ only by some earlier case happening to compile the same path first, which is
 luck. The base triangular, recursive triangular and dense entry paths are all
 exercised here, since they compile separately.
 """
-function warm_up()
+function warm_up(; algorithm::Symbol = :teaching)
+    algorithm in (:teaching, :heuristic) || throw(ArgumentError(
+        "unknown reduction algorithm $algorithm; expected :teaching or :heuristic"))
     rng = MersenneTwister(7)
 
-    # Base triangular path.
-    Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 24).basis;
-                         want_profile = false)
+    if algorithm === :teaching
+        # Base triangular path.
+        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 24).basis;
+                             algorithm = :teaching, want_profile = false)
 
-    # Recursive triangular path.  The default base cutoff is 32, so dimension
-    # 24 above does not compile recursion, the fused update, transform folding,
-    # compression or finalisation.  Dimension 48 is the first standard
-    # benchmark size above that boundary; without this warm-up its first timing
-    # can consist mostly of JIT compilation and then exceed `repeat_under`,
-    # preventing the clean repeat that would otherwise hide compilation.
-    Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
-                         want_profile = false)
+        # Recursive triangular path.
+        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
+                             algorithm = :teaching, want_profile = false)
 
-    # Dense entry path, which compiles independently of the triangular driver.
-    Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
-                         want_profile = false)
+        # Dense entry path, which compiles independently of the triangular driver.
+        Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
+                             algorithm = :teaching, want_profile = false)
+    else
+        # An easy triangular basis can satisfy H2's goal at entry and therefore
+        # fail to compile the left/right/all cycle.  Knapsack reliably exercises
+        # reorientation, recursive H2, LatRedRelSR and the H2 -> H3 handoff.
+        Flatter.reduce_basis(Flatter.knapsack_lattice(rng, 48).basis;
+                             algorithm = :heuristic, want_profile = false)
+        # Also compile the already-upper-triangular entry branch.
+        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
+                             algorithm = :heuristic, want_profile = false)
+    end
     return nothing
 end
-
 """
     run_family(name, sizes; seed=1, kwargs...) -> Vector
 
@@ -366,6 +402,7 @@ The size parameter is not always the dimension: knapsack produces `n+1` columns,
 q-ary `2n`, and relation `n+1` columns in `n+2` rows.
 """
 function run_family(name::AbstractString, sizes = nothing; seed::Integer = 1,
+                    algorithm::Symbol = :teaching,
                     breakdown::Bool = true, time_budget::Real = 60.0,
                     warm::Bool = true, kwargs...)
     families = Flatter.lattice_families()
@@ -374,15 +411,15 @@ function run_family(name::AbstractString, sizes = nothing; seed::Integer = 1,
                                join((f.name for f in families), ", "))
     family = families[index]
     sizes = sizes === nothing ? family.sizes : sizes
-    warm && warm_up()
+    warm && warm_up(; algorithm = algorithm)
 
-    println("\n=== $(family.name) ===")
+    println("\n=== $(family.name) [$(algorithm)] ===")
     print_header()
     results = []
     for n in sizes
         rng = MersenneTwister(hash((seed, name, n)))
         bundle = family.generate(rng, n)
-        r = measure(bundle; kwargs...)
+        r = measure(bundle; algorithm = algorithm, kwargs...)
         print_row(r)
         if breakdown && r.ours_error === nothing
             print_time_breakdown(r)
@@ -412,14 +449,15 @@ end
 Every family over its own declared range, smallest first so a stall shows up
 before much time has been spent. Pass `sizes` to override every family at once.
 """
-function run_all(; sizes = nothing, seed::Integer = 1, kwargs...)
-    warm_up()
+function run_all(; sizes = nothing, seed::Integer = 1,
+                 algorithm::Symbol = :teaching, kwargs...)
+    warm_up(; algorithm = algorithm)
     results = []
     for family in Flatter.lattice_families()
         # Each family carries the range that suits it; `sizes` overrides them
         # all, which is mostly useful for a quick pass at small dimensions.
-        append!(results, run_family(family.name, sizes; seed = seed, warm = false,
-                                    kwargs...))
+        append!(results, run_family(family.name, sizes; seed = seed,
+                                    algorithm = algorithm, warm = false, kwargs...))
     end
 
     println("\n=== summary ===")
@@ -485,6 +523,31 @@ end
 
 # Running the file directly does the default sweep. Small sizes first: if the
 # driver is going to stall it should do so cheaply.
+
+const HEURISTIC2_STANDARD_FAMILIES =
+    ("random-triangular", "spread", "knapsack", "q-ary")
+
+"""
+    run_heuristic2_standard(; sizes=nothing, seed=1, kwargs...) -> Vector
+
+Run the ordinary benchmark harness through the currently ported heuristic
+dispatcher, but only on families whose input can already enter Phase 2 faithfully.
+
+The supported set is `random-triangular`, `spread`, `knapsack` (after automatic
+reorientation), and `q-ary`.  `scrambled` and `ideal` need `CondUnknown`;
+`relation` is rectangular and also needs the general-input path.  Keeping this
+as a separate entry point prevents an incomplete heuristic dispatcher from
+quietly becoming the meaning of the normal `run_all()` benchmark.
+"""
+function run_heuristic2_standard(; sizes = nothing, seed::Integer = 1, kwargs...)
+    warm_up(; algorithm = :heuristic)
+    results = []
+    for name in HEURISTIC2_STANDARD_FAMILIES
+        append!(results, run_family(name, sizes; seed = seed, algorithm = :heuristic,
+                                    warm = false, kwargs...))
+    end
+    return results
+end
 
 """
     precision_tradeoff(; sizes, seed)

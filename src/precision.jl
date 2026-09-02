@@ -1,44 +1,20 @@
 # precision.jl
 #
-# Conventions and helpers for working at a fixed BigFloat precision.
+# Precision discipline and low-level MPFR helpers.
 #
-# Julia's BigFloat is MPFR, and every BigFloat carries its own precision, but
-# Julia does NOT use MPFR's destination-driven rounding rule.  Measured on
-# 1.12.6:
+# Every BigFloat carries its own MPFR precision, while ordinary Julia BigFloat
+# arithmetic creates results at the current default precision.  A
+# `Matrix{BigFloat}` therefore has a uniform precision only when the code that
+# constructs and updates it maintains that invariant explicitly.
 #
-#   * arithmetic allocates its result at the current GLOBAL DEFAULT precision,
-#     ignoring the operands entirely;
-#   * `setindex!` on a `Matrix{BigFloat}` rebinds the reference without
-#     re-rounding to the destination entry's precision;
-#   * `mul!` therefore widens its output matrix rather than preserving it.
+# Package kernels that allocate or compute BigFloat values establish the working
+# precision with `with_precision`.  Internal in-place MPFR helpers write into an
+# existing destination at that destination's precision.  `uniform_precision` and
+# `assert_precision` are available at boundaries where uniformity is required.
 #
-# Together these mean a `Matrix{BigFloat}` has no single precision as a matter
-# of type or structure -- only as a matter of discipline.  Two entries of the
-# same matrix can differ.
-#
-# THE CONVENTION
-# --------------
-# 1. Public entry points that do BigFloat work take (or derive) a precision and
-#    wrap their ENTIRE body in `setprecision(BigFloat, p) do ... end`.  Wrapping
-#    only the allocations is not enough: it is the arithmetic that reads the
-#    default.
-#
-# 2. Internal routines assume they are already inside such a block and never
-#    wrap.  Nesting is harmless but obscures where precision is decided.
-#
-# 3. A `Matrix{BigFloat}` returned from a block keeps its entries' precision,
-#    because precision travels with the object.  It is safe to store and pass
-#    around.  What is NOT safe is doing further arithmetic on it outside a
-#    matching block -- that silently produces results at the ambient default.
-#    Callers receiving such a matrix across a recursion boundary should convert
-#    it explicitly with `at_precision` rather than assume.
-#
-# 4. Use `assert_precision` at the entry of routines that require uniformity,
-#    mirroring flatter's
-#        assert(R.prec() == r_col.prec() && R.prec() == tau.prec());
-#    which is the same check, made cheap by MPFR's per-object precision.
-#
-# 5. None of this applies to the Float64 kernels.
+# `with_precision` changes Julia's global BigFloat default and is intentionally
+# used only by the serial implementation.  Threaded code will need a task-safe
+# precision policy.
 
 # ---------------------------------------------------------------------------
 # In-place MPFR arithmetic

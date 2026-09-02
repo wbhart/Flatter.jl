@@ -167,13 +167,12 @@ function _h1_reference_child!(B1::AbstractMatrix{T}, B2::AbstractMatrix{T},
     info = nothing
     if n <= 2
         started = _tick()
-        # The C++ dispatcher only selects Lagrange for the 2 x 2 case.  A tall
-        # two-column phase-1 child goes to Schoenhage even when its entries are
-        # small, so force the existing Gram-matrix path for that case.
-        base_threshold = (n == 2 && size(B1, 1) != 2) ? 0 : schoenhage_threshold
-        _reduce_two_columns!(B1, U1, base_threshold)
+        _, _, method = _heuristic_two_column_reduce!(
+            B1, U1, _integer_matrix_precision(B1))
         telemetry === nothing || begin
             telemetry.base_cases += 1
+            method === :lagrange ? (telemetry.lagrange_calls += 1) :
+                                   (telemetry.schoenhage_calls += 1)
             telemetry.time_base += _tock(started)
         end
         profile = _basis_profile(B1, aggressive)
@@ -186,7 +185,8 @@ function _h1_reference_child!(B1::AbstractMatrix{T}, B2::AbstractMatrix{T},
             base_cutoff = base_cutoff, blocksize = blocksize, panelsize = panelsize,
             tiled = true, schedule = :split, validate = validate,
             want_profile = true, _split = child_split::SplitPhase3,
-            telemetry = telemetry, _depth = depth)
+            telemetry = telemetry, _depth = depth,
+            _heuristic_phase = 3)
     else
         throw(ArgumentError("non-phase3 reference child must be handled by Heuristic1 recursion"))
     end

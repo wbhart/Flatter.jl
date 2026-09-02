@@ -1,47 +1,13 @@
 # lattices/large_benchmark.jl
 #
-# The few cases at a dimension where flatter's design decisions start to matter.
+# Dimension-256 regression and optimisation benchmark for the default serial
+# heuristic reducer.  fpLLL and local baseline timings are cached in
+# `reference_times.tsv`, keyed by machine and by a hash of the exact basis.
 #
-#     julia --project src/lattices/large_benchmark.jl
-#
-# WHY THIS EXISTS SEPARATELY
-#
-# The tiled size reduction crosses over against the elementary one at about
-# dimension 128 (see `lattices/size_reduction_probe.jl`). Below that the driver's
-# structure barely matters; above it, it decides everything. The main benchmark
-# runs at 8 to 128 because that is where iteration is quick, so it cannot see any
-# of this.
-#
-# Running everything at 256 would be intolerable as a routine check, so this
-# holds only the cases that could actually move, and it CACHES the timings that
-# will not change:
-#
-#   * fpLLL's time, which depends on the machine and the instance but not on
-#     anything in this package;
-#   * a baseline for our own time, recorded before a change, so a later run has
-#     something to compare against.
-#
-# Both live in `lattices/reference_times.tsv`, keyed by machine and by a hash of
-# the basis itself, so a changed generator invalidates its own entries rather
-# than quietly comparing against something else.  Historical `ours` rows are
-# the teaching reducer; `ours-heuristic` rows are the current default heuristic
-# dispatcher, so both baselines remain available.
-#
-# WHICH FAMILIES ARE HERE, AND WHY NOT THE OTHERS
-#
-# `Heuristic3` tiles the size reduction inside the factorisation, so it can only
-# help where that is a meaningful share of the run. Measured at dimension 96-128:
-#
-#   q-ary              fusedQR 44%, size reduction 30%   -- yes
-#   random-triangular  fusedQR 38%, size reduction 26%   -- yes
-#   relation           fusedQR 39%, size reduction 16%   -- yes
-#   knapsack           fusedQR 36%, size reduction 16%   -- yes
-#   scrambled          fusedQR 24%, size reduction 11%   -- marginal, included
-#   spread             fusedQR 5.5%  -- no, `finalise` is 50% of it
-#   ideal              fusedQR 6-12% -- no, `matmul` and `finalise` are 62%
-#
-# `spread` and `ideal` are excluded deliberately: they are expensive at this
-# dimension and nothing `Heuristic3` does can move them.
+# The selected families exercise the triangular fast path, generic dense
+# CondUnknown route, known-condition Heuristic1 route, Heuristic2/Heuristic3,
+# and exact-transform-heavy structured lattices.  The shorter `CHEAP_CASES`
+# subset is suitable for quick performance checks.
 
 using Flatter
 using Printf
@@ -55,6 +21,8 @@ const REFERENCE_FILE = joinpath(@__DIR__, "reference_times.tsv")
 const LARGE_CASES = [
     (family = "random-triangular", size = 256),
     (family = "scrambled",         size = 256),
+    (family = "spread",            size = 256),
+    (family = "ideal",             size = 256),
     (family = "knapsack",          size = 255),
     (family = "h1-known-cond",     size = 256),
     (family = "q-ary",             size = 128),
@@ -62,9 +30,8 @@ const LARGE_CASES = [
 ]
 
 """
-The subset that finishes in seconds rather than minutes: about 17s and 14s
-against 96, 506 and 1054 for the others. Used by [`run_cheap`](@ref) for
-iterating without paying for the full set each time.
+The short subset used for quick performance checks without running the
+multi-minute structured cases.
 """
 const CHEAP_CASES = [
     (family = "random-triangular", size = 256),
@@ -78,43 +45,6 @@ const CHEAP_CASES = [
 # deliberately selects Heuristic1 instead of CondUnknown.
 const HEURISTIC1_CASES = [
     (family = "h1-known-cond", size = 128),
-]
-
-# Historical subset used while only H2/H3 were available.  CondUnknown now
-# allows the heuristic dispatcher to handle dense and rectangular large cases too.
-const HEURISTIC2_LARGE_CASES = [
-    (family = "random-triangular", size = 256),
-    (family = "knapsack",          size = 255),
-    (family = "q-ary",             size = 128),
-]
-
-"""
-`relation` at a dimension small enough to sweep but large enough to be
-representative — the full case at 256 takes about 1050 seconds, this one a
-couple of minutes.
-
-It is the family where the trailing update is large (19.7% at dimension 256
-against 2.9% for random-triangular), so it is the one where panelling could
-plausibly pay.
-"""
-const RELATION_PROBE = [(family = "relation", size = 128)]
-
-"""
-Modest sizes for comparing the tiled representation update against the
-monolithic one.
-
-The tiled route is a different computation and may be far slower before it is
-tuned, so the comparison should be at a size where a tenfold loss still finishes
-in reasonable time. `CHEAP_CASES` at dimension 256 is not that: a run taking
-twenty minutes is indistinguishable from a hang.
-
-Dimension 128 rather than 64: at 64 every configuration finished in under a
-tenth of a second, which is below the noise floor and says nothing about which
-is faster.
-"""
-const TILED_PROBE = [
-    (family = "random-triangular", size = 128),
-    (family = "knapsack",          size = 127),
 ]
 
 """
@@ -382,7 +312,7 @@ function run_large(; cases = LARGE_CASES, algorithm::Symbol = :heuristic,
         tag = basis_tag(bundle.basis)
 
         # Ours, always: this is the number the run exists to produce.  Preserve
-        # the old keyword signature for ordinary cases; adding `log_cond = 0`
+        # ordinary cases omit `log_cond`; the known-condition probe supplies it.
         # everywhere would create a new Julia keyword specialisation and revive
         # the first-run JIT problem this benchmark explicitly avoids.
         GC.gc()
@@ -527,13 +457,12 @@ function print_heuristic3_split(t, total)
                 t.h3_time_basis_mul, 100 * t.h3_time_basis_mul / t.h3_time_basis,
                 t.h3_time_basis_write, 100 * t.h3_time_basis_write / t.h3_time_basis)
     end
-    @printf("           SR pairs %d: reuseQR %d  refactor %d  triangular %d\n",
-            t.h3_sr_pairs, t.h3_sr_reuse_qr, t.h3_sr_refactor, t.h3_sr_triangular)
+    @printf("           SR pairs %d: reuseQR %d  triangular %d\n",
+            t.h3_sr_pairs, t.h3_sr_reuse_qr, t.h3_sr_triangular)
     if t.h3_time_sr > 0
-        @printf("           SR: materialise %.2f (%.0f%%)  prec %.2f (%.0f%%)  WY %.2f (%.0f%%)\n",
+        @printf("           SR: materialise %.2f (%.0f%%)  factor %.2f (%.0f%%)\n",
                 t.h3_time_sr_materialise, 100 * t.h3_time_sr_materialise / t.h3_time_sr,
-                t.h3_time_sr_precision, 100 * t.h3_time_sr_precision / t.h3_time_sr,
-                t.h3_time_sr_factorprep, 100 * t.h3_time_sr_factorprep / t.h3_time_sr)
+                t.h3_time_sr_factor_setup, 100 * t.h3_time_sr_factor_setup / t.h3_time_sr)
         @printf("               reduce %.2f (%.0f%%): orth %.2f  triangular %.2f\n",
                 t.h3_time_sr_reduce, 100 * t.h3_time_sr_reduce / t.h3_time_sr,
                 t.h3_time_sr_orthogonal, t.h3_time_sr_triangular)
@@ -590,10 +519,6 @@ function print_cond_unknown_split(t, total)
     @printf("           extract %.2f  surrogate-SR %.2f  relative %.2f  apply %.2f  sort %.2f\n",
             t.cond_time_extract, t.cond_time_size_reduce, t.cond_time_relative,
             t.cond_time_apply, t.cond_time_sort)
-    if t.cond_time_h2 > 0
-        @printf("           phase-2 child wall %.2fs (overlaps H2; diagnostic only)\n",
-                t.cond_time_h2)
-    end
     return nothing
 end
 
@@ -612,10 +537,6 @@ function print_large_telemetry(t, total; algorithm::Symbol = :heuristic)
         label = h1_local > 0 ? "entry+H1+H2-local" :
                 cond_local > 0 ? "entry+H2+Cond-local" : "entry+H2-local"
         print_fused_split(t, total; extra_accounted = extra, extra_label = label)
-        if t.time_recursion > 0
-            @printf("        recursive-call wall %.2fs (overlapping parent views; diagnostic only)\n",
-                    t.time_recursion)
-        end
     else
         print_irregular_entry_split(t, total)
         print_fused_split(t, total; extra_accounted = entry_local,
@@ -653,210 +574,6 @@ function print_heuristic2_split(t, total)
             t.h2_time_compress, t.h2_time_apply)
     return nothing
 end
-
-"""
-    schedule_compare(; cases, seed, budget)
-
-All four combinations of schedule and representation update, on one instance
-each, writing nothing to disk.
-
-The two settings are not independent, which is why they belong on the same line
-rather than in two separate comparisons:
-
-  * `:legacy` is the hand-rolled middle/left/right cycle, which yields ONE
-    window per iteration. The tiled update then sees one reduced tile with a gap
-    either side — barely any structure to exploit.
-  * `:split` is flatter's phase 3 tree, which yields TWO windows on odd
-    iterations, covering the matrix with no gap between them. That is the shape
-    `Heuristic3` was written around, and until now nothing has measured it.
-
-Quality is reported alongside, because the tiled update assembles `R` locally
-and reaches a different representative: a faster route to a longer vector is not
-an improvement.
-"""
-function schedule_compare(; cases = TILED_PROBE, seed::Integer = 1,
-                          budget::Real = 300.0)
-    families = Dict(f.name => f for f in Flatter.lattice_families())
-
-    # Warm up EVERY keyword combination that will be timed. Julia specialises
-    # per combination, so a warm-up with different keywords compiles a different
-    # method and leaves the measured one cold. That is not a small effect here:
-    # it made a dimension-64 run read 0.79s where the compiled figure is 0.06s,
-    # and produced two reported "speedups" that were entirely compilation.
-    warm = Flatter.random_triangular_lattice(MersenneTwister(7), 24).basis
-    for schedule in (:legacy, :split), tiled in (false, true)
-        Flatter.reduce_basis(warm; algorithm = :teaching, schedule = schedule, tiled = tiled,
-                             want_profile = false)
-    end
-
-    @printf("%-18s %5s %9s %9s %11s %11s\n",
-            "family", "dim", "schedule", "update", "time(s)", "log2|b1|")
-    println(repeat("-", 70))
-
-    for case in cases
-        family = get(families, case.family, nothing)
-        family === nothing && continue
-        bundle = family.generate(MersenneTwister(hash((seed, case.family, case.size))),
-                                 case.size)
-        columns = Base.size(bundle.basis, 2)
-        best = Inf
-
-        for schedule in (:legacy, :split), tiled in (false, true)
-            print(stderr, "    [", case.family, " dim ", columns, "] ",
-                  schedule, "/", tiled ? "tiled" : "plain", " ...\n")
-            flush(stderr)
-            # Best of three. At these sizes a single timing varies by more than
-            # the differences being measured -- one earlier run showed a 3.98x
-            # ratio where a repeat gave 2.28x, with nothing changed between
-            # them, because the reference half happened to be slow.
-            # A configuration can fail rather than merely be slow: the tiled
-            # update assembles `R` locally, so the profile it yields can
-            # under-state the spread and the precision derived from it is then
-            # too low for a sub-problem. That is a result about the
-            # configuration, so it is reported and the sweep continues.
-            elapsed = Inf
-            best_telemetry = nothing
-            local reduced
-            failure = nothing
-            for _ in 1:3
-                GC.gc()
-                telemetry = Flatter.ReductionTelemetry()
-                try
-                    attempt = @elapsed reduced, _, _ = Flatter.reduce_basis(
-                        bundle.basis; algorithm = :teaching, schedule = schedule, tiled = tiled,
-                        telemetry = telemetry, want_profile = false)
-                    if attempt < elapsed
-                        elapsed = attempt
-                        best_telemetry = telemetry
-                    end
-                catch problem
-                    failure = problem
-                    break
-                end
-            end
-
-            if failure !== nothing
-                @printf("%-18s %5d %9s %9s %11s %11s\n",
-                        case.family, columns, schedule,
-                        tiled ? "tiled" : "plain", "FAILED", "-")
-                println("        ", first(sprint(showerror, failure), 100))
-                continue
-            end
-
-            shortest = shortest_norm_log2(reduced)
-            best = min(best, elapsed)
-
-            @printf("%-18s %5d %9s %9s %11.2f %11.2f\n",
-                    case.family, columns, schedule, tiled ? "tiled" : "plain",
-                    elapsed, shortest)
-            if best_telemetry !== nothing
-                if tiled
-                    print_heuristic3_split(best_telemetry, elapsed)
-                else
-                    print_fused_split(best_telemetry, elapsed)
-                end
-            end
-            elapsed > budget && break
-        end
-        println()
-    end
-
-    println("All four are the same lattice; only the route and the")
-    println("representative differ. Compare within a family, not across runs.")
-end
-
-
-"""
-    heuristic2_compare(; cases = CHEAP_CASES, seed = 1, repeats = 3)
-
-Compare the retained teaching reducer with the default heuristic dispatcher on
-triangular/reoriented inputs, writing nothing to disk.
-
-This is the short two-family probe retained for iteration.  For the complete
-large comparison now that CondUnknown is available, use
-[`compare_large_algorithms`](@ref).
-"""
-function heuristic2_compare(; cases = CHEAP_CASES, seed::Integer = 1,
-                            repeats::Integer = 3)
-    repeats >= 1 || throw(ArgumentError("repeats must be positive"))
-    families = Dict(f.name => f for f in Flatter.lattice_families())
-
-    # Julia specialises the two algorithm keywords independently.  Cross the
-    # recursive cutoff for both before timing either one.
-    warm = Flatter.random_triangular_lattice(MersenneTwister(7), 48).basis
-    Flatter.reduce_basis(warm; algorithm = :teaching, want_profile = false)
-    Flatter.reduce_basis(warm; algorithm = :heuristic)
-
-    @printf("%-18s %5s %11s %11s %9s %11s %11s\n",
-            "family", "dim", "teaching(s)", "heuristic(s)", "speedup",
-            "plain b1", "heur b1")
-    println(repeat("-", 92))
-
-    for case in cases
-        family = get(families, case.family, nothing)
-        family === nothing && continue
-        bundle = family.generate(MersenneTwister(hash((seed, case.family, case.size))),
-                                 case.size)
-
-        teaching_time = Inf
-        heuristic_time = Inf
-        teaching_reduced = nothing
-        heuristic_reduced = nothing
-        heuristic_info = nothing
-        heuristic_telemetry = nothing
-
-        for algorithm in (:teaching, :heuristic)
-            for _ in 1:Int(repeats)
-                GC.gc()
-                telemetry = Flatter.ReductionTelemetry()
-                local reduced, info
-                elapsed = @elapsed reduced, _, info = Flatter.reduce_basis(
-                    bundle.basis; algorithm = algorithm,
-                    telemetry = telemetry, want_profile = false)
-                if algorithm === :teaching
-                    if elapsed < teaching_time
-                        teaching_time = elapsed
-                        teaching_reduced = reduced
-                    end
-                elseif elapsed < heuristic_time
-                    heuristic_time = elapsed
-                    heuristic_reduced = reduced
-                    heuristic_info = info
-                    heuristic_telemetry = telemetry
-                end
-            end
-        end
-
-        plain_b1 = shortest_norm_log2(teaching_reduced)
-        heur_b1 = shortest_norm_log2(heuristic_reduced)
-        speedup = teaching_time / heuristic_time
-        # Heuristic2 follows flatter and may legitimately stop at iteration
-        # zero when the requested RHF/profile goal is already met.  The
-        # teaching reducer does not check its legacy goal at entry and can
-        # therefore over-reduce the same input.  A longer b1 than the teaching
-        # result is informative, but is not a quality failure if the requested
-        # flatter goal was met.
-        quality = if heur_b1 <= plain_b1 + 1e-9
-            ""
-        elseif heuristic_info !== nothing && heuristic_info.goal_met
-            " GOAL MET"
-        else
-            " QUALITY WORSE"
-        end
-
-        @printf("%-18s %5d %11.2f %11.2f %8.2fx %11.2f %11.2f%s\n",
-                case.family, Base.size(bundle.basis, 2), teaching_time,
-                heuristic_time, speedup, plain_b1, heur_b1, quality)
-        if heuristic_telemetry !== nothing
-            print_large_telemetry(heuristic_telemetry, heuristic_time;
-                                  algorithm = :heuristic)
-        end
-    end
-
-    println("\nNo reference rows are read or written.  A speedup above 1 favours the")
-    println("Heuristic2 -> Heuristic3 dispatcher; quality must remain comparable.")
-end
-
 
 """
     compare_large_algorithms(; cases = LARGE_CASES, repeats = 1,

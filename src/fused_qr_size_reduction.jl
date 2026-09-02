@@ -1,35 +1,24 @@
 # fused_qr_size_reduction.jl
 #
-# Simultaneous QR factorization and size reduction of an integer basis.
+# Simultaneous QR factorisation and size reduction of an integer basis.
 #
 # Given an integer basis B (m x n, columns are basis vectors), compute a
-# unimodular U (n x n) and a floating point R such that B*U is size reduced and
-# R is the R factor of B*U.
+# unimodular U and a floating R such that B*U is size reduced and R is the R
+# factor of B*U.  Reduction and factorisation are interleaved column by column:
+# reducing column j before constructing its Householder reflector prevents the R
+# factor of a badly unreduced basis from becoming the numerical representation.
 #
-# The two operations have to be fused. The R factor of an UNREDUCED basis is
-# catastrophically ill conditioned -- that is exactly what makes the basis
-# unreduced -- so factoring first and reducing afterwards loses the information
-# the reduction needs. Reducing column i against its predecessors BEFORE
-# generating its own Householder reflector keeps R well scaled as it is built.
+# This implements flatter's MPFR `FusedQRSizeRedImpl::Columnwise` backend.  The
+# serial heuristic pipeline allocates its R matrix as MPFR and therefore selects
+# this backend.  `ColumnwiseDouble` is selected upstream only for a hardware-
+# double R matrix, while LazyRefine/Iterated/SeysenRefine are not selected by the
+# serial heuristic dispatcher; those backends are outside this implementation.
 #
-# This is a port of flatter's `FusedQRSizeRedImpl::Columnwise`
-# (problems/fused_qr_sizered/columnwise.cpp). flatter's other implementations in
-# that directory are not ported here:
-#
-#   * `ColumnwiseDouble` is the same algorithm on hardware doubles, with
-#     machinery to carry a global power-of-two exponent shift so that R does not
-#     overflow. BigFloat's exponent range makes that unnecessary, and this
-#     implementation throws rather than silently producing Inf if a float type
-#     too narrow for the input is requested.
-#   * `LazyRefine` handles bases with already-reduced prefixes and needs a
-#     driver that produces them.
-#   * `Iterated` and `SeysenRefine` are unreachable from flatter's dispatcher.
-#
-# The output is in the same packed compact-WY-compatible layout as
-# `householder` and `householder_block`: the upper trapezoid of R is the R
-# factor, and below the diagonal column j holds the tail of the Householder
-# vector v_j whose leading entry is an implicit one. Use `triu` for R alone, and
-# `compact_wy_from_reflectors` to obtain the T factor that `apply_Qt!` wants.
+# Reflectors are returned in packed form: the upper trapezoid contains R and the
+# subdiagonal part of column j contains the tail of Householder vector v_j, whose
+# leading entry is implicit.  The corresponding scalar factors are returned in
+# tau.  `compact_wy_from_reflectors` constructs T on demand for callers that need
+# a compact-WY representation.
 
 const FUSED_QR_DEADBAND = 0.51
 const FUSED_QR_MAX_PASSES = 64
@@ -324,8 +313,7 @@ end
 #
 # A reflector is generated one column at a time and then pushed through every
 # column to its right, one at a time. That trailing update is a rank-1 operation
-# per column pair, and at dimension 256 it is 19.7% of the relation family's
-# runtime and 6.4% of knapsack's.
+# per column pair.
 #
 # Blocking it means deferring: within a panel of `panelsize` columns, a
 # reflector is applied only to the columns still inside the panel, since those
@@ -345,12 +333,11 @@ end
 # so unlike this they will not produce identical results.
 
 """
-Scratch for the panel flush, allocated ONCE per factorisation.
+Scratch for panel flushing, allocated once per factorisation.
 
-The first version allocated a compact-WY factor, a `k` by `n` work matrix and a
-Strassen workspace on every flush — at every level, every iteration. That cost
-more than the entire trailing update it was replacing, which is why panelling
-first measured slower than doing nothing.
+The compact-WY factor, rectangular work matrix and multiplication workspace are
+reused by every panel flush so the optional panelled path does not allocate those
+objects in its inner loop.
 """
 struct _FusedPanelWorkspace{S<:AbstractFloat}
     compact_T::Matrix{S}

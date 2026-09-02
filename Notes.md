@@ -1,244 +1,223 @@
-# Notes
-
-Things to watch out for. Each entry is a reminder, not an explanation — the
-reasoning is in the code comments and docstrings.
-
----
-
-## Design choices in this package
-
-* **`smsv.jl` defaults to blocked Householder QR.** `profile(...; blocked=true)` reaches for the recursive implementation to get n^omega with omega < 3 via Strassen. Only the diagonal of R is used for the profile, so the extra machinery buys complexity at the cost of a larger trusted surface. `blocked=false` is the conservative fallback if the profile ever looks wrong.
-
-* **The tiled size reduction beats the elementary one from dimension 128, and the mechanism is NOT Strassen.** Measured: 1.11x at dim 32, 1.10x at 64, 2.30x at 128, 1.99x at 256. `blocksize = 16` wins at every dimension and larger blocks are monotonically worse — which rules Strassen out, since 16 is exactly the BigInt cutoff so those tile products fall straight through to the base multiplication. What the tiling buys is cache locality and allocation behaviour. (An earlier note here guessed the opposite, that the block size was too small to reach Strassen. It was wrong.) The option of packing a tile into one huge integer for a single GMP multiply — Kronecker substitution — is also not the answer: it turns `n^3` multiplies of `b` bits into `n^2` multiplies of `nb` bits, worse by roughly `n^0.58` since GMP's multiplication is superlinear. Multi-modular multiplication is the technique that applies.
-
-* **Both the legacy window schedule and the phase-3 `SublatticeSplit` feeder are available.** `schedule = :legacy` keeps the earlier hard-coded cycle for comparison. `schedule = :split` carries the phase-3 split tree through recursion, including its even-iteration stopping points and the recursive left/right reset on advance; this is the feeder `Heuristic3` expects. This is still not a full flatter port: the phase-1/phase-2 dispatcher is outside the current teaching implementation.
-
-* **`fused_qr_size_reduction.jl` ports only flatter's `Columnwise`.** `ColumnwiseDouble` (same algorithm on doubles, plus a global power-of-two exponent shift to stop R overflowing) is not ported — BigFloat's exponent range makes the shifting unnecessary, and the `Float64` path here throws rather than silently producing `Inf`. `LazyRefine` needs a driver supplying prereduced prefixes; `Iterated` and `SeysenRefine` are unreachable from flatter's own dispatcher.
-
-* **The two-column base case splits between Lagrange and Schoenhage at `schoenhage_threshold` (512 bits).** Both give a Gauss-reduced basis, so the crossover is a pure cost trade: Lagrange is quadratic in the bit size, Schoenhage quasi-linear, but Schoenhage pays for forming the Gram matrix and entering its recursion. flatter splits the same way at `prec < 1400`. Neither involves a precision policy.
-
-* **`schoenhage` takes a Gram matrix, not a basis.** It returns `R == transpose(U) * G * U`; the driver forms `G = Bᵀ B` exactly and applies the returned `U` to the columns. Its reduction condition is exactly Gauss-reduced, i.e. what Lagrange produces — which is what makes the two cross-checkable.
-
----
-
-## Divergences from flatter
-
-* **Shift rounding.** flatter uses floor (`mpz_div_2exp`) in the compression path but truncation (`mpz_tdiv_q_2exp`) in `relative_size_reduction/triangular.cpp`. We use floor (`>>`) everywhere. Differs by one on negative entries, so no bit-for-bit agreement with the C++; harmless, since the shift is discarding low bits anyway. Compare invariants, not matrices.
-
-* **No `mpfr_mul_z` in Julia.** flatter rounds `float * exact integer` once; `::BigFloat * ::BigInt` promotes first and rounds twice. Only lossy when the multiplier exceeds the working precision, i.e. mostly on the first refinement pass. Absorbed by the refinement loop — symptom would be more passes than the C++ needs, not a wrong answer. `ccall` to `mpfr_mul_z` if it ever matters.
-
-* **flatter's `OrthogonalDouble` refinement loop is dead.** `max_mu_size` is never assigned, so the `while(true)` runs exactly once. We implement the real refinement (as in the MPFR kernel), since 53 bits needs it more, not less. Don't differential-test against the C++ double kernel.
-
-* **The fused stagnation guard diverges from flatter.** flatter compares multiplier *magnitudes* against an absolute slack of `prec/2`, which is dimensionally odd: for large multipliers the slack vanishes and for small ones `mu_max - prec/2` goes negative so it always fires. We compare exponents instead, matching `relative_size_reduction.jl`.
-
-* **The fused three-tier reduction test compares in `S`, not `double`.** flatter converts both operands out of MPFR and compares the quotient in `double` to save a division. Differs only for entries within a double's rounding error of the threshold, where either answer is fine.
-
-* **Fused QR returns `tau`, not compact-WY `T`.** Reflectors are generated one at a time, so `T` does not exist naturally. The generic `apply_Qt!`/compact-WY paths can build it with `compact_wy_from_reflectors`; Heuristic3 instead consumes the cached `R,tau` directly, matching flatter's MPFR orthogonal kernel. flatter zeroes `tau[n-1]` at the end (its `Columnwise` discards Q anyway); we keep it, so the returned factorisation is genuine and `Q'B = R` is testable.
-
-* **Fused QR returns R packed, subdiagonal not cleared.** Matches `householder_block`'s convention. flatter clears it because its `Columnwise` asserts `tau` empty. Use `triu(R)` if you want R alone.
-
-* **The stagnation exit is ours; flatter has it commented out.** `Proved3::is_reduced` contains `if (iterations % 3 == 0 && !lattice_changed) { //return true; }` — written but disabled, with nothing else consuming `lattice_changed`. Without it the loop grinds indefinitely at a goal it cannot quite reach. We enable it: if a full cycle of windows leaves the true-scale profile unmoved, stop. `info.stopped` reports `:goal`, `:stagnated`, `:cap` or `:base_case`.
-
-* **flatter's reduction loop has no iteration cap** (`for(iterations=0;;iterations++)`) — it relies on the goal being reachable. We add `max_iterations`. Hitting it is not an error; the basis is still valid, just less reduced, and `info.goal_met` reports which happened.
-
-* **`goal_from_drop`'s proved branch drops the flag, but the branch is unreachable.** It calls `from_slope(n, slope)` instead of `from_slope(n, slope, proved)`, so it would return a *heuristic* goal — except all three call sites in flatter use the two-argument form. Reproduced verbatim anyway.
-
-* **`params.proved` and `goal.proved` are independent flags.** The first (from `FLATTER_PROVED`) picks the *implementation*; the second picks the *acceptance test*. `params.cpp` always builds the initial goal with the two-argument `from_RHF`, so it is heuristic regardless; the only genuinely proved goal in flatter is constructed at `proved_1.cpp:100`. So reaching `Proved2`/`Proved3` without passing through `Proved1` gives proved implementations checked against a heuristic goal. Worth verifying before porting `Proved1/2/3`; irrelevant to the heuristic path.
-
----
-
-## Julia numeric hazards
-
-* **BigFloat arithmetic uses the global default precision, not the operands'.** Measured on 1.12.6: `arith=default`, `setindex=rebind`, `mul!=widened`. So a `Matrix{BigFloat}` has no precision as a matter of type — only of discipline.
-
-* **Use `with_precision(f, bits)`, not `setprecision(BigFloat, bits) do ... end`.** The block form installs a `ScopedValue`, and every subsequent `BigFloat` allocation then resolves the precision through a `PersistentDict` lookup — ruinous in code that allocates temporaries in inner loops. `with_precision` sets the default directly and restores it in a `finally`. It is **not task-safe**; revisit every call site if this package ever threads. A bare `setprecision` with no restoration remains wrong — it leaks the precision to the caller.
-
-* **Wrapping a precision block around the caller hides the bug; the callee must wrap itself.** Every `heuristic3.jl` test passed while the driver failed, because the tests wrapped the call in `setprecision` and the driver did not. `compact_wy_from_reflectors` allocates its `T` at the DEFAULT precision, so it disagreed with an `R` built at the working precision and `assert_precision` refused it. Any function that allocates BigFloats and is called from unwrapped code has to establish its own scope — and at least one test must call it without a surrounding block, or the whole class of fault is invisible.
-
-* **Wrap whole computations, not just allocations.** `Matrix{BigFloat}(undef, ...)` pins nothing; it is the arithmetic that reads the default. Applies to `householder_block`, `apply_Qt!` and every BigFloat kernel — none of them establish their own scope.
-
-* **`precision(A[1,1])` does not describe the matrix.** Entries can differ after a stray write. Use `uniform_precision` / `assert_precision`.
-
-* **Widening costs speed, not accuracy.** Extra bits are noise on an already-correct value. But MPFR cost scales with precision, and the "precision exhausted" guard is calibrated against the precision you think you're at.
-
-* **Convert BigFloat matrices explicitly across recursion boundaries** with `at_precision`. Returning one from a scoped block is safe; doing further arithmetic on it outside a matching block is not.
-
-* **`Float64(::BigInt)` overflows to `Inf` on lattice-sized entries.** Use `float64_matrix`, which pulls out a common power-of-two scale. Common, not per-column — per-column would distort the ratios the multipliers depend on.
-
-* **In-place MPFR/MPZ mutate the OBJECT, not the matrix slot.** Only safe on values the callee owns. `R` inside the fused factorisation qualifies, because it is filled entry by entry with `_to_float`. Two tests guard this: "the caller's matrices are never mutated in place" and "copy of a BigFloat matrix is shallow".
-
-* **`Matrix{BigInt}(undef, n, n)` holds undefined REFERENCES, not zeros.** `BigInt` and `BigFloat` are mutable, so an `undef` matrix of them has genuinely unassigned slots and any generic iteration over it throws `UndefRefError`. A matrix can legitimately sit in that state mid-computation — the driver's output transform `U` is only filled at the end. Guard with `isassigned` when walking a matrix that might not be fully populated.
-
-* **Duplicating a `BigFloat` is harder than it looks, and there are two traps.** `copy` and `Matrix{T}(A)` are SHALLOW — they duplicate the array of references, so every entry is still the same object. And `BigFloat(x)` on a `BigFloat` returns **x itself** when the precision already matches, so the obvious `[BigFloat(x) for x in A]` is also a no-op. The reliable form is `_mpfr_set!(BigFloat(), x)`: allocate, then write. `fill!(v, zero(S))` is worse still — one shared object in every slot. Both traps are pinned by the "duplicating a BigFloat matrix" testset; between them they produced failures that looked numerical but were one code path reading another's output.
-
-* **`at_precision` allocates and writes rather than constructing.** Its whole purpose is an independent copy, and `BigFloat(x; precision = p)` short-circuits to `x` when `p` already matches. Same reasoning applies anywhere else that needs a genuine duplicate.
-
-* **The in-place kernels accumulate with `mpfr_fma`**, which rounds once where the generic path rounds twice, so the two are **not bit-identical** — the in-place path is slightly more accurate. Tests compare with a tolerance.
-
----
-
-## Algorithm facts that look like bugs
-
-* **`Profile::get_drop` is not first-minus-last.** It is the spread *less the sum of clean upward gaps* — places where every entry to the right sits strictly above every entry to the left. Those gaps are exactly what block compression removes, so they don't count as un-reducedness. `get_spread` is the plain `max - min`. They coincide on a decreasing profile, which is why a first-minus-last stand-in passes most tests. Invariant: `0 <= drop <= spread`.
-
-* **The heuristic `goal_check` has three conditions and all three do work.** Total drop, half-mean separation, and middle-span drop. A profile flat in both halves with a step between them at 95% of the budget is rejected despite its total drop fitting, and the middle-span condition alone rejects profiles the other two accept. Don't simplify it to the drop condition — that's the *proved* goal's test, and it would let the recursion settle for a basis still improvable across the half boundary.
-
-* **`with_best_slope` preserves the budget, it does not move it.** A heuristic goal's target slope splits as `best_slope + gap`; changing the base slope re-attributes the same total and leaves `goal_max_drop` exactly unchanged. Its precondition is `slope < target slope`.
-
-* **`goal_from_rhf` clamps below `2^(BKZ_BEST_SLOPE/2) ≈ 1.0109`.** Asking for a better root Hermite factor than BKZ achieves silently gives the clamp.
-
-* **`goal_slope` returns different kinds of thing for the two goal families.** Proved: an actual slope. Heuristic: the raw `quality` scalar, which is *not* a slope. For the slope a heuristic goal really targets, use `goal_max_drop(g) / g.n`.
-
-* **Heuristic `goal_max_drop(g) / n` recovers the input slope exactly.** The `shape` function cancels between `from_slope` and `max_drop`, so `quality` is a pure scale factor with no dimensional meaning of its own. `_goal_shape(1) == 0`, so dimension-one goals are guarded.
-
-* **Heuristic3 must reuse the QR it just computed.** An earlier safety check compared `relative_size_reduction_precision(B1)` (an absolute-magnitude policy for the generic kernel) with Heuristic3's working precision (chosen from the post-child profile spread), and therefore refactorised almost every reduced tile. That was unlike flatter and slow. The apparent need for it was masking a cache bug: `householder_block` returns compact-WY `T` as its second result, and linear indexing of that matrix had been stored as if it were `tau`, making almost every cached coefficient zero. Heuristic3 now stores real `tau` and passes cached `R,tau` directly to the direct-reflector kernel. Standalone `relative_size_reduction!` still chooses its own precision when it has to build a factorisation itself.
-
-* **Relative size reduction's precision requirement is set by the block magnitude ratio, not just conditioning.** Coordinates are known only to `max|B2| * 2^-p`, so reducing to the deadband needs `p > log2(max|B2| / min|R_jj|)` with margin. The `max|B2|` is the magnitude *after* reduction — only the component of `B2` in `B1`'s span can shrink, so a large orthogonal component sets a floor that no number of refinement passes can lower. Under-provisioning isn't an error: the convergence guard stops, `U` stays exact and unimodular, and only reduction quality suffers.
-
-* **The second convergence guard is load-bearing.** `max_mu >= prev_max` (precision exhausted) is what stops a badly conditioned input at 53 bits looping forever. It is not redundant with the unit-magnitude test.
-
-* **Size reduction bounds entries against the DIAGONAL they are reduced against, not against `max|B|`.** So `max|B|` need not fall, and can drift up by a few parts per billion as other rows' updates propagate. A basis whose off-diagonal entries are already small relative to the diagonal is already size-reduced, and a test that expects the maximum to shrink there is testing nothing. To exercise a reduction, the off-diagonal entries must exceed the diagonal of the block they are reduced against.
-
-* **Size-reduction bound isn't 1/2 on the orthogonal kernels.** flatter uses a 0.51 deadband and terminates on a unit-magnitude test, so expect ~0.51 plus float error. Only `Triangular` achieves a strict 1/2. The exactly testable invariant on every path is `B2_new == B2_old + B1*U` over `BigInt`.
-
-* **Relative size reduction never reduces `B2`'s columns against each other.** When checking against `smsv_gso([B1 B2])`, assert only on `mu[j, n1+c]` for `j <= n1`.
-
-* **`blocked` size reduction is not a reordering of the elementary one.** `diag_above` multiplies the *original* tile by `U(j,j)`, where the elementary sweep would use the already-reduced columns. Different valid reduced representative — agrees with `:zz` on only ~2/3 of inputs. Test the contract, not equality.
-
-* **`U` from fused QR is unimodular but not triangular.** Columns are processed left to right, but each is reduced against *all* its predecessors. Test `abs(det(U)) == 1` (Bareiss), not the triangular structure.
-
-* **`reduce_basis` accepts any full-rank integer basis; `lattice_reduce` requires upper triangular.** Prefer the former unless the input is known triangular. It detects all four corner orientations and flips into place — reversing columns reorders basis vectors, reversing rows permutes coordinates, so neither changes the lattice. `info.path` reports `:triangular`, `:reoriented` or `:dense`.
-
-* **flatter's double-precision paths are switched off, deliberately.** `Heuristic3::set_precision` guards the swap with `if (prec <= 53 && R.type() == MPFR && false)` — the `&& false` is in the source. `OrthogonalDouble`'s dead refinement loop is consistent with that: nobody leaves a never-executing loop in a path that runs. So `ColumnwiseDouble`, `OrthogonalDouble` and `ElementaryLL` exist but are unreachable.
-
-* **Why a 53-bit driver is not straightforward, and what would make it possible.** The obstacle is not the implementation — `fused_qr_size_reduction` already takes `float_type = Float64` — it is the precision policy. `lll_precision` is `2*spread + 30 + 2n`, so 53 bits would require the post-compression profile spread to be near zero, and compression bounds the spread without making it tiny. What could work is iterative refinement: recompute the coordinates from the EXACT integer basis each pass, so low precision plus an exact residual converges. Both the fused QR's re-orthogonalisation and the relative size reduction's refinement loop already have this shape, so the experiment is not unreasonable — the open question is whether 53 bits converges for the spreads that actually arise, and how many extra passes it costs. flatter did not find out: its double paths are disabled with `&& false`.
-
-* **A wider fixed-precision type only fits the dense path, and only for medium entries.** The driver runs at roughly `4n` bits (the compressed spread is about `n`), which passes 106 bits at around dimension 26 — below `base_cutoff`, so a double-double can never serve the fused QR. The dense path is different: `householder_precision` is about `34.5 + entry_bits`, so entries of 19-71 bits fall between `Float64` and a double-double. `float_tiers` is the seam; pass `(Float64, Double64, BigFloat)` with DoubleFloats loaded. Nothing in the package depends on it.
-
-* **`aggressive` precision is free but small: measured 1.0-1.3x, with quality identical on all 33 benchmark instances.** `log2|b1|` matched to the last digit everywhere, so the concern that `spread + 30` would undershoot did not materialise — even though ball arithmetic puts the certifying threshold well above it. Certification is a worst-case statement about radii; the refinement loop and the 0.51 deadband absorb imprecision that a rigorous bound cannot ignore, which is what those heuristics are for. Left off by default anyway: the gain is small, it is not certifiable, and it is only tested to dimension 128. flatter likewise makes it an opt-in environment variable.
-
-* **Precision is not the performance lever at these widths.** Cutting the working precision by roughly threefold bought only 1.0-1.3x, because at 120-420 bits (two to seven limbs) MPFR's cost is dominated by per-operation overhead — allocation, call, indirection — rather than by limb arithmetic. Fewer bits does not mean less overhead. The lever is fewer operations: panel-blocking the fused QR, or cheaper integer products.
-
-* **`aggressive` is already a second precision policy, and it may undershoot.** `lll_precision` gives `2*spread + 30 + 2n` by default and `spread + 30` under `aggressive` — 606 against 286 bits at dimension 32 with spread 256, where ball arithmetic put the certifying threshold near 406. So the default has headroom AND the aggressive setting may be too little; the useful policy is probably between them. `precision_tradeoff()` in the benchmark compares both on identical instances, reporting `log2|b1|` and the stopping reason alongside the time, because a precision that is too low shows up as a longer vector or a run that starts stagnating, not as an error.
-
-* **The Arb probe says the precision policy is over-provisioned, and cutting it turned out not to matter much.** At `2*spread + 30 + 2n` every quotient certifies with 200-500 bits of margin. But the measured benefit of actually reducing it was 1.0-1.3x — see the entries above on why. `headroom()` in `lattices/arb_probe.jl` bisects for the certifying minimum if the question comes up again.
-
-* **Our only hardware-precision path is the dense-path QR.** Everything else is BigFloat and BigInt, and in the driver a Float64 path is unreachable by construction: `lll_precision` is `2*spread + 30 + 2n`, above 53 bits for any n over about 12, and `base_cutoff` keeps the driver from seeing smaller. The dense path differs because `householder_precision` bottoms out at exactly 53, which is what a small-entry basis gets — so that factorisation runs in `Float64` via LAPACK's `geqrf!` — the same Householder algorithm as this package's generic version, but with BLAS-3 panel updates, and it leaves R in the upper trapezoid, which is the only part `to_integer_lattice` reads. Falls back to BigFloat when 53 bits will not resolve the profile.
-
-* **The memory instrumentation is not free and is off by default.** `held_bytes` walks every entry of four matrices and inspects each value's allocation — O(n^2) big-integer inspections per iteration, at every level. It was written for a one-off investigation and then left running in every benchmark, where it was untimed and so showed up only as "unaccounted". Set `telemetry.measure_memory = true` when the question is memory; `lattices/memory_scaling.jl` does.
-
-* **Reporting `info.profile` costs a factorisation, and it is charged to us in comparisons.** The reduced basis is no longer triangular, so a profile means a full arbitrary-precision QR. fplll computes nothing of the kind, so a benchmark that reports our time against theirs is comparing a reduction-plus-factorisation with a bare reduction. `want_profile = false` skips it; the benchmark prints its share when it exceeds 1% of a run. Internally nothing needs it: the driver tracks its own profile from the R diagonal, and the dense path's round test reads the approximation's diagonal, which is triangular and therefore free.
-
-* **The base-case profile was computed and thrown away.** `lattice_reduce!` returned `info.profile` from every base case, which costs a full arbitrary-precision factorisation — and every recursive call discards the info it is handed. q-ary at dimension 96 makes 507 base-case calls, so that was 507 wasted factorisations. Now computed only at `_depth == 0`; recursive base cases return an empty profile. A large share of the "unaccounted" time in the benchmark was this.
-
-* **The dense path's QR dominates it, so precision policy matters there.** Measured on ideal lattices: the factorisation is 41-49% of the whole run, against 3.6-6.8% for the fused QR inside the driver. Use `householder_precision`, not `lll_precision` — the latter's `2n` term describes the compressed basis inside the driver and is meaningless for factorising a raw one, asking 302 bits where 53 suffice at dimension 128 with 8-bit entries. The starting estimate is optimistic for an ill-conditioned basis, so `_dense_approximation` doubles until the factor is usable, which is `CondUnknown`'s discovery loop in miniature.
-
-* **CondUnknown is now ported for the heuristic dense path.** flatter deliberately sends non-triangular phase-1 input with `log_cond = 0` to `CondUnknown` rather than inventing the pessimistic bound `O(n log|B|)`. The port follows its 53-bit starting precision, orthogonal-component column selection with the `2*spread + 40` acceptance rule, exact-norm sorting after a failed refinement, precision growth, triangular surrogate size reduction, relative reduction of the unresolved block, and the Phase-2/LatRedRelSR handoff. The transforms are additionally accumulated through the outer loop so the Julia public contract `B_out == B_in * U` remains exact, including for rank-deficient input; dependent combinations finish as exact zero columns on the right. The older QR-and-round dense route remains available as `algorithm = :teaching` and still requires full column rank, which is useful as an independent baseline.
-
-* **After flipping, the transform needs its ROWS reversed, not its columns.** Reducing `Q B P` to `Q B P U'` means the transform for the original basis is `P U'`. flatter does the same via `flip_mat(U, flip_cols, false)`, which is easy to misread as a column flip.
-
-* **Input to the driver is upper triangular; output is a general basis.** `B_out = B_in * U` has a meaningless diagonal that may contain zeros — reading it as a profile gives `-Inf`. The profile is in `info.profile`, from the R factor. flatter is the same. Re-triangularise before feeding a result back in.
-
-* **Compression acts on the R factor, never on the basis product.** `B_next = B * U_window` is *not* triangular, so it must be re-factored by the fused QR first, and the resulting R is what gets compressed. Compressing `B_next` directly produces a singular basis within a couple of iterations.
-
-* **Compression only fires on profiles that jump *upward*.** The gap test needs the right block higher than the left, which never happens on a descending profile — so on a normal lattice profile the shifts are all zero and only the uniform truncation applies.
-
-* **Compression cannot vanish a diagonal entry**, given the precision policy: the smallest column retains about `spread + 30 + 2n` bits. If a diagonal ever does hit zero, suspect the precision policy, not the shifts.
-
-* **`collect_U` pairing is off-by-one by design.** The compression stack holds one more entry than the transform stack. The last compression is discarded, then transform *k* pairs with compression *k−1*. Getting this wrong throws inside `conjugate_transform`'s block-structure check rather than silently corrupting the result.
-
-* **`compression_shifts`' truncation depends linearly on the precision argument.** Call with `precision = 0` to recover the constant: `truncation = offset - lll_precision(spread, n)`.
-
-* **Compare profiles at true scale, not compressed.** Compression shifts the profile every iteration; the stagnation test uses `profile .+ offsets`.
-
-* **The exact invariants hold unconditionally.** `B_out == B_in * U` and `|det U| == 1` are true regardless of working precision, of whether the goal was met, and of the iteration cap. When something looks wrong, check these first: if they hold, it's a precision or goal problem, not an algorithmic one.
-
----
-
-## Performance
-
-* **The Strassen cutoff depends on element type.** `BigInt` wants 16, everything else 32. For floats the leaf is BLAS and recursing far is a loss; for `BigInt` the leaf is a scalar loop and the entries dominate. If you preallocate a workspace, size it with `strassen_workspace_length(T, n)` — the type-free method uses the generic cutoff and would under-size the buffer for `BigInt`.
-
-* **Never materialise the embedded window transform.** It is the identity outside one `w x w` block, so a general product costs `O(n^3)` to compute something touching `O(n*w^2)` entries. `_apply_window_right`/`_apply_window_left` do the block product and copy the rest.
-
-* **Measure before optimising here.** Three separate predictions about the bottleneck were wrong: the fused QR was expected to dominate and was the smallest phase; the finalise phase was invisible until instrumented; the final size reduction was expected to dominate and was negligible. The real costs turned out to be Julia-level overheads — scoped-precision lookups and GMP allocation — not the algorithm.
-
-* **Benchmark timings vary by up to 2x** with GC on BigInt work. `lattices/benchmark.jl` repeats cheap runs and keeps the fastest; the Strassen sweep in `lattices/profile_lift.jl` collects before each sample and prints the noise floor. Treat any single-run difference smaller than that floor as meaningless.
-
-* **Memory is the binding constraint at large dimension, and it is live data, not collection lag.** `--heap-size-hint` made no difference at dim 260, and measured live bytes grow steeply with dimension — the collector cannot free what is reachable. The driver still asks for `GC.gc(false)` per iteration at `gc_dimension` (200) since arbitrary-precision limbs are malloc'd and freed by finalizers, but expect little from it. `telemetry.peak_live` and the benchmark's memory line are how to tell the two apart.
-
-* **`Sys.maxrss` deltas are misleading across repeated runs.** It is a high-water mark for the whole process, so a later, larger run can report a delta of zero simply because an earlier one already raised the mark. Use `gc_live_bytes` for comparisons.
-
-* **O(log k) partial products is not O(log k) bytes.** Entry widths add across a product, so a partial product of 2^j factors is ~2^j times as wide as one factor; summing over the balanced stack gives Theta(k) bits — the same order as keeping every factor. The balanced tree buys multiplication speed, not memory.
-
-* **`low_memory` (bounded accumulation) is off by default but does raise the ceiling.** It folds every factor into one running product rather than keeping O(log k) partial products. An early measurement suggested it was much worse, but that used the contaminated absolute live-bytes counter and should not be trusted. What is observed: with it enabled the reducer clears dimensions it otherwise cannot. Re-measure before drawing conclusions either way.
-
-* **The peak is in the finalise phase, not the loop.** The transform stack's partial products are at their widest when they are finally combined, so that is where a run dies — symptom: memory is comfortable throughout and the process is killed near the end. `_drain_transform` folds by popping, releasing each factor as it is consumed; a product tree would hold an entire level while building the next, roughly doubling the live set at exactly the wrong moment. The balanced tree is still used while the stack is being BUILT, where factors are narrow and the pairings keep multiplications cheap.
-
-* **Finalizable objects survive one collection.** `BigInt` and `BigFloat` both carry finalizers; the first GC pass queues the finalizer, the second releases the limbs. So a single `GC.gc()` leaves them counted as live, and an incremental `GC.gc(false)` cannot reclaim them at all. Measure retained memory after **two** full passes, and use `gc_full` if periodic collection is to have any chance of helping.
-
-* **Memory steps with recursion depth, it does not grow smoothly.** Each extra level adds another level's working state to the live set, so the curve jumps whenever depth increases (q-ary: depth 2 at dim 128, depth 3 at dim 160, levels 559 -> 6865). Fitting a growth exponent across a depth transition badly overstates the trend. Fit within a depth, and expect any projection past the next transition to be low.
-
-* **Measure memory as `Sys.maxrss` in a fresh process. Nothing else here is trustworthy.** `gc_live_bytes` is absolute (so earlier runs in the same session inflate it) AND over-reports for this workload: Julia's malloc'd-byte counter drifts upward under heavy GMP/MPFR reallocation, to the point where it exceeded the process's actual resident size. `Sys.maxrss` is a process-wide high-water mark, so within one session a later run can report zero growth because an earlier one already raised it. `lattices/memory_scaling.jl` spawns one process per measurement for exactly these reasons.
-
-* **Measured resident memory, q-ary family, isolated processes** (includes ~250 MB of Julia runtime): dim 64 → 512 MB, dim 96 → 1126 MB, dim 128 → 1590 MB, dim 160 → 3648 MB. Roughly `dim^3.7` across the last pair, but that pair straddles a depth increase, so treat it as an upper bound on the trend.
-
-* **The memory measures are gated by dimension, and the gates matter more than the measures.** Collection is worth threefold in memory and costs a little time, so it only pays where memory is actually a constraint: excess with no collection is 44 MB at dim 64, 580 at 96, 1141 at 128, 3092 at 160. Defaults: collect every 2 iterations above dimension 128, switch to bounded accumulation above 256. Below those, reduction runs unencumbered. Setting the gates too low costs speed at small dimensions for no benefit, and shows up as run-to-run variance.
-
-* **`malloc_trim` measured no saving at all**, so `trim_memory` defaults off. The call is retained for the case where a different allocator behaves differently.
-
-* **`malloc_trim` does nothing here.** Measured saving across dim 64-160: 0%. Whatever holds the memory is not free pages the C allocator can return.
-
-* **On WSL, the memory ceiling is not the machine's.** WSL2 defaults to half of Windows RAM and does not readily return freed pages, so an OOM there can be a VM limit rather than an algorithmic one. `.wslconfig` sets it.
-
-* **Families declare their own size ranges.** They do not cost the same at a given dimension — q-ary is by far the most expensive, relation and ideal cheap enough to run much further. `run_family(name)` uses the declared range; passing `sizes` overrides.
-
-* **Two families have a known answer, which is a sharper test than "how short".** `relation` recovers the minimal polynomial of `radicand^(1/degree)`, so `found_planted` says whether reduction found the true relation, not merely something short — this is the integer-relation application of LLL. `knapsack` likewise plants a subset-sum solution. `ideal` is the ideal `(g)` in `Z[x]/(f)`, whose short vectors are small elements of the ideal — ideal-SVP, and the same computation as looking for small generators in class group work.
-
-* **The benchmark generators are shape approximations, not standard instances.** The q-ary modulus in particular defaults to `2^(2n)+1`, making `log2 det` quadratic in dimension — chosen to stress compression, not to match any published convention. Fine for tracking this package against itself and against fplll on identical input; not comparable with the literature. Use fplll's `latticegen` or the Darmstadt challenges for that.
-
-* **Which cost dominates depends on the family and on the representation update.** Integer products in `matmul`, transform folding and final application can dominate some families, while QR/size reduction dominates others. Multi-modular integer multiplication remains the lever for the former. For the latter, the useful alternative is the Heuristic3 tiled representation update with direct Householder QR/SR; compact-WY panelling of the monolithic BigFloat QR did not pay in the measured regime.
-
-* **Dimension-256 baseline, AMD Ryzen 7 5800H, after stage 1 (blocked size reduction).** Ours against fpLLL in seconds: random-triangular 8.1/0.87, scrambled 87.3/82.5, knapsack 14.4/3.11, q-ary 424.8/12092.5, relation 981.2/960.4. Against the pre-blocking baseline that is 1.24x, 1.19x, 0.96x, 1.20x and 1.08x, and `size-red` roughly halved on every family. q-ary is 28.5x faster than fpLLL.
-
-  | family | fusedQR | (size-red, reorth, trailing) | finalise | gc | fold-in | matmul |
-  |---|---|---|---|---|---|---|
-  | random-triangular | 28.9% | 15.9, 2.4, 2.9 | 30.9% | 5.6% | 16.1% | 5.0% |
-  | scrambled | 25.3% | 9.2, 6.4, 8.4 | 17.0% | 14.1% | 19.7% | 9.0% |
-  | knapsack | 15.0% | 4.6, 3.7, 5.9 | 28.8% | 21.9% | 22.7% | 6.6% |
-  | q-ary | 31.4% | 12.1, 8.2, 9.7 | 9.1% | 19.8% | 21.0% | 6.1% |
-  | relation | 41.7% | 3.9, 16.2, 21.2 | 37.6% | 2.9% | 2.6% | 1.2% |
-
-  `lattices/reference_times.tsv` holds these and fpLLL's timings, keyed by a hash of the basis. The `tiled` path is NOT what this measures: it is off by default.
-
-* **Global transform products remain a separate lever from Heuristic3.** `fold-in`, final application and other exact matrix products are not removed by changing the representation update, even though Heuristic3 itself also performs structured integer tile products. Multi-modular multiplication is therefore still relevant after Heuristic3 reaches parity. `gc` can also be a material share on BigInt-heavy families and should be re-swept independently.
-
-* **At dimension 256 on q-ary we are 22x faster than fpLLL** — 536s against 12,092s — while `scrambled` and `relation` sit at parity and `random-triangular` and `knapsack` remain behind. That is the flatter result: the recursion is worth its overhead once the dimension is large enough, and the families where it wins are the ones with a profile worth compressing.
-
-* **Whether panel blocking helps depends on the family, at dimension 256.** relation's fused QR is 41.9% of which trailing is 19.7% and re-orthogonalisation 15.7% — 35% addressable — against size reduction at 6.0%. random-triangular is the exact inverse: 30.4% size reduction against 2.4% trailing. So blocking would nearly halve relation's factorisation and do almost nothing for random-triangular.
-
-* **Warm-up must cross the same dispatch boundaries as the benchmark.** Julia specialises aggressively, so a warm-up that stays below `base_cutoff` does not compile recursion, fused representation updates, transform folding or finalisation. Special keyword combinations such as `tiled = true` should likewise be warmed before interpreting a one-shot timing. Best-of-several remains useful for cheap cases because GC noise is large.
-
-* **The standard benchmark warm-up must include recursion.** With `base_cutoff = 32`, warming only dimensions 24 and 16 left the first recursive case, dimension 48, completely cold. Its first timing was 2.27s versus 4.32ms for fpLLL (a spurious 526x), carried about 47% unaccounted compilation time and exceeded `repeat_under`, so no clean repeat was taken. `warm_up()` now exercises a dimension-48 triangular reduction as well as the base and dense paths before measurements begin.
-
-* **The phase mix shifts with dimension, so a verdict taken at one size need not hold at another.** relation's fused QR at dim 97 is size-reduction-dominated (15.9% against 12.6% trailing); at dim 256 it inverts (6.9% against 19.9% trailing, plus 15.0% re-orthogonalisation). random-triangular goes the other way — 18.7% size reduction against 1.3% trailing at 256. So "panel blocking is not worth doing", concluded from dim 96-128 figures, is wrong for relation at 256 and right for random-triangular. Measure at the size you care about.
-
-* **Heuristic3 reaches its crossover by dimension 256 in this Julia port once it is fed and implemented like flatter.** On the knapsack probe, `split/plain` and `split/tiled` measured 3.76s and 3.73s with identical quality; the six Heuristic3 updates cost 0.84s in total, slightly less than the roughly 0.90s fused-update work they replace. Random-triangular measured 1.58s/1.65s but was already at the goal at the root, so it performed no Heuristic3 update and is not a useful kernel timing. At dimension 128 the tiled route is still slower. Characterise the crossover rather than assuming Heuristic3 only helps at dimensions beyond the machine's reach.
-
-* **Do not generalise the win from blocked exact arithmetic to BigFloat Householder work.** Blocking the exact size reduction still pays because it batches `B`/`U` updates and removes BigInt allocation pressure. In contrast, compact-WY BigFloat QR/SR was a major loss at the Heuristic3 tile sizes: switching orthogonal SR to direct saved reflectors cut that kernel substantially, and switching tile QR to direct Householder cut the knapsack/split QR component from about 1.20s to 0.05s. `Matrix{BigFloat}` does not get the ordinary BLAS cache/SIMD payoff that motivates compact-WY. Multi-modular multiplication remains a separate possibility for exact BigInt products, not a reason to block MPFR/BigFloat QR.
-
-* **Blocking the size reduction pays; panelling the trailing update does not.** `blocksize` defers the `B` and `U` updates to one batch per block of predecessors — exact, since only `R` is read during the sweep — and cut random-triangular from 10.11s to 7.86s at dimension 256, with `size-red` falling from 30.4% to 12.0%. `panelsize` defers a reflector's trailing update until its panel is flushed as one compact-WY block; measured at dimension 256 it is SLOWER at every panel width tried, and the factorisation's share of the run rises. A flush allocates a compact-WY factor, a `k` by `n` work matrix and a Strassen workspace per panel, per level, per iteration, while the trailing update it replaces is 2.9% of random-triangular and 6.5% of knapsack. Left in, defaulting to off; the relation family spends 19.7% in the trailing update and has not been measured.
-
-* **Panel blocking the monolithic fused QR was not worthwhile in the measured cases.** Splitting that factorisation shows the trailing rank-1 update is only a modest share on most families, and compact-WY BigFloat panelling adds its own overhead. This result says nothing against Heuristic3: the earlier note that gave Heuristic3 the same ceiling was wrong, because Heuristic3 changes the tile decomposition, relative reductions and phase-3 schedule rather than merely batching the monolithic trailing update.
-
-* **The dominant cost is the reduction itself, which is a good place to be.** `size reduction` computes quotients and applies them to `B`, `U` and `R` — the actual work, not factorisation overhead. Its integer half allocates one `BigInt` per element because `B` and `U` may share entry objects with a copy the caller holds, so slots must be rebound rather than mutated. Letting the caller assert ownership would remove that allocation; that is the remaining lever here, and it is a small one.
-
-* **For MPFR/BigFloat Heuristic3, direct Householder is the right baseline.** flatter's MPFR QR dispatcher uses its direct `HouseholderMPFR` implementation; the blocked QR branch is disabled. The Julia measurements agree: after replacing compact-WY tile QR with the allocation-controlled direct reflector primitives, the knapsack/split QR share fell from about 1.20s to 0.05s. Keep Strassen/multi-modular work aimed at exact integer matrix products unless a future BigFloat matrix-multiplication backend changes this tradeoff.
-
-* **Deferred threading target: orthogonal relative size reduction is column-parallel.** Upstream flatter parallelises the target columns in its MPFR orthogonal relative-size-reduction kernel with an OpenMP `taskloop`; the Julia port is deliberately serial for now. The corresponding loop is `for column in 1:n2` inside `_relative_orthogonal_reflectors!` in `relative_size_reduction.jl`. For a fixed reference block, `B1`, the saved Householder `factors` and `tau` are read-only, while target column `j` writes only `B2[:, j]`, `U[:, j]` and, when requested, `R2[:, j]`. Thus those columns can be distributed independently across Julia threads. Each worker must have its own floating workspace `r` and its own `previous`/`passes` state; do not share the current single `r` vector. Keep the reflector precision fixed before entering the threaded region rather than changing BigFloat precision inside workers. This one change would accelerate both H2's `LatRedRelSR` path and H3's orthogonal SR path, because both call `_relative_orthogonal_reflectors!`. Do **not** parallelise H3's bottom-up row-tile loop: reducing against a lower diagonal tile changes what the higher tile sees, so that ordering is a real dependency. A future implementation should retain the serial path for one-thread runs and probably use a size threshold before spawning tasks, since small `n2` blocks will not amortise scheduling/workspace overhead.
-
-* **The flatter-style heuristic dispatcher is now the public default.** After CondUnknown, Heuristic2 and Heuristic3 passed the full test suite and the standard benchmark, `reduce_basis(B)` now means `algorithm = :heuristic`. The older QR-and-round / recursive teaching reducer is intentionally retained as `algorithm = :teaching` for exposition, independent cross-checking and historical baselines. Teaching-only controls such as `schedule`, `tiled`, `low_memory` and `max_rounds` should therefore be paired explicitly with `algorithm = :teaching` in experiments.
-
-* **Serial dimension-256 heuristic baseline before threading.** On the AMD Ryzen 7 5800H reference machine, teaching/heuristic seconds were: random-triangular 8.95/3.29 (2.72x heuristic win), scrambled 80.32/70.64 (1.14x), knapsack 5.87/13.12 (0.45x), q-ary 377.92/386.80 (0.98x), relation 896.67/329.55 (2.72x). Quality remained comparable; knapsack deliberately over-reduced (log2 shortest norm 5.14 versus teaching 8.91 and fplll 5.31). These `ours-heuristic` rows are the pre-threading reference baseline. Orthogonal relative SR dominates the difficult heuristic cases, reinforcing the deferred threading target above.
-
-* **Irregular-entry time is accounted separately.** A triangular input can be size-reduced and then accepted immediately by H2, so the recursive telemetry may report zero H2/H3 work even though wall time is nonzero. `ReductionTelemetry` therefore times orientation detection, the exact triangular size-reduction pre-pass, composition of `U_sr * U_h2`, and orientation flips. These are disjoint from H2/CondUnknown/generic-driver timers and are included in benchmark accounting. In particular, the full transform composition is kept visible because it can be expensive when H2 returns the identity and is a plausible later optimisation target.
+# Implementation notes
+
+This file records properties of the current implementation that are useful when
+reading, testing, or optimising it.  Algorithm history belongs in version
+control, not here.
+
+## Serial heuristic dispatcher
+
+`reduce_basis(B)` defaults to `algorithm = :heuristic`.  Its dispatch mirrors
+flatter's serial heuristic pipeline:
+
+* one or two columns are handled before phase dispatch; a square `2 x 2` basis
+  below 1400 bits uses Lagrange and other two-column bases use Schoenhage;
+* phase 0 is `Irregular`, which recognises the four triangular orientations and
+  otherwise sends dense input to phase 1;
+* phase 1 uses `CondUnknown` when the condition number is unknown and
+  `Heuristic1` when a positive `log_cond` is supplied;
+* phase 2 is `Heuristic2`;
+* phase 3 is `Heuristic3`;
+* in phases 2 and 3, fpLLL is used only when the dimension is at most 32 and the
+  represented integer precision is at most 128 bits.  `base_cutoff` remains an
+  experimental/test override of the dimension 32 cutoff; its default is 32.
+
+`Threaded3` is deliberately absent.  The implementation described here is the
+serial heuristic algorithm.
+
+`algorithm = :teaching` is independent.  It retains the QR-and-round dense
+route and the generic recursive driver because those are useful for exposition,
+cross-checking, and controlled experiments.  Teaching-only controls such as
+`schedule`, `tiled`, `low_memory`, and `schoenhage_threshold` should not be
+interpreted as flatter heuristic-policy knobs.
+
+## Heuristic phases
+
+### Irregular and CondUnknown
+
+`Irregular` tests the four corner orientations of a square triangular basis.
+The oriented triangular basis is exactly size reduced before entering phase 2.
+A genuinely dense heuristic input enters `CondUnknown`, which starts at low
+MPFR precision, identifies a resolvable independent prefix, reduces it through
+phase 2, applies the transform to the exact basis, and raises precision until
+all remaining dependencies are represented by exact zero columns.  Rank-
+deficient dense input is therefore supported.
+
+### Heuristic1
+
+Heuristic1 is the known-condition phase-1 route.  Its simulated representation
+is rectangular and carries the auxiliary right-hand block `B2` together with
+`U2`.  The exact auxiliary invariant is
+
+    B2_out == B2_in + B_in * U2.
+
+The phase-1 split performs left, right, and whole-window updates; the whole
+window is handed to phase 3.  A newly constructed phase-1 profile contains NaNs,
+matching flatter's `Profile(n)` state; the first representation update produces
+the usable profile.
+
+### Heuristic2
+
+Heuristic2 carries a compressed upper-triangular phase-2 representation and the
+same `B2/U2` auxiliary relation where required.  Its split schedule is left,
+right, then whole.  Partial children remain in phase 2 and the whole-window
+child is handed to phase 3.
+
+### Heuristic3
+
+Heuristic3 updates the representation tile by tile.  Sublattice transforms are
+embedded block-diagonally, the corresponding integer basis blocks are updated,
+diagonal tiles are QR-factorised, and off-diagonal tiles are relatively size
+reduced from the bottom upwards.  The phase-3 split tree shares child nodes in
+the same way as flatter; the shared iteration state is intentional.
+
+The serial MPFR path uses direct Householder reflectors and reuses the saved
+`R/tau` factorisation during orthogonal relative size reduction.  Compact-WY
+blocked QR remains implemented in `householder.jl` as an experimental building
+block but is not the default Heuristic3 factorisation path.
+
+## Fused QR and size reduction
+
+`fused_qr_size_reduction.jl` implements flatter's MPFR `Columnwise` algorithm:
+size reduction of a column is interleaved with generation of its Householder
+reflector so that the working R factor never represents the unreduced basis for
+longer than necessary.
+
+`ColumnwiseDouble` is intentionally not implemented.  Flatter selects it only
+when the supplied R matrix has hardware-double element type.  The serial
+heuristic recursion allocates R as MPFR (starting at 53 bits) and changes its
+precision rather than its element type, so the heuristic pipeline selects
+`Columnwise`, not `ColumnwiseDouble`.
+
+`LazyRefine`, `Iterated`, and `SeysenRefine` are also not implemented because the
+serial heuristic dispatcher does not select them.  They are not prerequisites
+for fidelity of the heuristic pipeline.
+
+The fused implementation returns the Householder `tau` vector rather than
+building compact-WY `T` eagerly.  `compact_wy_from_reflectors` is available for
+callers that need `T`; Heuristic3 consumes the saved reflectors directly.
+
+## Deliberate numerical differences from C++ flatter
+
+These differences are intentional; differential tests should compare exact
+lattice invariants and reduction properties rather than require bit-for-bit
+identical intermediate matrices.
+
+* Compression shifts use Julia's arithmetic right shift for negative integers.
+  This is floor division by a power of two.  Some flatter relative-size-
+  reduction code uses GMP truncating division instead; the discarded low bits
+  can therefore differ by one for negative values.
+* Julia has no direct high-level `mpfr_mul_z`.  Multiplying a `BigFloat` by a
+  `BigInt` can involve promotion of the integer before multiplication.  The
+  refinement loops are designed to tolerate the resulting extra rounding.
+* The Float64 orthogonal relative-size-reduction path performs an actual
+  refinement loop.  The corresponding upstream double implementation has a
+  non-updated bound that makes its loop execute once.
+* The fused stagnation guard compares exponent sizes, consistent with the
+  relative-size-reduction code, instead of applying an absolute precision slack
+  to multiplier magnitudes.
+* The fused three-tier size-reduction test performs its boundary comparison in
+  the working floating type rather than converting MPFR operands to `double`.
+* The recursive teaching driver has a stagnation exit and an iteration cap.
+  These are safety controls for that independent reducer and do not change the
+  exact lattice invariant.
+
+## Julia arbitrary-precision discipline
+
+`Matrix{BigFloat}` has no matrix-wide precision encoded in its type.  Arithmetic
+uses Julia's current default BigFloat precision, so kernels that allocate or
+compute with BigFloat values must establish the intended precision explicitly.
+
+Use `with_precision(f, bits)` for package kernels.  It changes the default
+precision directly and restores it in `finally`; unlike the scoped
+`setprecision(BigFloat, bits) do ... end` form, it avoids the `ScopedValue`
+lookup in allocation-heavy inner loops.  It is not task-safe, which is one of
+the issues that must be revisited before adding threading.
+
+`uniform_precision` and `assert_precision` should be used when a matrix is
+expected to have one precision.  Reading `precision(A[1, 1])` alone is not a
+sufficient check because BigFloat entries can have different precisions.
+
+`Float64(::BigInt)` can overflow on lattice-sized values.  Use
+`float64_matrix`, which extracts a common power-of-two scale without changing
+column ratios.
+
+`BigInt` and `BigFloat` entries are mutable objects.  In-place GMP/MPFR helpers
+may mutate shared objects, so they are used only where the callee owns the
+entries.  Ordinary matrix copies of arbitrary-precision values must not be
+assumed to make deep copies of the entry objects.
+
+## Exact arithmetic and multiplication
+
+The exact size-reduction implementation batches predecessor updates.  The
+current default block size improves cache/allocation behaviour even when the
+tiles are too small to reach Strassen.  The result is exact and independent of
+the chosen block size.
+
+Global transform products, Heuristic3 tile products, transform folding, and the
+final exact application can consume a substantial part of a reduction.
+Multi-modular integer matrix multiplication is therefore a separate optimisation
+target from the heuristic representation logic.
+
+Blocked QR is intentionally retained even though it is not selected by the
+serial MPFR heuristic path.  It provides a tested Strassen-backed QR building
+block for experiments and may be useful to other reduction pipelines.
+
+## Memory and garbage collection
+
+Large reductions hold many arbitrary-precision matrix entries whose limbs are
+allocated outside Julia's small-object pools.  `ReductionTelemetry` can record
+live/data estimates, and the recursive teaching driver can request periodic
+collections.  Process resident-size measurements should be made in fresh
+processes when comparing memory use because `Sys.maxrss` is a process-wide high
+water mark.
+
+Transform accumulation is drained while finalising so factors can be released
+as they are consumed.  A full product tree at that point can increase the live
+set substantially because a whole level of wide partial products coexists with
+the next level.
+
+## Telemetry
+
+Telemetry is intended to locate optimisation targets, not to trace control-flow
+debugging.  Retained timers partition useful work such as:
+
+* Irregular entry/orientation work;
+* CondUnknown rank discovery and exact applications;
+* Heuristic1 and Heuristic2 representation QR, relative reduction, transform
+  composition, compression, and exact application;
+* Heuristic3 basis products, diagonal QR, orthogonal/triangular relative size
+  reduction, writeback, and propagation;
+* fused QR components, exact matrix products, compression, base cases,
+  transform folding/finalisation, and garbage collection.
+
+Nested child wall timers are intentionally not recorded because they overlap
+with the child algorithms' own timers and make aggregate accounting misleading.
+
+## Benchmarks
+
+`src/lattices/large_benchmark.jl` compares deterministic lattice families with
+cached fpLLL/reference timings.  The default benchmark algorithm is
+`:heuristic`.  `h1-known-cond` uses the dense exact matrix
+
+    B = I + v*v'
+
+with `v_i = +/-1`; its singular values are `1` and `n + 1`, so its condition
+number is known exactly and the case reliably exercises Heuristic1.
+
+Julia JIT warm-up must cross the same dispatch boundaries and use the same
+keyword signature as a measured call.  In particular, the large benchmark warms
+the blocked triangular size-reduction path and passes a telemetry object so
+compilation is not charged to the first timing.
+
+The benchmark telemetry should be used to decide which optimisation is relevant
+for a given family.  Orthogonal relative size reduction and exact integer matrix
+products are independent targets; improving one does not remove the other.
+
+## Not implemented
+
+The following are outside the present serial-heuristic scope:
+
+* `Threaded3` and threaded relative size reduction;
+* flatter's proved reduction pipeline;
+* fused-QR backends not selected by the serial heuristic dispatcher;
+* multi-modular exact matrix multiplication.

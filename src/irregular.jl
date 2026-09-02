@@ -1,43 +1,29 @@
 # irregular.jl
 #
-# Reduction of a basis that is not already square upper triangular.
+# Public entry handling for bases that are not already square upper triangular.
 #
-# `lattice_reduce!` requires square, upper triangular, nonsingular input, which
-# is what the recursion produces internally but not what a caller usually has.
-# This lifts that restriction, following flatter's
-# `LatticeReductionImpl::Irregular` (problems/lattice_reduction/irregular.cpp):
+# The heuristic path follows flatter's `LatticeReductionImpl::Irregular`:
 #
-#   * a basis that is triangular in ANY of the four corner orientations is
-#     flipped into upper triangular form, reduced, and flipped back;
-#   * anything else takes the dense path below.
+#   * two-column inputs are dispatched directly to the heuristic base case;
+#   * a square basis triangular in any corner orientation is flipped to upper
+#     triangular form, exactly size reduced, sent to phase 2, and flipped back;
+#   * a genuinely dense basis enters phase 1.  With an unknown condition number
+#     it is handled by CondUnknown; with a supplied positive `log_cond` it is
+#     handled by Heuristic1.
 #
-# There are now two dense paths.  The default `algorithm=:heuristic` follows flatter: a
-# non-triangular basis enters phase 1 with unknown condition number and is sent
-# to CondUnknown, which discovers a resolvable independent prefix, drives it
-# through phase 2, and increases precision until every remaining dependency is
-# represented by an exact zero column.  Rank-deficient input is therefore
-# supported on the heuristic path.
-#
-# `algorithm=:teaching` keeps the older QR-and-round route because it is useful
-# as an independent baseline and is substantially simpler to study:
-#
-#   1. QR-factor B and round its R factor to an integer triangular lattice;
-#   2. reduce that integer lattice with the recursive driver;
-#   3. apply the resulting unimodular transform to B;
-#   4. repeat on the improved exact basis.
-#
-# The teaching dense path still requires full column rank.
+# `algorithm = :teaching` is an independent QR-and-round reducer retained for
+# exposition and cross-checking.  Its dense route requires full column rank.
 
 const DEFAULT_DENSE_ROUNDS = 4
 
 """
-Fixed-precision float types the dense path will try, cheapest first, before
+Fixed-precision float types the teaching dense path will try, cheapest first, before
 falling back to `BigFloat`.
 
 Only `Float64` is here by default, because it is all the standard library
 offers. A double-double type gives about 106 bits at a small multiple of
 `Float64` cost -- far cheaper than `BigFloat` at the same width -- and slots
-into the gap this path otherwise jumps. Nothing in the package depends on such a
+into the gap the teaching path otherwise jumps. Nothing in the package depends on such a
 type; pass one in instead:
 
     using DoubleFloats
@@ -314,6 +300,8 @@ already.
 
 `info` reports `path`, one of:
 
+  * `:base`        — the heuristic dispatcher selected a one- or two-column
+                     base reducer before phase selection;
   * `:triangular`  — the basis was already upper triangular;
   * `:reoriented`  — it was triangular in another corner orientation and was
                      flipped into place;
@@ -325,7 +313,7 @@ together with `rounds` (dense path only) and the fields
 Keyword arguments beyond those of [`lattice_reduce!`](@ref):
 
   * `algorithm`  -- `:heuristic` (the default, flatter's heuristic phase
-                    dispatcher) or `:teaching` (the older independent reducer).  Triangular/reoriented input
+                    dispatcher) or `:teaching` (the independent explanatory reducer).  Triangular/reoriented input
                     enters Heuristic2 after exact size reduction; dense input
                     enters CondUnknown when no condition bound is supplied, or
                     Heuristic1 when `log_cond > 0`.
@@ -364,6 +352,26 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         "expected at least as many rows as columns, got $m x $n"))
     size(U) == (n, n) || throw(DimensionMismatch("U must be $n x $n, got $(size(U))"))
     (iszero(m) || iszero(n)) && throw(ArgumentError("B must be non-empty"))
+
+    # flatter dispatches one- and two-column problems before phase 0/Irregular.
+    if algorithm === :heuristic && n <= 2
+        started = time_ns()
+        _, _, method = _heuristic_two_column_reduce!(
+            B, U, _integer_matrix_precision(B))
+        if telemetry !== nothing
+            telemetry.base_cases += 1
+            if method === :lagrange
+                telemetry.lagrange_calls += 1
+            else
+                telemetry.schoenhage_calls += 1
+            end
+            telemetry.time_base += (time_ns() - started) / 1e9
+        end
+        profile = want_profile ? _basis_profile(B, aggressive) : Float64[]
+        info = (iterations = 0, goal_met = true, stopped = :base_case,
+                profile = profile)
+        return B, U, (; path = :base, rounds = 0, info...)
+    end
 
     telemetry === nothing || (telemetry.irregular_calls += 1)
     orientation_started = time_ns()

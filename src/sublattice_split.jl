@@ -1,27 +1,18 @@
 # sublattice_split.jl
 #
-# The schedules: which windows get reduced, in what order, at each phase.
+# Tree schedules used by flatter's heuristic phases.
 #
-# This package has so far used `_reduction_window`, a hand-rolled cycle of
-# middle, left and right windows taken from `Proved3`. flatter's real schedules
-# are trees, built once and walked, and they differ from that approximation in a
-# way that matters:
+# A phase-3 node alternates between its middle window and its left/right halves;
+# the left/right iteration yields two windows.  A phase-2 node uses a
+# left/right/whole cycle, with the whole child represented by a phase-3 tree.
 #
-#   * a phase 3 node yields TWO windows on odd iterations, not one. Our version
-#     only ever produced a single window per iteration, which is why the tiled
-#     update had so little structure to work with -- one window means one reduced
-#     tile and two gaps, where flatter routinely has two reduced tiles and none.
-#   * a phase 2 node has its own three-step schedule -- left half, right half,
-#     then the whole -- and hands the whole-window step to a phase 3 tree.
+# Phase-3 trees intentionally share nodes: a middle child is assembled from the
+# inner children of its left and right siblings, so the corresponding iteration
+# state is shared as well.  Julia represents that sharing directly by storing the
+# same mutable nodes rather than copies.
 #
-# The trees SHARE nodes on purpose. A phase 3 node's middle child is built from
-# its left child's right child and its right child's left child, so those nodes
-# are reachable by more than one path and their iteration state is shared. That
-# is deliberate in flatter -- its destructor detaches the middle child's pointers
-# before deleting to avoid a double free -- and it is reproduced here by holding
-# the same objects rather than copies.
-#
-# Indices here are 1-based inclusive ranges; flatter's are 0-based half-open.
+# Indices here are 1-based inclusive ranges; flatter uses 0-based half-open
+# ranges.
 
 """
     SplitPhase3
@@ -87,8 +78,7 @@ end
 
 The windows this node wants reduced at its current iteration.
 
-One window on even iterations, two on odd. Two is the case our previous
-hand-rolled schedule never produced.
+One window is produced on even iterations and two on odd iterations.
 """
 function split_windows(node::SplitPhase3)
     if node.n == 3

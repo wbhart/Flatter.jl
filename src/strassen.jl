@@ -43,8 +43,8 @@ function strassen_workspace_length(::Type{T}, n::Integer;
     return strassen_workspace_length(n; cutoff = cutoff)
 end
 
-# NOTE: the element-type-free form below keeps the generic default. Since
-# `strassen!` now picks its cutoff from the element type, a workspace sized with
+# NOTE: the element-type-free form below keeps the generic default. Because
+# `strassen!` picks its cutoff from the element type, a workspace sized with
 # this method and then handed to `strassen!` on a `BigInt` matrix would be too
 # SMALL -- the lower cutoff recurses deeper and needs more space. Prefer the
 # method above, which takes the type, or pass the same explicit `cutoff` to both.

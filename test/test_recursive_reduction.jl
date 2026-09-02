@@ -609,9 +609,8 @@ end
     @testset "no configuration exhausts the iteration cap on knapsack" begin
         capped = String[]
         for n in (16, 32, 48), sched in (:legacy, :split), t in (false, true)
-            # Keep the most expensive n = 48 split case out of the unit suite,
-            # but do include the tiled path: the old divergence that justified
-            # skipping it has been fixed and this test should guard that result.
+            # Keep the most expensive n = 48 split case out of the unit suite;
+            # smaller cases cover both plain and tiled representation updates.
             sched === :split && n > 32 && continue
 
             bundle = Flatter.knapsack_lattice(MersenneTwister(hash((n, :knap))), n)

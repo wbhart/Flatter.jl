@@ -23,7 +23,7 @@
 
             Flatter.split_advance!(node)
 
-            # Odd: BOTH halves, which the old hand-rolled schedule never did.
+            # Odd: both halves.
             @test Flatter.split_windows(node) == [1:4, 5:8]
             @test Flatter.split_children(node) == [node.left, node.right]
             @test !Flatter.split_stopping_point(node)

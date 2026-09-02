@@ -39,12 +39,18 @@
         @test isapprox(sum(info.profile), Flatter._log2_abs(abs(rr_det(reduced)));
                        atol = 1e-7, rtol = 1e-10)
 
-        @test telemetry.h2_calls == 1
-        @test telemetry.h2_left_steps == 1
-        @test telemetry.h2_right_steps == 1
-        @test telemetry.h2_all_steps == 1
-        @test telemetry.h2_phase3_calls == 1
-        @test telemetry.h2_relative_calls == 1
+        # H2 telemetry is aggregate over the recursive subtree.  A small child
+        # whose compressed representation exceeds the 128-bit fpLLL cutoff
+        # remains in H2 rather than becoming an fpLLL leaf.  The top-level cycle
+        # is already pinned down by `info.iterations == 3`; here we only require
+        # that each phase-2 operation was actually exercised somewhere in that
+        # cycle/subtree.
+        @test telemetry.h2_calls >= 1
+        @test telemetry.h2_left_steps >= 1
+        @test telemetry.h2_right_steps >= 1
+        @test telemetry.h2_all_steps >= 1
+        @test telemetry.h2_phase3_calls >= 1
+        @test telemetry.h2_relative_calls >= 1
     end
 
 
@@ -155,6 +161,32 @@
         @test telemetry.h2_left_steps == 0
         @test telemetry.h2_right_steps == 0
         @test telemetry.h2_all_steps == 0
+    end
+
+    @testset "fpLLL base dispatch includes the 128-bit precision cutoff" begin
+        n = 4
+
+        low = zeros(BigInt, n, n)
+        for i in 1:n
+            low[i, i] = big(1) << 40
+        end
+        low_telemetry = Flatter.ReductionTelemetry()
+        low_reduced, low_U, _ = Flatter.heuristic2_reduce(
+            low; base_cutoff = 4, telemetry = low_telemetry)
+        @test low_reduced == low * low_U
+        @test low_telemetry.fplll_calls == 1
+
+        high = zeros(BigInt, n, n)
+        for i in 1:n
+            high[i, i] = big(1) << 160
+        end
+        high_telemetry = Flatter.ReductionTelemetry()
+        high_reduced, high_U, info = Flatter.heuristic2_reduce(
+            high; base_cutoff = 4, max_iterations = 4, telemetry = high_telemetry)
+        @test high_reduced == high * high_U
+        @test info.goal_met
+        @test high_telemetry.fplll_calls == 0
+        @test high_telemetry.h2_calls >= 1
     end
 
     @testset "argument checking" begin

@@ -380,7 +380,6 @@ function _cond_refine_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
             schoenhage_threshold = schoenhage_threshold, base_cutoff = base_cutoff,
             blocksize = blocksize, panelsize = panelsize,
             validate = validate, telemetry = telemetry, depth = depth + 1)
-        telemetry === nothing || (telemetry.cond_time_h2 += _tock(started))
 
         profile = isempty(info.profile) ?
                   [_log2_abs(B_indep[i, i]) - shift_amount for i in 1:num_valid] :

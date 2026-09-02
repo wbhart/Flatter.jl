@@ -357,7 +357,7 @@ function print_time_breakdown(r)
     # three quite different costs with three quite different remedies.
     if t.time_finalise > 0.25 * total
         # `fold-in` happens in the loop and `combine` in the finalise block, so
-        # only the latter is part of `finalise`; they used to share a counter.
+        # only `combine` belongs to the finalisation total.
         @printf("      finalise = combine %5.1f%%  apply %5.1f%%  final-SR %5.1f%%  (fold-in %5.1f%% in loop)\n",
                 100 * t.time_collect / total, 100 * t.time_apply / total,
                 100 * t.time_final_sr / total, 100 * t.time_push / total)
@@ -367,10 +367,9 @@ function print_time_breakdown(r)
     # lag rather than a genuine memory requirement, and is worth knowing about
     # before concluding that an instance is too big to run.
     if (r.rss_growth > 64 * 1024 * 1024 || r.live_growth > 64 * 1024 * 1024)
-        # Growth figures only. `telemetry.peak_live` is an absolute reading, so
-        # in a shared session it reports whatever earlier runs left live and
-        # says nothing about this one; `lattices/memory_scaling.jl` measures in
-        # a fresh process for that reason.
+        # Growth figures only. `telemetry.peak_live` is an absolute process
+        # reading; `lattices/memory_scaling.jl` uses fresh processes when an
+        # isolated peak measurement is required.
         @printf("    memory: live %+.0f MB   resident %+.0f MB\n",
                 r.live_growth / 1024^2, r.rss_growth / 1024^2)
     end

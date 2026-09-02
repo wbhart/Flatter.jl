@@ -96,6 +96,44 @@ end
     end
 
     @testset "default heuristic dispatcher" begin
+        @testset "one- and two-column policy bypasses Irregular" begin
+            one = reshape(BigInt[17, -4, 9], 3, 1)
+            telemetry = Flatter.ReductionTelemetry()
+            reduced, U, info = Flatter.reduce_basis(one; telemetry = telemetry)
+            @test rr_check_exact(one, reduced, U)
+            @test info.path === :base
+            @test telemetry.lagrange_calls == 1
+            @test telemetry.schoenhage_calls == 0
+            @test telemetry.irregular_calls == 0
+
+            low_square = BigInt[7 3; 2 11]
+            telemetry = Flatter.ReductionTelemetry()
+            reduced, U, info = Flatter.reduce_basis(low_square; telemetry = telemetry)
+            @test rr_check_exact(low_square, reduced, U)
+            @test info.path === :base
+            @test telemetry.lagrange_calls == 1
+            @test telemetry.schoenhage_calls == 0
+            @test telemetry.irregular_calls == 0
+
+            tall = BigInt[7 3; 2 11; 5 -4]
+            telemetry = Flatter.ReductionTelemetry()
+            reduced, U, info = Flatter.reduce_basis(tall; telemetry = telemetry)
+            @test rr_check_exact(tall, reduced, U)
+            @test info.path === :base
+            @test telemetry.lagrange_calls == 0
+            @test telemetry.schoenhage_calls == 1
+            @test telemetry.irregular_calls == 0
+
+            high_square = BigInt[(big(1) << 1400) 1; 0 1]
+            telemetry = Flatter.ReductionTelemetry()
+            reduced, U, info = Flatter.reduce_basis(high_square; telemetry = telemetry)
+            @test rr_check_exact(high_square, reduced, U)
+            @test info.path === :base
+            @test telemetry.lagrange_calls == 0
+            @test telemetry.schoenhage_calls == 1
+            @test telemetry.irregular_calls == 0
+        end
+
         @testset "triangular input enters Heuristic2 when the entry goal fails" begin
             n = 8
             B0 = zeros(BigInt, n, n)

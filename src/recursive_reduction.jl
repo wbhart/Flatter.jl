@@ -1,39 +1,21 @@
 # recursive_reduction.jl
 #
-# The recursive lattice reduction driver.
+# Shared exact/compressed reduction machinery.
 #
-# A port of flatter's `LatticeReductionImpl::RecursiveGeneric`
-# (problems/lattice_reduction/recursive_generic.cpp), which is the skeleton all
-# of flatter's reduction implementations are built on:
+# The recursive driver maintains an exact basis and a compressed triangular
+# representation, reduces sublattice windows recursively, lifts the resulting
+# transforms through the compression scalings, and finally applies the collected
+# transform to the exact basis.
 #
-#     initialise, compress
-#     loop until the goal is met:
-#         pick a sublattice window
-#         reduce that window recursively
-#         apply the result, re-factor, re-compress
-#     collect the accumulated transforms, size reduce once more
+# `lattice_reduce!` is also the independent teaching reducer.  The serial
+# heuristic phases have their own representation updates in heuristic1.jl,
+# heuristic2.jl and heuristic3.jl, but use the base-case, goal, transform and
+# finalisation machinery in this file.
 #
-# The window schedule here is the hardcoded one from `Proved3`
-# (proved_3.cpp) -- middle, left, right, cycling -- rather than the
-# configurable `SublatticeSplit` tree that `Heuristic1/2/3` use. `Proved2` and
-# `Proved3` reference no split object at all, which makes this the shortest
-# route to a working end-to-end reducer. Swapping in the split tree later
-# changes `_reduction_window` and nothing else in this file.
-#
-# What the recursion is for: reducing a lattice basis directly is expensive
-# because the entries are enormous. Each level of this recursion compresses the
-# basis -- discards low-order bits that provably cannot affect the result --
-# reduces the smaller problem, then lifts the transform back. `collect_U`
-# performs the lift, conjugating each level's transform by the scaling that was
-# in force when it was computed.
-#
-# The two-column base case is exact: Lagrange for small entries, Schoenhage for
-# large ones. Neither involves a precision policy.
-#
-# Contract: the input basis must be square, upper triangular, and nonsingular.
-# That is what the recursion produces internally, and what flatter's `Proved2`
-# and `Proved3` require. General input is handled one level up by `Irregular`;
-# its heuristic dense route now uses the port of `CondUnknown`.
+# Two-column heuristic subproblems use flatter's dispatcher policy: Lagrange only
+# for a square 2 x 2 basis below 1400 bits and Schoenhage otherwise.  In phases 2
+# and 3 fpLLL is selected only when the dimension is at most the default cutoff
+# 32 and the represented integer precision is at most 128 bits.
 
 const DEFAULT_REDUCTION_RHF = 1.02
 const DEFAULT_REDUCTION_MAX_ITERATIONS = 120
@@ -47,11 +29,9 @@ const REDUCTION_STAGNATION_TOLERANCE = 1e-6
 # At and above this dimension the reduction loop asks for an incremental
 # collection once per iteration.
 #
-# Collection is worth roughly threefold in memory and costs a little time, so
-# it is only worth paying where the memory matters. Measured excess with no
-# collection at all: 44 MB at dimension 64, 580 MB at 96, 1141 MB at 128,
-# 3092 MB at 160. Below about 128 there is nothing to manage, and collecting
-# anyway is pure cost -- and a source of run-to-run variance.
+# Collection is useful only once arbitrary-precision temporary matrices are
+# large enough for finaliser lag to matter; below the threshold it is pure
+# overhead.
 #
 # `BigInt` and `BigFloat` limbs are malloc'd through Julia's counted allocators
 # and released by finalizers, and the collector's heuristics for malloc'd bytes
@@ -68,11 +48,8 @@ const REDUCTION_GC_DIMENSION = 128
 const REDUCTION_GC_INTERVAL = 2
 
 # Bounded accumulation holds one running product rather than O(log k) partial
-# products. It multiplies less efficiently -- an ever-growing accumulator
-# against a fixed-width factor is the wrong shape for GMP -- so it is not worth
-# paying for until the footprint is the binding constraint. Observed: the
-# default settings reach about dimension 260, and bounded accumulation extends
-# that to about 300.
+# products. It uses less memory but gives GMP a less favourable product shape,
+# so it is reserved for dimensions where footprint is the binding constraint.
 const REDUCTION_LOW_MEMORY_DIMENSION = 256
 
 # ---------------------------------------------------------------------------
@@ -164,19 +141,24 @@ function lagrange_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T}) where {T<:
     return B, U
 end
 
-# Below this many bits in the largest entry, the two-column base case uses
-# Lagrange; at or above it, Schoenhage. Lagrange is quadratic in the bit size
-# and Schoenhage quasi-linear, but Schoenhage carries the overhead of forming
-# the Gram matrix and entering its recursion, so small inputs are faster the
-# direct way. flatter makes the same split at `prec < 1400`.
+# `lattice_reduce!` is retained as an independent teaching reducer. Its
+# configurable two-column crossover is separate from flatter's heuristic
+# dispatcher policy below.
 const DEFAULT_SCHOENHAGE_THRESHOLD = 512
 
-# Dimensions at or below this are handed straight to `fplll_reduce` instead of
-# being recursed on. flatter does the same (n <= 32), and for good reason: the
-# recursion's cost is multiplicative in the depth, since every window reduction
-# at one level spawns a whole reduction loop at the next. Descending all the way
-# to two columns turns a dimension-16 problem into tens of thousands of calls.
+# Exact cutoffs used by flatter's serial heuristic dispatcher.
+const FLATTER_LAGRANGE_PRECISION_CUTOFF = 1400
 const DEFAULT_BASE_CUTOFF = 32
+const FLATTER_FPLLL_PRECISION_CUTOFF = 128
+
+"Maximum binary width of an integer matrix, used as the MPZ precision proxy."
+function _integer_matrix_precision(A::AbstractMatrix{<:Integer})
+    widest = 1
+    for value in A
+        iszero(value) || (widest = max(widest, ndigits(abs(value); base = 2)))
+    end
+    return widest
+end
 
 """
     _reduce_two_columns!(B, U, threshold) -> (B, U)
@@ -222,6 +204,53 @@ function _reduce_two_columns!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
 end
 
 """
+    _heuristic_two_column_reduce!(B, U, precision) -> (B, U, method)
+
+Apply flatter's heuristic two-column dispatch rule. Lagrange is selected only
+for a square `2 x 2` basis with represented integer precision below 1400 bits;
+all other two-column bases use Schoenhage. A one-column basis is unchanged.
+
+The local Schoenhage kernel requires a positive-definite `2 x 2` Gram matrix.
+For a rank-deficient pair, exact Lagrange reduction is used as the degenerate
+fallback; the returned transform and rank-reduced lattice are still exact.
+"""
+function _heuristic_two_column_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T},
+                                       precision::Int = _integer_matrix_precision(B)) where {T<:Integer}
+    m, n = size(B)
+    n <= 2 || throw(DimensionMismatch("two-column dispatch received $n columns"))
+    if n <= 1
+        lagrange_reduce!(B, U)
+        return B, U, :lagrange
+    end
+
+    if m == 2 && precision < FLATTER_LAGRANGE_PRECISION_CUTOFF
+        lagrange_reduce!(B, U)
+        return B, U, :lagrange
+    end
+
+    gram = Matrix{BigInt}(undef, 2, 2)
+    for a in 1:2, b in 1:2
+        gram[a, b] = sum(BigInt(B[i, a]) * BigInt(B[i, b]) for i in 1:m)
+    end
+    det = gram[1, 1] * gram[2, 2] - gram[1, 2] * gram[2, 1]
+    if det <= 0
+        lagrange_reduce!(B, U)
+        return B, U, :schoenhage
+    end
+
+    _, transform = schoenhage(gram)
+    applied = T.(transform)
+    updated = B * applied
+    for j in 1:2, i in 1:m
+        B[i, j] = updated[i, j]
+    end
+    for j in 1:2, i in 1:2
+        U[i, j] = applied[i, j]
+    end
+    return B, U, :schoenhage
+end
+
+"""
     ReductionTelemetry()
 
 Optional counters and timings for [`lattice_reduce!`](@ref), for working out
@@ -231,12 +260,10 @@ Pass one via the `telemetry` keyword; it is mutated in place, accumulating over
 the whole recursion. When no telemetry object is given the driver does nothing
 beyond a null check, so this costs nothing in normal use.
 
-Times are in seconds and count only the phase named, so they do not sum to the
-total: `time_recursion` covers the nested reduction calls and therefore overlaps
-everything measured at deeper levels.
+Times are in seconds. Timers reported as components of a phase are disjoint from
+that phase's other reported components unless the field documentation says
+otherwise.
 """
-# Defaults live on the fields, so adding one cannot desynchronise a positional
-# constructor -- which it did, twice, while this struct was growing.
 Base.@kwdef mutable struct ReductionTelemetry
     levels::Int = 0
     max_depth::Int = 0
@@ -260,7 +287,6 @@ Base.@kwdef mutable struct ReductionTelemetry
     h3_calls::Int = 0
     h3_sr_pairs::Int = 0
     h3_sr_reuse_qr::Int = 0
-    h3_sr_refactor::Int = 0
     h3_sr_triangular::Int = 0
     h3_time_precheck::Float64 = 0.0
     h3_time_setup::Float64 = 0.0
@@ -272,8 +298,7 @@ Base.@kwdef mutable struct ReductionTelemetry
     h3_time_sr_setup::Float64 = 0.0
     h3_time_sr::Float64 = 0.0
     h3_time_sr_materialise::Float64 = 0.0
-    h3_time_sr_precision::Float64 = 0.0
-    h3_time_sr_factorprep::Float64 = 0.0
+    h3_time_sr_factor_setup::Float64 = 0.0
     h3_time_sr_reduce::Float64 = 0.0
     h3_time_sr_orthogonal::Float64 = 0.0
     h3_time_sr_triangular::Float64 = 0.0
@@ -315,9 +340,8 @@ Base.@kwdef mutable struct ReductionTelemetry
     h2_time_compress::Float64 = 0.0
     h2_time_apply::Float64 = 0.0
 
-    # CondUnknown precision/rank discovery.  `cond_time_h2` is diagnostic and
-    # overlaps the H2/generic timers below; the other CondUnknown times are
-    # outer-loop work and are disjoint from the recursive driver.
+    # CondUnknown precision/rank discovery. These timers cover only work local
+    # to the CondUnknown outer loop; phase-2 child work is accounted by H2.
     cond_calls::Int = 0
     cond_refinements::Int = 0
     cond_precision_changes::Int = 0
@@ -326,7 +350,6 @@ Base.@kwdef mutable struct ReductionTelemetry
     cond_time_extract::Float64 = 0.0
     cond_time_size_reduce::Float64 = 0.0
     cond_time_relative::Float64 = 0.0
-    cond_time_h2::Float64 = 0.0
     cond_time_apply::Float64 = 0.0
     cond_time_sort::Float64 = 0.0
 
@@ -347,7 +370,6 @@ Base.@kwdef mutable struct ReductionTelemetry
     time_matmul::Float64 = 0.0
     time_compress::Float64 = 0.0
     time_base::Float64 = 0.0
-    time_recursion::Float64 = 0.0
     time_finalise::Float64 = 0.0
     time_collect::Float64 = 0.0
     time_push::Float64 = 0.0
@@ -414,7 +436,6 @@ function Base.show(io::IO, t::ReductionTelemetry)
         println(io, "    extract/select         : ", round(t.cond_time_extract; digits = 3), " s")
         println(io, "    surrogate size reduce  : ", round(t.cond_time_size_reduce; digits = 3), " s")
         println(io, "    surrogate relative SR  : ", round(t.cond_time_relative; digits = 3), " s")
-        println(io, "    phase-2 child wall     : ", round(t.cond_time_h2; digits = 3), " s (overlaps H2)")
         println(io, "    exact transform apply  : ", round(t.cond_time_apply; digits = 3), " s")
         println(io, "    exact norm sorting     : ", round(t.cond_time_sort; digits = 3), " s")
     end
@@ -460,8 +481,7 @@ function Base.show(io::IO, t::ReductionTelemetry)
         println(io, "    size-red setup         : ", round(t.h3_time_sr_setup; digits = 3), " s")
         println(io, "    tiled size reduction   : ", round(t.h3_time_sr; digits = 3), " s")
         println(io, "      materialise views    : ", round(t.h3_time_sr_materialise; digits = 3), " s")
-        println(io, "      precision scans      : ", round(t.h3_time_sr_precision; digits = 3), " s")
-        println(io, "      compact-WY prep      : ", round(t.h3_time_sr_factorprep; digits = 3), " s")
+        println(io, "      factor/reuse setup   : ", round(t.h3_time_sr_factor_setup; digits = 3), " s")
         println(io, "      relative reduction   : ", round(t.h3_time_sr_reduce; digits = 3), " s")
         println(io, "        orthogonal/reuse   : ", round(t.h3_time_sr_orthogonal; digits = 3), " s")
         println(io, "        triangular         : ", round(t.h3_time_sr_triangular; digits = 3), " s")
@@ -469,14 +489,11 @@ function Base.show(io::IO, t::ReductionTelemetry)
         println(io, "      propagation          : ", round(t.h3_time_sr_propagate; digits = 3), " s")
         println(io, "    SR tile pairs          : ", t.h3_sr_pairs,
                     " (reuse QR ", t.h3_sr_reuse_qr,
-                    ", refactor ", t.h3_sr_refactor,
                     ", triangular ", t.h3_sr_triangular, ")")
     end
     println(io, "  time in matrix products  : ", round(t.time_matmul; digits = 3), " s")
     println(io, "  time in compression      : ", round(t.time_compress; digits = 3), " s")
     println(io, "  time in base cases       : ", round(t.time_base; digits = 3), " s")
-    println(io, "  time in recursive calls  : ", round(t.time_recursion; digits = 3),
-                " s  (a parent's view of its children, so NOT part of any total)")
     println(io, "  time collecting garbage  : ", round(t.time_gc; digits = 3), " s")
     println(io, "  time in per-level setup  : ", round(t.time_setup; digits = 3), " s")
     if t.final_precision > 0
@@ -648,9 +665,8 @@ Arbitrary-precision arithmetic allocates a limb block per value, a few dozen to
 a few hundred bytes, and frees it almost immediately. glibc serves blocks that
 size from the main heap and keeps them on free lists rather than returning
 them, so resident memory tracks the high-water mark of the heap rather than
-what is live -- measured at 300 times the actual data held. Neither garbage
-collection nor a Julia heap-size hint touches this, because Julia has already
-freed the memory; the allocator is holding it.
+what is live. Neither garbage collection nor a Julia heap-size hint can reclaim
+allocator-owned free pages, because Julia has already released those blocks.
 
 `malloc_trim` releases the free pages it can. Returns whether anything was
 released, and is a no-op off glibc.
@@ -711,12 +727,9 @@ held_bytes(items::Vector{<:AbstractArray}) = sum(held_bytes, items; init = 0)
 """
     _ReductionSettings
 
-Everything the recursion passes down unchanged, gathered so that adding a
-setting does not mean editing every call site.
-
-There were fifteen of these threaded through by hand; a list that long is one
-where a forgotten entry silently changes a sub-problem's behaviour rather than
-failing to compile.
+Settings inherited unchanged by recursive child reductions.  Keeping them in one
+object makes the child call explicit and prevents accidental divergence between
+recursion levels.
 """
 struct _ReductionSettings
     max_iterations::Int
@@ -734,14 +747,16 @@ struct _ReductionSettings
     trim_memory::Bool
     schedule::Symbol
     validate::Bool
+    heuristic_phase::Int
 end
 
 """
 Extra bits the validator's reference factorisation may use beyond the driver's
 working precision.
 
-Enough to resolve a genuine disagreement -- the ones seen were 4 to 112 bits --
-without letting an uncompressed candidate drive the reference to thousands.
+Provides enough headroom for an independent reference factorisation without
+allowing an uncompressed candidate to drive validation precision arbitrarily
+high.
 """
 const VALIDATION_PRECISION_HEADROOM = 512
 
@@ -761,11 +776,9 @@ const PROFILE_GROWTH_ALLOWANCE = 64.0
 Check the invariants a representation update must maintain, at the iteration
 that breaks them.
 
-Every failure seen from the tiled update so far has surfaced downstream -- a
-zero diagonal in a later factorisation, a non-finite profile entry in the
-compression -- several steps after the step that caused it. These are the
-properties that must hold on EVERY iteration, so a break is reported where it
-happens:
+The validator checks the representation invariants at the update boundary, so
+an invalid transform or profile is reported before it can affect a later
+factorisation or compression step:
 
   * `candidate == working * transform`, exactly. Integer arithmetic, so there is
     no tolerance to argue about.
@@ -773,10 +786,9 @@ happens:
   * the reported profile finite and nonzero, since the working precision for the
     next iteration is derived from it.
 
-Off by default, and expensive when on: an exact determinant and a full
-high-precision factorisation on every iteration at every level. The last run
-with it enabled was killed, so keep it to the small dimensions used for
-debugging rather than turning it on for a benchmark.
+Off by default because it is expensive: it performs an exact determinant and a
+high-precision reference factorisation on every validated iteration.  It is
+intended for tests and small diagnostic runs rather than benchmarks.
 """
 function _validate_update(working::AbstractMatrix{T}, candidate::AbstractMatrix{T},
                           transform::AbstractMatrix{T}, factor::AbstractMatrix{S},
@@ -977,9 +989,8 @@ end
 Reduce one window recursively, returning its transform, or `nothing` when the
 window is too narrow to have one.
 
-Extracted from the reduction loop unchanged. The loop currently calls it once
-per iteration; flatter's phase 3 schedule wants it called once per window, of
-which there are two on odd iterations.
+The phase-3 split may request two windows on one iteration; this helper reduces
+one requested window with the appropriate child split and goal.
 """
 function _reduce_window(working::AbstractMatrix{T}, window::UnitRange{Int},
                         goal, current_drop::Real, held_above::Int,
@@ -1012,7 +1023,6 @@ function _reduce_window(working::AbstractMatrix{T}, window::UnitRange{Int},
     child_goal = goal_slope(inherited_goal) < goal_slope(drop_goal) ?
                  drop_goal : inherited_goal
 
-    recursion_started = _tick()
     _, _, child_info = lattice_reduce!(sub_basis, sub_transform;
                     goal = child_goal,
                     max_iterations = settings.max_iterations,
@@ -1036,8 +1046,8 @@ function _reduce_window(working::AbstractMatrix{T}, window::UnitRange{Int},
                     # it per call would restart every sub-schedule from zero.
                     _split = child,
                     telemetry = telemetry,
-                    _depth = depth + 1)
-    telemetry === nothing || (telemetry.time_recursion += _tock(recursion_started))
+                    _depth = depth + 1,
+                    _heuristic_phase = settings.heuristic_phase)
 
     # Heuristic3 uses the profiles returned by the child reductions to choose
     # the precision for THIS iteration's tiled QR/size-reduction stage.  The
@@ -1309,11 +1319,8 @@ Keyword arguments:
                         reduction. Set `false` when the profile is not read.
   * `gc_dimension`   -- at or above this dimension, collect periodically.
                         `typemax(Int)` disables it.
-  * `gc_interval`    -- iterations between collections. Measured at dimension
-                        128 the runtime is flat across every setting while the
-                        footprint varies threefold, so a small value is close to
-                        free; `gc_tradeoff()` in the scaling probe re-measures
-                        this.
+  * `gc_interval`    -- iterations between requested collections once the
+                        dimension threshold is reached.
   * `base_cutoff`    -- dimensions at or below this go straight to
                         [`fplll_reduce`](@ref) instead of being recursed on.
                         Default `$(DEFAULT_BASE_CUTOFF)`, matching flatter. The
@@ -1361,7 +1368,8 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                          _held_above::Int = 0,
                          _split = nothing,
                          telemetry::Union{Nothing, ReductionTelemetry} = nothing,
-                         _depth::Integer = 0) where {T<:Integer}
+                         _depth::Integer = 0,
+                         _heuristic_phase::Integer = 0) where {T<:Integer}
     n = _check_reduction_input(B)
     size(U) == (n, n) || throw(DimensionMismatch("U must be $n x $n, got $(size(U))"))
     # Validated here rather than beside the code that reads it: a dimension at or
@@ -1381,10 +1389,47 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         telemetry.max_depth = max(telemetry.max_depth, Int(_depth))
     end
 
-    # Base case. Small dimensions go to fplll rather than being recursed on;
-    # two columns are handled exactly, with no compression and no precision
-    # policy at all.
-    if 2 < n <= base_cutoff
+    # Base dispatch. For heuristic phases 2 and 3 this mirrors
+    # LatticeReduction::configure: two-column bases are handled first, and
+    # fpLLL is selected only when n <= 32 and the MPZ representation is at most
+    # 128 bits. The independent teaching reducer keeps its configurable
+    # dimension-only base cutoff.
+    heuristic_phase = Int(_heuristic_phase)
+    heuristic_phase in (0, 2, 3) || throw(ArgumentError(
+        "internal heuristic phase must be 0, 2 or 3, got $heuristic_phase"))
+    input_precision = _integer_matrix_precision(B)
+
+    if n <= 2
+        method = :lagrange
+        started = _tick()
+        if heuristic_phase in (2, 3)
+            _, _, method = _heuristic_two_column_reduce!(B, U, input_precision)
+        else
+            _reduce_two_columns!(B, U, Int(schoenhage_threshold))
+            if n > 1
+                method = input_precision < schoenhage_threshold ? :lagrange : :schoenhage
+            end
+        end
+        if telemetry !== nothing
+            telemetry.base_cases += 1
+            if method === :lagrange
+                telemetry.lagrange_calls += 1
+            else
+                telemetry.schoenhage_calls += 1
+            end
+            telemetry.time_base += _tock(started)
+        end
+        return B, U, (iterations = 0, goal_met = true, stopped = :base_case,
+                      profile = _reported_profile(B, aggressive, want_profile,
+                                                  Int(_depth), telemetry))
+    end
+
+    use_fplll = if heuristic_phase in (2, 3)
+        n <= base_cutoff && input_precision <= FLATTER_FPLLL_PRECISION_CUTOFF
+    else
+        n <= base_cutoff
+    end
+    if use_fplll
         if telemetry !== nothing
             telemetry.base_cases += 1
             telemetry.fplll_calls += 1
@@ -1396,38 +1441,6 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             U[i, j] = applied[i, j]
         end
         telemetry === nothing || (telemetry.time_base += _tock(started))
-        # The profile costs a full arbitrary-precision factorisation, and only
-        # the outermost caller ever reads it -- every recursive call discards
-        # the info it is returned in. At dimension 96 the q-ary family makes 507
-        # base-case calls, so computing it unconditionally means 507 wasted
-        # factorisations.
-        return B, U, (iterations = 0, goal_met = true, stopped = :base_case,
-                      profile = _reported_profile(B, aggressive, want_profile,
-                                                  _depth, telemetry))
-    end
-
-    if n <= 2
-        if telemetry === nothing
-            _reduce_two_columns!(B, U, Int(schoenhage_threshold))
-        else
-            largest = 0
-            for value in B
-                iszero(value) || (largest = max(largest, ndigits(value; base = 2)))
-            end
-            telemetry.base_cases += 1
-            if n <= 1 || largest < schoenhage_threshold
-                telemetry.lagrange_calls += 1
-            else
-                telemetry.schoenhage_calls += 1
-            end
-            started = _tick()
-            _reduce_two_columns!(B, U, Int(schoenhage_threshold))
-            telemetry.time_base += _tock(started)
-        end
-        # Gauss/Lagrange reduction returns a general reduced basis, not an
-        # upper-triangular one.  In particular, a column swap can put zeros on
-        # the ordinary matrix diagonal even though the basis is nonsingular.
-        # Report its true Gram-Schmidt profile, just as for the fplll base case.
         return B, U, (iterations = 0, goal_met = true, stopped = :base_case,
                       profile = _reported_profile(B, aggressive, want_profile,
                                                   Int(_depth), telemetry))
@@ -1453,7 +1466,8 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                                   Int(blocksize), Int(panelsize), tiled,
                                   want_profile, Int(gc_dimension),
                                   Int(gc_interval), low_memory, gc_full,
-                                  trim_memory, schedule, validate)
+                                  trim_memory, schedule, validate,
+                                  heuristic_phase)
 
     bounded = low_memory === nothing ? n >= REDUCTION_LOW_MEMORY_DIMENSION :
                                        low_memory
@@ -1502,10 +1516,8 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             break
         end
 
-        # flatter's phase 3 schedule yields TWO windows on odd iterations, the
-        # left and right halves, and one -- the middle -- on even ones. The
-        # hand-rolled cycle it replaces only ever produced a single window, so
-        # the tiled update never saw more than one reduced tile.
+        # The phase-3 split yields the middle window on one iteration and the
+        # left/right pair on the other.  The teaching schedule yields one window.
         windows = schedule === :split ? split_windows(split_node) :
                                         [_reduction_window(iteration, n)]
         window = first(windows)
@@ -1606,20 +1618,16 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             telemetry === nothing || (telemetry.time_matmul += _tock(multiply_started))
         end
 
-        # Check the update where it happened, not where its consequences show
-        # up. Every tiled-path failure so far has surfaced downstream: a zero
-        # diagonal in a later factorisation, a non-finite profile in the
-        # compression, several steps after whatever caused them.
+        # Validate the representation before its factor/profile is used by the
+        # next compression and recursive step.
         validation_precision = tiled ? tiled_precision : precision
         validate && _validate_update(working, candidate, window_transform, factor,
                                      iteration, Int(_depth), validation_precision, windows)
 
         # Lift and fold in immediately: the scaling this transform needs is the
         # one currently in force, and holding it unlifted would only cost memory.
-        # Lifting and folding happen in the LOOP, while draining happens in the
-        # finalise block. They had shared a counter, which meant the in-loop
-        # half -- real integer matrix products -- was timed into a figure that
-        # nothing summed, and surfaced only as unaccounted time.
+        # `time_push` measures these in-loop exact transform products separately
+        # from the final drain/collection work.
         push_started = _tick()
         _push_transform!(stack, _lift_transform(window_transform, compression))
         telemetry === nothing || (telemetry.time_push += _tock(push_started))
@@ -1763,10 +1771,9 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         U[i, j] = result[i, j]
     end
 
-    # Measured HERE, after `U` is written. `U` arrives as
-    # `Matrix{BigInt}(undef, n, n)`, whose entries are undefined references
-    # until assigned, so iterating it any earlier throws `UndefRefError` --
-    # which is exactly what an earlier version of this did.
+    # Measure transform width from the fully initialised product. `U` may have
+    # been supplied with undefined BigInt slots, so no entry of it is inspected
+    # before assignment.
     if telemetry !== nothing
         for value in result
             iszero(value) || (telemetry.widest_transform = max(

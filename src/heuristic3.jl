@@ -1,45 +1,23 @@
 # heuristic3.jl
 #
-# The tiled representation update: flatter's `Heuristic3`.
+# flatter's serial phase-3 representation update.
 #
-# WHAT THIS REPLACES
-#
-# `RecursiveGeneric::update_representation`, which this package currently
-# follows, folds each sublattice reduction into the basis and then re-factorises
-# the WHOLE matrix from scratch:
-#
-#     for each sublattice i
-#         B_next *= U_tmp                       (full n-by-n product)
-#         FusedQRSizeReduction(B_next, R, U_sr) (full n-by-n factorisation)
-#         U_i *= U_tmp * U_sr
-#
-# `Heuristic3` never factorises the whole matrix. The columns are partitioned
-# into tiles -- one per sublattice window, plus one for each gap between them --
-# and the update works tile by tile:
+# A phase-3 iteration reduces one or two sublattice windows.  Their transforms
+# are embedded into one block-diagonal U, after which the representation is
+# updated tile by tile rather than by QR-factorising the entire basis:
 #
 #     U_i          <- block diagonal of the sublattice transforms
-#     B_next[r, c] <- B[r, c] * U_i[c, c]       for r <= c, per tile pair
-#     R[c, c]      <- QR(B_next[c, c])          per diagonal tile
-#     R[r, c]      <- size reduce tile c against tile r, bottom up
+#     B_next[r, c] <- B[r, c] * U_i[c, c]
+#     R[c, c]      <- QR(B_next[c, c])
+#     R[r, c]      <- relative size reduction of tile c against tile r
 #
-# So the O(n^3) factorisation becomes a set of tile-sized ones, and the
-# off-diagonal blocks of R come from relative size reduction rather than from a
-# global sweep. That is the substance of `Heuristic3`; its tiling is a serial
-# optimisation, not a threading device -- `Threaded3` is the threaded variant and
-# `heuristic_3.cpp` contains no OpenMP at all.
+# The off-diagonal reductions are performed from the bottom upwards so that each
+# row tile sees the state produced by lower tiles.  Diagonal QR factors are
+# retained as packed Householder reflectors plus tau and reused by the
+# orthogonal relative-size-reduction kernel.
 #
-# WHAT IT COSTS, MEASURED
-#
-# With the phase-3 SublatticeSplit feeder, cached R/tau reuse, and direct MPFR-
-# style Householder kernels, the tiled update reaches the intended regime by
-# dimension 256.  On the knapsack probe (Ryzen 7 5800H), split/plain and
-# split/tiled both take about 3.7s, with the six Heuristic3 updates themselves
-# costing about 0.84s.  An earlier implementation was roughly 2x slower because
-# it repeatedly refactorised tiles, used compact-WY BigFloat QR/SR, and drove
-# phase 3 with the wrong stopping/reset cycle.  Those measurements are obsolete.
-#
-# This is still a teaching port of the phase-3/Heuristic3 machinery, not a full
-# port of flatter's phase 1/2 dispatcher.
+# This file implements the serial Heuristic3 path.  flatter's Threaded3 is a
+# separate implementation and is not reproduced here.
 
 """
     Tile
@@ -365,7 +343,7 @@ function _tiled_size_reduction_body!(B::AbstractMatrix{T}, B_next::AbstractMatri
                 scalars = view(tau, rows)
                 R2 = Matrix{S}(undef, length(rows), length(columns))
                 telemetry === nothing ||
-                    (telemetry.h3_time_sr_factorprep += _tock(factorprep_started))
+                    (telemetry.h3_time_sr_factor_setup += _tock(factorprep_started))
                 reduce_started = _tick()
                 _relative_orthogonal_reflectors!(B1, B2, block, factors, scalars, R2;
                     deadband = RELATIVE_SIZE_REDUCTION_DEADBAND,
@@ -484,16 +462,11 @@ function heuristic3_update!(working::AbstractMatrix{T},
                             strassen_cutoff::Integer = DEFAULT_STRASSEN_CUTOFF,
                             telemetry::Union{Nothing, ReductionTelemetry} = nothing
                             ) where {T<:Integer, S<:AbstractFloat}
-    # PRECONDITION, and not a mild one. `tiled_basis_update!` writes only the
-    # blocks at or above the tile diagonal, and `tiled_size_reduction!` tells
-    # `relative_size_reduction!` that a gap tile's diagonal block is triangular.
-    # Both are true only for an upper triangular `working`. Given anything else
-    # the update silently discards the blocks below the diagonal, so
-    # `basis == working * transform` fails -- which is how this was found.
-    #
-    # The driver satisfies it because it compresses every iteration, and
-    # compression rebuilds a triangular basis from `R`. Feeding the raw output
-    # of one update straight into the next does NOT satisfy it.
+    # PRECONDITION. `tiled_basis_update!` writes only blocks at or above the tile
+    # diagonal, and gap tiles are treated as triangular during relative size
+    # reduction.  The working representation must therefore be fully upper
+    # triangular.  The phase-3 driver guarantees this by compressing the R factor
+    # before each recursive iteration.
     telemetry === nothing || (telemetry.h3_calls += 1)
     precheck_started = _tick()
     for j in 1:n, i in (j + 1):n

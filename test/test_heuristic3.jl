@@ -262,13 +262,39 @@ end
     end
 end
 
+@testset "heuristic3 fpLLL precision cutoff" begin
+    n = 4
+
+    low = zeros(BigInt, n, n)
+    for i in 1:n
+        low[i, i] = big(1) << 40
+    end
+    low_U = Matrix{BigInt}(undef, n, n)
+    low_telemetry = Flatter.ReductionTelemetry()
+    low_reduced, low_U, _ = Flatter.lattice_reduce!(
+        copy(low), low_U; base_cutoff = 4, max_iterations = 4,
+        want_profile = false, telemetry = low_telemetry, _heuristic_phase = 3)
+    @test low_reduced == low * low_U
+    @test low_telemetry.fplll_calls == 1
+
+    high = zeros(BigInt, n, n)
+    for i in 1:n
+        high[i, i] = big(1) << 160
+    end
+    high_U = Matrix{BigInt}(undef, n, n)
+    high_telemetry = Flatter.ReductionTelemetry()
+    high_reduced, high_U, info = Flatter.lattice_reduce!(
+        copy(high), high_U; base_cutoff = 4, max_iterations = 4,
+        want_profile = false, telemetry = high_telemetry, _heuristic_phase = 3)
+    @test high_reduced == high * high_U
+    @test info.goal_met
+    @test high_telemetry.fplll_calls == 0
+end
+
 @testset "heuristic3 update_representation" begin
 
-    # Called with no surrounding precision block, which is how the driver calls
-    # it. Every BigFloat the update allocates has to end up at the working
-    # precision; the first version allocated the compact-WY factor and the R
-    # matrix at whatever the default happened to be, and only worked because
-    # every test wrapped it in `setprecision`.
+    # Called with no surrounding precision block, as in the driver. Every
+    # BigFloat allocated by the update must use the requested working precision.
     @testset "works outside a setprecision block" begin
         rng = MersenneTwister(0x0303)
         n, window = 10, 4:9
@@ -425,11 +451,9 @@ end
         # With nothing to fold in, the update is pure size reduction across the
         # tile boundary -- and must still return a valid, non-trivial transform.
         #
-        # The off-diagonal entries have to be large RELATIVE TO THE DIAGONAL of
-        # the block they are reduced against, or there is nothing to do. A
-        # previous version of this test used a 40-bit diagonal spread against
-        # 30-bit entries, so the largest ones were already size-reduced and the
-        # maximum was dominated by an entry the reduction rightly left alone.
+        # The off-diagonal entries have to be large relative to the diagonal of
+        # the block they are reduced against, otherwise the identity transform is
+        # already size reduced.
         rng = MersenneTwister(0x0302)
         n, window = 10, 6:10
 
@@ -616,13 +640,10 @@ end
         end
     end
 
-    # Feeding one update's raw output into the next is NOT what the driver
-    # does, and `heuristic3_update!` does not support it: the output is only
-    # BLOCK upper triangular, while the update requires a fully triangular
-    # basis. The driver satisfies that by compressing every iteration. An
-    # earlier version of this file chained the raw output and reported the exact
-    # contract failing, which was the test violating a precondition rather than
-    # the update being wrong -- the compressed variant below passed throughout.
+    # `heuristic3_update!` requires a fully upper-triangular working
+    # representation.  A raw tile update is only block upper triangular; the
+    # driver restores the stronger invariant by compressing its R factor between
+    # updates.
     @testset "the update rejects a basis that is not upper triangular" begin
         rng = MersenneTwister(0x7A11)
         n = 12

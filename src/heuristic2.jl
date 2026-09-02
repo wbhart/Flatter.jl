@@ -21,14 +21,8 @@
 # compressed recursion can be accumulated directly and applied once to the
 # original basis at the end.
 
-"Return the maximum binary width of a nonzero integer matrix entry."
-function _h2_widest_bits(A::AbstractMatrix{<:Integer})
-    widest = 0
-    for value in A
-        iszero(value) || (widest = max(widest, ndigits(value; base = 2)))
-    end
-    return widest
-end
+"Return the maximum binary width of an integer matrix entry."
+_h2_widest_bits(A::AbstractMatrix{<:Integer}) = _integer_matrix_precision(A)
 
 "The current-drop approximation used by flatter's Heuristic2."
 function _h2_current_drop(profile::AbstractVector{<:Real})
@@ -74,9 +68,10 @@ end
 function _h2_direct_factor(A::AbstractMatrix{T}, precision::Integer) where {T<:Integer}
     m, n = size(A)
     widest = _h2_widest_bits(A)
-    # The profile-derived figure is flatter's policy.  The extra lower bound is
-    # the same safety used by H3's Julia tile QR: unlike flatter's C++ Matrix,
-    # this teaching port materialises the raw integer tile before factorising it.
+    # The profile-derived figure is flatter's policy.  The Julia implementation
+    # also prevents conversion of a raw exact tile at a precision below its
+    # represented entry width; this is a numerical-safety lower bound, not a
+    # dispatcher decision.
     bits = max(Int(precision), householder_precision(min(m, n), Float64(widest)))
     return with_precision(bits) do
         F = Matrix{BigFloat}(undef, m, n)
@@ -322,14 +317,19 @@ function _heuristic2_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                              depth::Int) where {T<:Integer}
     n = size(B, 2)
 
-    # The upstream dispatcher never instantiates H2 below the fplll threshold.
-    if n <= base_cutoff || n <= 2
+    # LatticeReduction::configure handles two-column problems before phase
+    # selection, and sends phase-2 problems to fpLLL only when both n <= 32 and
+    # the MPZ representation is at most 128 bits.
+    input_precision = _integer_matrix_precision(B)
+    if n <= 2 || (n <= base_cutoff &&
+                  input_precision <= FLATTER_FPLLL_PRECISION_CUTOFF)
         return lattice_reduce!(B, U;
             goal = goal, max_iterations = max_iterations,
             aggressive = aggressive, schoenhage_threshold = schoenhage_threshold,
             base_cutoff = base_cutoff, blocksize = blocksize, panelsize = panelsize,
             tiled = true, schedule = :split, validate = validate,
-            want_profile = true, telemetry = telemetry, _depth = depth)
+            want_profile = true, telemetry = telemetry, _depth = depth,
+            _heuristic_phase = 2)
     end
 
     if telemetry !== nothing
@@ -496,7 +496,8 @@ function _heuristic2_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                 base_cutoff = base_cutoff, blocksize = blocksize, panelsize = panelsize,
                 tiled = true, schedule = :split, validate = validate,
                 want_profile = true, _split = child::SplitPhase3,
-                telemetry = telemetry, _depth = depth + 1)
+                telemetry = telemetry, _depth = depth + 1,
+                _heuristic_phase = 3)
             step_U = U_sub
             validate && _h2_validate_step(working, B_sub, step_U, "all")
             child_profile = isempty(info.profile) ? _basis_profile(B_sub, aggressive) : info.profile
@@ -548,13 +549,12 @@ end
 Reduce a square upper-triangular integer basis with flatter's phase-2 heuristic.
 
 The phase-2 schedule is left, right, whole. Partial children remain phase 2; the
-whole-window child is handed to the already-ported phase-3 Heuristic3. Small
-children use the same fplll base case as [`lattice_reduce!`](@ref).
+whole-window child is handed to phase 3. Two-column children use flatter's
+Lagrange/Schoenhage dispatch, and dimensions at most 32 use fpLLL only when the
+compressed integer representation is at most 128 bits.
 
-This remains an explicit phase-2 entry point as well as the implementation used
-by the public dispatcher. With CondUnknown and Heuristic1 now ported, the public
-heuristic route reaches phase 2 through the same triangular, known-condition and
-unknown-condition entry routes as flatter.
+This function is both the explicit phase-2 entry point and the phase-2 component
+of the public heuristic dispatcher.
 """
 function heuristic2_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                             goal::Union{Nothing, ReductionGoal} = nothing,

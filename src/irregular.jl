@@ -11,7 +11,7 @@
 #     flipped into upper triangular form, reduced, and flipped back;
 #   * anything else takes the dense path below.
 #
-# There are now two dense paths.  `algorithm=:heuristic` follows flatter: a
+# There are now two dense paths.  The default `algorithm=:heuristic` follows flatter: a
 # non-triangular basis enters phase 1 with unknown condition number and is sent
 # to CondUnknown, which discovers a resolvable independent prefix, drives it
 # through phase 2, and increases precision until every remaining dependency is
@@ -324,15 +324,16 @@ together with `rounds` (dense path only) and the fields
 
 Keyword arguments beyond those of [`lattice_reduce!`](@ref):
 
-  * `algorithm`  -- `:teaching` (the existing reducer) or `:heuristic` (flatter's
-                    heuristic phase dispatcher).  Triangular/reoriented input
+  * `algorithm`  -- `:heuristic` (the default, flatter's heuristic phase
+                    dispatcher) or `:teaching` (the older independent reducer).  Triangular/reoriented input
                     enters Heuristic2 after exact size reduction; dense input
                     enters CondUnknown and is then handed to Heuristic2 as its
                     rank/condition information becomes available.
-  * `max_rounds` -- iterations of the dense path. Each round re-factorises an
-                    already improved basis, so its integer approximation is a
-                    better one; the loop stops early when a round produces the
-                    identity. Default `$(DEFAULT_DENSE_ROUNDS)`.
+  * `max_rounds` -- iterations of the `:teaching` dense path. Each round
+                    re-factorises an already improved basis, so its integer
+                    approximation is a better one; the loop stops early when a
+                    round produces the identity. Ignored by the heuristic
+                    dispatcher. Default `$(DEFAULT_DENSE_ROUNDS)`.
 
 # Rank
 
@@ -341,7 +342,7 @@ uses CondUnknown and supports rank-deficient input, moving exact zero
 dependencies to the right of the returned basis.
 """
 function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
-                       algorithm::Symbol = :teaching,
+                       algorithm::Symbol = :heuristic,
                        max_rounds::Integer = DEFAULT_DENSE_ROUNDS,
                        aggressive::Bool = false,
                        telemetry::Union{Nothing, ReductionTelemetry} = nothing,
@@ -356,11 +357,19 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     size(U) == (n, n) || throw(DimensionMismatch("U must be $n x $n, got $(size(U))"))
     (iszero(m) || iszero(n)) && throw(ArgumentError("B must be non-empty"))
 
+    telemetry === nothing || (telemetry.irregular_calls += 1)
+    orientation_started = time_ns()
     orientation = triangular_orientation(B)
+    telemetry === nothing ||
+        (telemetry.irregular_time_orientation += (time_ns() - orientation_started) / 1e9)
 
     if orientation !== nothing
+        telemetry === nothing || (telemetry.irregular_triangular_calls += 1)
         flip_rows, flip_columns = orientation
+        flip_started = time_ns()
         _flip!(B, flip_rows, flip_columns)
+        telemetry === nothing ||
+            (telemetry.irregular_time_flip += (time_ns() - flip_started) / 1e9)
 
         if algorithm === :heuristic
             # flatter's Irregular::solve_triangular performs an exact triangular
@@ -368,18 +377,60 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             # even when Heuristic2 accepts the profile immediately at iteration
             # zero: size reduction does not change the diagonal profile, but it
             # is part of the returned reduced representative.
-            U_sr = Matrix{T}(undef, n, n)
-            size_reduction_triu!(B, U_sr)
+            # `U` is the transform in oriented coordinates until the final
+            # orientation correction below, so write the size-reduction
+            # transform there directly instead of allocating a second n x n
+            # BigInt matrix just to copy or compose it later.
+            sr_started = time_ns()
+            size_reduction_triu!(B, U)
+            telemetry === nothing ||
+                (telemetry.irregular_time_triangular_sr +=
+                    (time_ns() - sr_started) / 1e9)
 
-            U_h2 = Matrix{T}(undef, n, n)
-            _, _, info = heuristic2_reduce!(B, U_h2; aggressive = aggressive,
-                                             telemetry = telemetry, kwargs...)
+            # For dimensions where the dispatcher would really instantiate H2,
+            # its first action is only to test the triangular diagonal profile
+            # against the same goal.  Do that test here as well.  If it already
+            # passes, H2 would return the identity transform, so allocating its
+            # transform, copying the basis inside H2, and multiplying the
+            # size-reduction transform by `I` are all pure overhead. Small
+            # problems still go through the base reducer, matching the existing
+            # phase-2 dispatch.
+            base_cutoff = Int(get(kwargs, :base_cutoff, DEFAULT_BASE_CUTOFF))
+            max_iterations = Int(get(kwargs, :max_iterations,
+                                     DEFAULT_REDUCTION_MAX_ITERATIONS))
+            base_cutoff >= 2 || throw(ArgumentError("base_cutoff must be at least two"))
+            max_iterations >= 1 || throw(ArgumentError(
+                "max_iterations must be at least one"))
+            requested_goal = get(kwargs, :goal, nothing)
+            requested_rhf = get(kwargs, :rhf, DEFAULT_REDUCTION_RHF)
+            resolved_goal = requested_goal === nothing ?
+                goal_from_rhf(n, requested_rhf) : requested_goal
+            resolved_goal.n == n || throw(ArgumentError(
+                "the goal has dimension $(resolved_goal.n) but the basis has $n columns"))
+            entry_profile = [_log2_abs(B[i, i]) for i in 1:n]
 
-            # Q*B0*P is first changed by U_sr and then by U_h2, so the
-            # transform in the oriented coordinates is U_sr * U_h2.
-            combined = strassen(U_sr, U_h2)
-            for j in 1:n, i in 1:n
-                U[i, j] = combined[i, j]
+            if !haskey(kwargs, :_split) && n > base_cutoff && n > 2 &&
+                    goal_check(resolved_goal, entry_profile)
+                telemetry === nothing ||
+                    (telemetry.irregular_triangular_goal_exits += 1)
+                info = (iterations = 0, goal_met = true, stopped = :goal,
+                        profile = entry_profile)
+            else
+                U_h2 = Matrix{T}(undef, n, n)
+                _, _, info = heuristic2_reduce!(B, U_h2; aggressive = aggressive,
+                                                 telemetry = telemetry, kwargs...)
+
+                # Q*B0*P is first changed by the size-reduction transform now
+                # stored in U and then by U_h2, so compose them only when H2
+                # actually did work.
+                compose_started = time_ns()
+                combined = strassen(U, U_h2)
+                for j in 1:n, i in 1:n
+                    U[i, j] = combined[i, j]
+                end
+                telemetry === nothing ||
+                    (telemetry.irregular_time_transform_compose +=
+                        (time_ns() - compose_started) / 1e9)
             end
         else
             _, _, info = lattice_reduce!(B, U; aggressive = aggressive,
@@ -390,13 +441,17 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         # Undo the row reversal on the basis, and apply the column reversal to
         # the transform: reducing `Q B P` to `Q B P U'` means the transform for
         # the original basis is `P U'`, which is `U'` with its rows reversed.
+        flip_started = time_ns()
         _flip!(B, flip_rows, false)
         _flip!(U, flip_columns, false)
+        telemetry === nothing ||
+            (telemetry.irregular_time_flip += (time_ns() - flip_started) / 1e9)
 
         path = (flip_rows || flip_columns) ? :reoriented : :triangular
         return B, U, (; path, rounds = 0, info...)
     end
 
+    telemetry === nothing || (telemetry.irregular_dense_calls += 1)
     if algorithm === :heuristic
         _, _, info = cond_unknown_reduce!(B, U; aggressive = aggressive,
                                           telemetry = telemetry, kwargs...)

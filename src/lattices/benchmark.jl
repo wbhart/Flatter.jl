@@ -69,13 +69,15 @@ gaussian_heuristic_log2(log2_det::Float64, n::Int) =
 """
     measure(bundle; kwargs...) -> NamedTuple
 
-Reduce one basis with the driver and with fplll, and collect the comparison.
+Reduce one basis with the selected driver and with fplll, and collect the comparison.
+The default is the flatter-style heuristic dispatcher; pass `algorithm = :teaching`
+to retain the older teaching reducer.
 
 Failures are caught rather than thrown: one bad instance should not abandon the
 sweep, and a timeout or a stall is itself a result worth recording.
 """
 function measure(bundle; max_iterations = 120, aggressive = false,
-                 algorithm::Symbol = :teaching,
+                 algorithm::Symbol = :heuristic,
                  run_fplll = true, verbose = false, repeat_under = 2.0,
                  progress = true, measure_memory = false, low_memory = nothing,
                  gc_dimension = Flatter.REDUCTION_GC_DIMENSION,
@@ -266,6 +268,12 @@ function cond_unknown_local_time(t)
            t.cond_time_apply + t.cond_time_sort
 end
 
+"Public irregular-entry work outside H2, CondUnknown and the generic driver."
+function irregular_entry_local_time(t)
+    return t.irregular_time_orientation + t.irregular_time_triangular_sr +
+           t.irregular_time_transform_compose + t.irregular_time_flip
+end
+
 "Where the time went, as a share of the driver's wall clock."
 function print_time_breakdown(r)
     t = r.telemetry
@@ -279,7 +287,8 @@ function print_time_breakdown(r)
                         t.time_gc + t.time_setup + t.time_push
     h2_local = heuristic2_local_time(t)
     cond_local = cond_unknown_local_time(t)
-    accounted = generic_accounted + h2_local + cond_local
+    entry_local = irregular_entry_local_time(t)
+    accounted = generic_accounted + h2_local + cond_local + entry_local
     @printf("    fusedQR %5.1f%%  matmul %5.1f%%  compress %5.1f%%  base %5.1f%%  finalise %5.1f%%\n",
             100 * t.time_fused / total, 100 * t.time_matmul / total,
             100 * t.time_compress / total, 100 * t.time_base / total,
@@ -308,6 +317,15 @@ function print_time_breakdown(r)
         @printf("    teaching dense path: %d rounds, QR %5.1f%% of total\n",
                 t.dense_rounds, 100 * t.time_dense_qr / total)
     end
+    if entry_local > 0.005 * total
+        @printf("    irregular entry: %5.1f%% (orientation %4.1f%%, triangular-SR %4.1f%%, U-compose %4.1f%%, flips %4.1f%%; goal-exit %d)\n",
+                100 * entry_local / total,
+                100 * t.irregular_time_orientation / total,
+                100 * t.irregular_time_triangular_sr / total,
+                100 * t.irregular_time_transform_compose / total,
+                100 * t.irregular_time_flip / total,
+                t.irregular_triangular_goal_exits)
+    end
     if t.cond_calls > 0
         @printf("    CondUnknown: %d refinement%s, rank %d, maxprec %d; local %5.1f%% (extract %4.1f%%, size-red %4.1f%%, relative %4.1f%%, apply %4.1f%%, sort %4.1f%%)\n",
                 t.cond_refinements, t.cond_refinements == 1 ? "" : "s",
@@ -323,10 +341,11 @@ function print_time_breakdown(r)
     # recursive-driver timers above.  Include them before calling anything
     # residual; H3 update time is already inside `time_fused` and must not be
     # added again.
-    if t.h2_calls > 0 || t.cond_calls > 0
-        @printf("    accounted %5.1f%% = generic %5.1f%% + H2-local %5.1f%% + CondUnknown-local %5.1f%%; residual %5.1f%%\n",
+    if t.h2_calls > 0 || t.cond_calls > 0 || entry_local > 0
+        @printf("    accounted %5.1f%% = generic %5.1f%% + entry %5.1f%% + H2-local %5.1f%% + CondUnknown-local %5.1f%%; residual %5.1f%%\n",
                 100 * accounted / total, 100 * generic_accounted / total,
-                100 * h2_local / total, 100 * cond_local / total,
+                100 * entry_local / total, 100 * h2_local / total,
+                100 * cond_local / total,
                 100 * max(0.0, 1 - accounted / total))
     elseif accounted < 0.75 * total
         # Anything unaccounted is worth seeing: it has hidden a dominant cost twice.
@@ -378,7 +397,7 @@ only by some earlier case happening to compile the same path first, which is
 luck. The base triangular, recursive triangular and dense entry paths are all
 exercised here, since they compile separately.
 """
-function warm_up(; algorithm::Symbol = :teaching)
+function warm_up(; algorithm::Symbol = :heuristic)
     algorithm in (:teaching, :heuristic) || throw(ArgumentError(
         "unknown reduction algorithm $algorithm; expected :teaching or :heuristic"))
     rng = MersenneTwister(7)
@@ -425,7 +444,7 @@ The size parameter is not always the dimension: knapsack produces `n+1` columns,
 q-ary `2n`, and relation `n+1` columns in `n+2` rows.
 """
 function run_family(name::AbstractString, sizes = nothing; seed::Integer = 1,
-                    algorithm::Symbol = :teaching,
+                    algorithm::Symbol = :heuristic,
                     breakdown::Bool = true, time_budget::Real = 60.0,
                     warm::Bool = true, kwargs...)
     families = Flatter.lattice_families()
@@ -473,7 +492,7 @@ Every family over its own declared range, smallest first so a stall shows up
 before much time has been spent. Pass `sizes` to override every family at once.
 """
 function run_all(; sizes = nothing, seed::Integer = 1,
-                 algorithm::Symbol = :teaching, kwargs...)
+                 algorithm::Symbol = :heuristic, kwargs...)
     warm_up(; algorithm = algorithm)
     results = []
     for family in Flatter.lattice_families()

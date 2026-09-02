@@ -23,7 +23,9 @@
 #
 # Both live in `lattices/reference_times.tsv`, keyed by machine and by a hash of
 # the basis itself, so a changed generator invalidates its own entries rather
-# than quietly comparing against something else.
+# than quietly comparing against something else.  Historical `ours` rows are
+# the teaching reducer; `ours-heuristic` rows are the current default heuristic
+# dispatcher, so both baselines remain available.
 #
 # WHICH FAMILIES ARE HERE, AND WHY NOT THE OTHERS
 #
@@ -68,9 +70,8 @@ const CHEAP_CASES = [
     (family = "knapsack",          size = 255),
 ]
 
-# Square triangular/reoriented families that can enter the heuristic dispatcher
-# before CondUnknown is ported.  `scrambled` is dense and `relation` is
-# rectangular, so both still belong to the teaching/dense path for now.
+# Historical subset used while only H2/H3 were available.  CondUnknown now
+# allows the heuristic dispatcher to handle dense and rectangular large cases too.
 const HEURISTIC2_LARGE_CASES = [
     (family = "random-triangular", size = 256),
     (family = "knapsack",          size = 255),
@@ -127,11 +128,18 @@ end
 "A hash of the basis, so a changed generator invalidates its own cached rows."
 basis_tag(B) = string(hash(B); base = 16)
 
+"Reference kind for one of our reducers.  Legacy `ours` rows are teaching baselines."
+function ours_reference_kind(algorithm::Symbol)
+    algorithm === :teaching && return "ours"
+    algorithm === :heuristic && return "ours-heuristic"
+    throw(ArgumentError("algorithm must be :teaching or :heuristic"))
+end
+
 struct Reference
     machine::String
     family::String
     size::Int
-    kind::String          # "fplll" or "ours"
+    kind::String          # "fplll", legacy teaching "ours", or "ours-heuristic"
     basis::String
     seconds::Float64
     norm_log2::Float64
@@ -219,40 +227,53 @@ recorded before the recursive path was warmed).  `find_reference` deliberately
 uses the last matching row, so the refreshed row supersedes the old one without
 editing the TSV by hand.
 """
-function _warm_large_benchmark!()
+function _warm_large_benchmark!(algorithm::Symbol = :heuristic)
+    ours_reference_kind(algorithm)  # validate early
     rng = MersenneTwister(7)
 
-    # Exercise the base triangular entry path.
-    Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 24).basis;
-                         want_profile = false)
+    if algorithm === :teaching
+        # Exercise the base triangular entry path.
+        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 24).basis;
+                             algorithm = :teaching, want_profile = false)
 
-    # Dimension 48 is above the default base cutoff of 32.  This is essential:
-    # warming only dimension 24 leaves recursion, the fused update, compression,
-    # transform folding and finalisation cold, so the first large timing can be
-    # dominated by JIT compilation.
-    Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
-                         want_profile = false)
+        # Dimension 48 is above the default base cutoff of 32.  This is essential:
+        # warming only dimension 24 leaves recursion, the fused update, compression,
+        # transform folding and finalisation cold.
+        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
+                             algorithm = :teaching, want_profile = false)
 
-    # The dense/irregular entry path compiles independently.
-    Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
-                         want_profile = false)
+        # The teaching dense/irregular entry path compiles independently.
+        Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
+                             algorithm = :teaching, want_profile = false)
+    else
+        # H2/H3 on a problem above the recursive cutoff.  Random triangular may
+        # legitimately stop at H2 entry, so also warm the CondUnknown path below.
+        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
+                             algorithm = :heuristic, want_profile = false)
+
+        # Dense input forces Phase 1 / CondUnknown and then the H2/H3 machinery.
+        # Use dimension 48 so the recursive phase-2 path is compiled as well.
+        Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 48).basis;
+                             algorithm = :heuristic, want_profile = false)
+    end
     return nothing
 end
 
-function run_large(; cases = LARGE_CASES, record_baseline::Bool = false,
-                   refresh_baseline::Bool = false,
+function run_large(; cases = LARGE_CASES, algorithm::Symbol = :heuristic,
+                   record_baseline::Bool = false, refresh_baseline::Bool = false,
                    force_fplll::Bool = false, skip_fplll::Bool = false,
                    verbose::Bool = false, seed::Integer = 1)
     machine = machine_tag()
+    baseline_kind = ours_reference_kind(algorithm)
     entries = load_references()
     families = Dict(f.name => f for f in Flatter.lattice_families())
 
     # Compile the base, recursive and dense entry paths before timing anything.
     # In particular, the recursive warm-up must cross DEFAULT_BASE_CUTOFF = 32;
     # otherwise the first dimension-256 case pays the recursive JIT cost.
-    _warm_large_benchmark!()
+    _warm_large_benchmark!(algorithm)
 
-    println("Large cases, dimension ~256. Machine: ", machine)
+    println("Large cases [", algorithm, "], dimension ~256. Machine: ", machine)
     println("Cached timings in ", REFERENCE_FILE, "\n")
     @printf("%-18s %5s %11s %11s %9s %11s %s\n",
             "family", "dim", "ours(s)", "fplll(s)", "faster", "baseline(s)", "change")
@@ -270,7 +291,7 @@ function run_large(; cases = LARGE_CASES, record_baseline::Bool = false,
         GC.gc()
         telemetry = Flatter.ReductionTelemetry()
         elapsed = @elapsed reduced, _, _ = Flatter.reduce_basis(
-            bundle.basis; telemetry = telemetry, want_profile = false)
+            bundle.basis; algorithm = algorithm, telemetry = telemetry, want_profile = false)
         shortest = shortest_norm_log2(reduced)
 
         # fpLLL, only if we have not already paid for it on this machine.
@@ -292,10 +313,10 @@ function run_large(; cases = LARGE_CASES, record_baseline::Bool = false,
         end
 
         baseline = refresh_baseline ? nothing :
-                   find_reference(entries, machine, case.family, case.size, "ours", tag)
+                   find_reference(entries, machine, case.family, case.size, baseline_kind, tag)
         if (record_baseline || refresh_baseline) && baseline === nothing
             baseline = save_reference(Reference(machine, case.family, case.size,
-                                                "ours", tag, elapsed, shortest,
+                                                baseline_kind, tag, elapsed, shortest,
                                                 string(Dates.now())))
         end
 
@@ -316,7 +337,7 @@ function run_large(; cases = LARGE_CASES, record_baseline::Bool = false,
                 baseline === nothing ? "-" : @sprintf("%.2f", baseline.seconds),
                 change)
 
-        print_fused_split(telemetry, elapsed)
+        print_large_telemetry(telemetry, elapsed; algorithm = algorithm)
         if verbose
             # Every counter, including the ones the summary does not add up.
             # When a residual will not close, the field that is large and
@@ -328,11 +349,11 @@ function run_large(; cases = LARGE_CASES, record_baseline::Bool = false,
         end
     end
 
-    println("\nRecord the first baseline with `run_large(record_baseline = true)` BEFORE")
-    println("changing the implementation. Replace a stale existing baseline with")
-    println("`run_large(refresh_baseline = true)`. Afterwards the change column is")
-    println("what the work bought. A quality warning means the reduction got worse,")
-    println("which no amount of speed makes acceptable.")
+    println("\nBaselines are algorithm-specific: legacy `ours` rows are teaching, while")
+    println("heuristic rows use kind `ours-heuristic`. Record with")
+    println("`run_large(algorithm = :", algorithm, ", record_baseline = true)`; replace")
+    println("a stale same-algorithm baseline with `refresh_baseline = true`. The other")
+    println("algorithm's history is left untouched.")
 end
 
 function shortest_norm_log2(B)
@@ -348,12 +369,14 @@ end
 
 function print_fused_split(t, total; extra_accounted::Real = 0.0,
                            extra_label::AbstractString = "")
-    total > 0 && t.time_fused > 0 || return nothing
-    @printf("      fusedQR %5.1f%%  = size-red %4.1f%%  reorth %4.1f%%  trailing %4.1f%%\n",
-            100 * t.time_fused / total,
-            100 * t.fused_split[Flatter.FUSED_TIME_REDUCE] / total,
-            100 * t.fused_split[Flatter.FUSED_TIME_REORTH] / total,
-            100 * t.fused_split[Flatter.FUSED_TIME_TRAILING] / total)
+    total > 0 || return nothing
+    if t.time_fused > 0
+        @printf("      fusedQR %5.1f%%  = size-red %4.1f%%  reorth %4.1f%%  trailing %4.1f%%\n",
+                100 * t.time_fused / total,
+                100 * t.fused_split[Flatter.FUSED_TIME_REDUCE] / total,
+                100 * t.fused_split[Flatter.FUSED_TIME_REORTH] / total,
+                100 * t.fused_split[Flatter.FUSED_TIME_TRAILING] / total)
+    end
     generic_accounted = t.time_fused + t.time_matmul + t.time_finalise + t.time_base +
                         t.time_compress + t.time_dense_qr + t.time_gc + t.time_setup +
                         t.time_push
@@ -417,6 +440,71 @@ function heuristic2_local_time(t)
            t.h2_time_compress + t.h2_time_apply
 end
 
+"CondUnknown outer-loop time disjoint from H2 and the generic driver."
+function cond_unknown_local_time(t)
+    return t.cond_time_extract + t.cond_time_size_reduce + t.cond_time_relative +
+           t.cond_time_apply + t.cond_time_sort
+end
+
+"Public irregular-entry work outside H2, CondUnknown and the generic driver."
+function irregular_entry_local_time(t)
+    return t.irregular_time_orientation + t.irregular_time_triangular_sr +
+           t.irregular_time_transform_compose + t.irregular_time_flip
+end
+
+function print_irregular_entry_split(t, total)
+    local_time = irregular_entry_local_time(t)
+    local_time > 0 || return nothing
+    @printf("        entry %.2fs (%.1f%% wall): orientation %.2f  triangular-SR %.2f  U-compose %.2f  flips %.2f  goal-exit %d\n",
+            local_time, 100 * local_time / total,
+            t.irregular_time_orientation, t.irregular_time_triangular_sr,
+            t.irregular_time_transform_compose, t.irregular_time_flip,
+            t.irregular_triangular_goal_exits)
+    return nothing
+end
+
+function print_cond_unknown_split(t, total)
+    t.cond_calls > 0 || return nothing
+    local_time = cond_unknown_local_time(t)
+    @printf("        CondUnknown %d call%s, %d refinement%s, rank %d, maxprec %d; %.2fs local (%.1f%% wall)\n",
+            t.cond_calls, t.cond_calls == 1 ? "" : "s",
+            t.cond_refinements, t.cond_refinements == 1 ? "" : "s",
+            t.cond_selected_rank, t.cond_max_precision, local_time,
+            100 * local_time / total)
+    @printf("           extract %.2f  surrogate-SR %.2f  relative %.2f  apply %.2f  sort %.2f\n",
+            t.cond_time_extract, t.cond_time_size_reduce, t.cond_time_relative,
+            t.cond_time_apply, t.cond_time_sort)
+    if t.cond_time_h2 > 0
+        @printf("           phase-2 child wall %.2fs (overlaps H2; diagnostic only)\n",
+                t.cond_time_h2)
+    end
+    return nothing
+end
+
+function print_large_telemetry(t, total; algorithm::Symbol = :heuristic)
+    entry_local = irregular_entry_local_time(t)
+    if algorithm === :heuristic
+        print_irregular_entry_split(t, total)
+        print_cond_unknown_split(t, total)
+        print_heuristic2_split(t, total)
+        print_heuristic3_split(t, total)
+        h2_local = heuristic2_local_time(t)
+        cond_local = cond_unknown_local_time(t)
+        extra = entry_local + h2_local + cond_local
+        label = cond_local > 0 ? "entry+H2+Cond-local" : "entry+H2-local"
+        print_fused_split(t, total; extra_accounted = extra, extra_label = label)
+        if t.time_recursion > 0
+            @printf("        recursive-call wall %.2fs (overlapping parent views; diagnostic only)\n",
+                    t.time_recursion)
+        end
+    else
+        print_irregular_entry_split(t, total)
+        print_fused_split(t, total; extra_accounted = entry_local,
+                          extra_label = "entry-local")
+    end
+    return nothing
+end
+
 function print_heuristic2_split(t, total)
     t.h2_calls > 0 || return nothing
     h2_total = heuristic2_local_time(t)
@@ -463,7 +551,7 @@ function schedule_compare(; cases = TILED_PROBE, seed::Integer = 1,
     # and produced two reported "speedups" that were entirely compilation.
     warm = Flatter.random_triangular_lattice(MersenneTwister(7), 24).basis
     for schedule in (:legacy, :split), tiled in (false, true)
-        Flatter.reduce_basis(warm; schedule = schedule, tiled = tiled,
+        Flatter.reduce_basis(warm; algorithm = :teaching, schedule = schedule, tiled = tiled,
                              want_profile = false)
     end
 
@@ -501,7 +589,7 @@ function schedule_compare(; cases = TILED_PROBE, seed::Integer = 1,
                 telemetry = Flatter.ReductionTelemetry()
                 try
                     attempt = @elapsed reduced, _, _ = Flatter.reduce_basis(
-                        bundle.basis; schedule = schedule, tiled = tiled,
+                        bundle.basis; algorithm = :teaching, schedule = schedule, tiled = tiled,
                         telemetry = telemetry, want_profile = false)
                     if attempt < elapsed
                         elapsed = attempt
@@ -547,14 +635,12 @@ end
 """
     heuristic2_compare(; cases = CHEAP_CASES, seed = 1, repeats = 3)
 
-Compare the existing teaching reducer with the opt-in heuristic dispatcher on
+Compare the retained teaching reducer with the default heuristic dispatcher on
 triangular/reoriented inputs, writing nothing to disk.
 
-This is deliberately separate from `run_large`: the latter is the stable
-reference benchmark whose cached `ours` rows belong to the teaching reducer.
-Until `CondUnknown` is ported, `algorithm=:heuristic` only supports the square
-triangular families, so the default comparison uses the two cheap 256-column
-cases.  Pass `cases = HEURISTIC2_LARGE_CASES` to add q-ary.
+This is the short two-family probe retained for iteration.  For the complete
+large comparison now that CondUnknown is available, use
+[`compare_large_algorithms`](@ref).
 """
 function heuristic2_compare(; cases = CHEAP_CASES, seed::Integer = 1,
                             repeats::Integer = 3)
@@ -628,20 +714,168 @@ function heuristic2_compare(; cases = CHEAP_CASES, seed::Integer = 1,
                 case.family, Base.size(bundle.basis, 2), teaching_time,
                 heuristic_time, speedup, plain_b1, heur_b1, quality)
         if heuristic_telemetry !== nothing
-            h2_local = heuristic2_local_time(heuristic_telemetry)
-            print_heuristic2_split(heuristic_telemetry, heuristic_time)
-            print_heuristic3_split(heuristic_telemetry, heuristic_time)
-            print_fused_split(heuristic_telemetry, heuristic_time;
-                              extra_accounted = h2_local, extra_label = "H2-local")
-            if heuristic_telemetry.time_recursion > 0
-                @printf("        recursive-call wall %.2fs (overlapping parent views; diagnostic only)\n",
-                        heuristic_telemetry.time_recursion)
-            end
+            print_large_telemetry(heuristic_telemetry, heuristic_time;
+                                  algorithm = :heuristic)
         end
     end
 
     println("\nNo reference rows are read or written.  A speedup above 1 favours the")
     println("Heuristic2 -> Heuristic3 dispatcher; quality must remain comparable.")
+end
+
+
+"""
+    compare_large_algorithms(; cases = LARGE_CASES, repeats = 1,
+                             force_fplll = false, skip_fplll = false)
+
+Run only the heuristic reducer and compare it with the cached teaching baseline
+and cached fpLLL result for the same exact basis.  If a teaching or fpLLL row is
+missing it is measured once for this comparison, but it is NOT written to disk.
+The function itself never changes `reference_times.tsv`.
+
+It returns the heuristic measurements.  Keep the Julia process open and pass
+that result to [`record_heuristic_baseline!`](@ref) if, after inspecting the
+comparison, these are the measurements you want to preserve as the new
+heuristic baseline.  This avoids paying for q-ary/relation twice.
+"""
+function compare_large_algorithms(; cases = LARGE_CASES, repeats::Integer = 1,
+                                  force_fplll::Bool = false,
+                                  skip_fplll::Bool = false,
+                                  verbose::Bool = false, seed::Integer = 1)
+    repeats >= 1 || throw(ArgumentError("repeats must be positive"))
+    machine = machine_tag()
+    entries = load_references()
+    families = Dict(f.name => f for f in Flatter.lattice_families())
+
+    # Compile Phase 1/CondUnknown and H2/H3 before the first heuristic timing.
+    _warm_large_benchmark!(:heuristic)
+
+    println("Large teaching vs heuristic comparison, dimension ~256. Machine: ", machine)
+    println("Teaching and fpLLL use cached rows when available; nothing is written.\n")
+    @printf("%-18s %5s %10s %10s %8s %10s %9s %10s %10s %10s %s\n",
+            "family", "dim", "teach(s)", "heur(s)", "vs teach", "fplll(s)",
+            "vs fplll", "teach b1", "heur b1", "fplll b1", "quality")
+    println(repeat("-", 132))
+
+    results = NamedTuple[]
+
+    for case in cases
+        family = get(families, case.family, nothing)
+        family === nothing && continue
+        bundle = family.generate(MersenneTwister(hash((seed, case.family, case.size))),
+                                 case.size)
+        tag = basis_tag(bundle.basis)
+        columns = Base.size(bundle.basis, 2)
+
+        teaching = find_reference(entries, machine, case.family, case.size, "ours", tag)
+        if teaching === nothing
+            println("    measuring uncached teaching reference for ", case.family,
+                    " (comparison only; not saved)")
+            GC.gc()
+            teach_time = @elapsed teach_reduced, _, _ = Flatter.reduce_basis(
+                bundle.basis; algorithm = :teaching, want_profile = false)
+            teaching = Reference(machine, case.family, case.size, "ours", tag,
+                                 teach_time, shortest_norm_log2(teach_reduced), "")
+        end
+
+        fp = force_fplll ? nothing :
+             find_reference(entries, machine, case.family, case.size, "fplll", tag)
+        if fp === nothing && skip_fplll
+            fp = Reference(machine, case.family, case.size, "fplll", tag,
+                           NaN, NaN, "")
+        elseif fp === nothing
+            println("    measuring uncached fpLLL reference for ", case.family,
+                    " (comparison only; not saved)")
+            GC.gc()
+            fp_time = @elapsed fp_reduced, _ = Flatter.fplll_reduce(bundle.basis)
+            fp = Reference(machine, case.family, case.size, "fplll", tag,
+                           fp_time, shortest_norm_log2(fp_reduced), "")
+        end
+
+        heuristic_time = Inf
+        heuristic_norm = NaN
+        heuristic_info = nothing
+        heuristic_telemetry = nothing
+        for _ in 1:Int(repeats)
+            GC.gc()
+            telemetry = Flatter.ReductionTelemetry()
+            local reduced, info
+            attempt = @elapsed reduced, _, info = Flatter.reduce_basis(
+                bundle.basis; algorithm = :heuristic,
+                telemetry = telemetry, want_profile = false)
+            if attempt < heuristic_time
+                heuristic_time = attempt
+                heuristic_norm = shortest_norm_log2(reduced)
+                heuristic_info = info
+                heuristic_telemetry = telemetry
+            end
+        end
+
+        vs_teach = teaching.seconds / heuristic_time
+        vs_fp = isnan(fp.seconds) ? "-" :
+                heuristic_time <= fp.seconds ?
+                @sprintf("%.1fx us", fp.seconds / heuristic_time) :
+                @sprintf("%.1fx them", heuristic_time / fp.seconds)
+        quality = if heuristic_norm <= teaching.norm_log2 + 1e-9
+            ""
+        elseif heuristic_info !== nothing && heuristic_info.goal_met
+            "GOAL MET"
+        else
+            "QUALITY WORSE"
+        end
+
+        @printf("%-18s %5d %10.2f %10.2f %7.2fx %10.2f %9s %10.2f %10.2f %10.2f %s\n",
+                case.family, columns, teaching.seconds, heuristic_time, vs_teach,
+                fp.seconds, vs_fp, teaching.norm_log2, heuristic_norm,
+                fp.norm_log2, quality)
+
+        heuristic_telemetry !== nothing &&
+            print_large_telemetry(heuristic_telemetry, heuristic_time;
+                                  algorithm = :heuristic)
+        if verbose && heuristic_telemetry !== nothing
+            println()
+            show(stdout, heuristic_telemetry)
+            @printf("      heuristic elapsed      : %.3f s\n\n", heuristic_time)
+        end
+
+        push!(results, (machine = machine, family = case.family, size = case.size,
+                        basis = tag, seconds = heuristic_time,
+                        norm_log2 = heuristic_norm,
+                        recorded = string(Dates.now())))
+    end
+
+    println("\nNo baseline rows were written.  `vs teach > 1` favours the heuristic path.")
+    println("If these exact heuristic measurements are the baseline you want to keep,")
+    println("call `record_heuristic_baseline!(results)` in this same Julia process.")
+    return results
+end
+
+"""
+    record_heuristic_baseline!(results; refresh = false)
+
+Append measurements returned by [`compare_large_algorithms`](@ref) as
+`ours-heuristic` baseline rows.  Existing teaching (`ours`) rows are never
+changed.  With `refresh=false`, an existing heuristic baseline for the same
+machine/family/basis is left alone; `refresh=true` appends a new row and the
+usual last-row-wins rule makes it current.
+"""
+function record_heuristic_baseline!(results; refresh::Bool = false)
+    entries = load_references()
+    saved = 0
+    for r in results
+        existing = find_reference(entries, r.machine, r.family, r.size,
+                                  "ours-heuristic", r.basis)
+        if existing !== nothing && !refresh
+            println("    keeping existing heuristic baseline for ", r.family,
+                    " (use refresh = true to supersede it)")
+            continue
+        end
+        save_reference(Reference(r.machine, r.family, r.size, "ours-heuristic",
+                                 r.basis, r.seconds, r.norm_log2, r.recorded))
+        saved += 1
+    end
+    println("Recorded ", saved, " heuristic baseline row", saved == 1 ? "." : "s.")
+    return saved
 end
 
 """

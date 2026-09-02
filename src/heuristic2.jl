@@ -338,15 +338,18 @@ function _heuristic2_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
         telemetry.h2_calls += 1
     end
 
-    original = Matrix{T}(B)
     entry_profile = [_log2_abs(B[i, i]) for i in 1:n]
     profile = copy(entry_profile)
     if goal_check(goal, profile)
+        # Do not materialise a second copy of the whole basis on the common
+        # entry-goal fast path.  `original` is needed only by the final exact
+        # validation after H2 has actually changed the basis.
         _set_identity!(U)
         return B, U, (iterations = 0, goal_met = true,
                       stopped = :goal, profile = profile)
     end
 
+    original = Matrix{T}(B)
     compression_started = _tick()
     working, total_shift, precision = _h2_initial_compress(B, profile, aggressive)
     telemetry === nothing || (telemetry.h2_time_compress += _tock(compression_started))

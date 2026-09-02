@@ -567,7 +567,7 @@ end
             # broken invariant; the larger ones are here to check they finish.
             reduced, U, info = rr_timed("knapsack n=$n $sched tiled=$t") do
                 Flatter.reduce_basis(
-                    B0; schedule = sched, tiled = t, base_cutoff = 8,
+                    B0; algorithm = :teaching, schedule = sched, tiled = t, base_cutoff = 8,
                     max_iterations = 30, want_profile = false,
                     validate = (n <= 32), telemetry = telemetry)
             end
@@ -590,7 +590,7 @@ end
                 bundle = Flatter.knapsack_lattice(MersenneTwister(hash((n, :knap))), n)
                 telemetry = Flatter.ReductionTelemetry()
                 rr_timed("branching n=$n $sched") do
-                    Flatter.reduce_basis(bundle.basis; schedule = sched,
+                    Flatter.reduce_basis(bundle.basis; algorithm = :teaching, schedule = sched,
                                          tiled = false, base_cutoff = 8,
                                          max_iterations = 30,
                                          want_profile = false,
@@ -619,7 +619,7 @@ end
             try
                 info = rr_timed("cap check n=$n $sched tiled=$t") do
                     _, _, result = Flatter.reduce_basis(
-                        bundle.basis; schedule = sched, tiled = t,
+                        bundle.basis; algorithm = :teaching, schedule = sched, tiled = t,
                         base_cutoff = 8, max_iterations = 30,
                         want_profile = false)
                     result

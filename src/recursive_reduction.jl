@@ -312,6 +312,19 @@ Base.@kwdef mutable struct ReductionTelemetry
     cond_time_apply::Float64 = 0.0
     cond_time_sort::Float64 = 0.0
 
+    # Public irregular-entry work which sits outside the recursive driver.
+    # These timers are mutually disjoint and can be added to the H2/CondUnknown
+    # local timers for wall-clock accounting.  Child calls themselves are not
+    # timed here because H2/CondUnknown already account for their own work.
+    irregular_calls::Int = 0
+    irregular_triangular_calls::Int = 0
+    irregular_triangular_goal_exits::Int = 0
+    irregular_dense_calls::Int = 0
+    irregular_time_orientation::Float64 = 0.0
+    irregular_time_triangular_sr::Float64 = 0.0
+    irregular_time_transform_compose::Float64 = 0.0
+    irregular_time_flip::Float64 = 0.0
+
     time_fused::Float64 = 0.0
     time_matmul::Float64 = 0.0
     time_compress::Float64 = 0.0
@@ -363,6 +376,16 @@ function Base.show(io::IO, t::ReductionTelemetry)
                         round(t.fused_split[slot]; digits = 3), " s (",
                         round(100 * t.fused_split[slot] / t.time_fused; digits = 1), "%)")
         end
+    end
+    if t.irregular_calls > 0
+        println(io, "  irregular entries        : ", t.irregular_calls,
+                    " (triangular ", t.irregular_triangular_calls,
+                    ", dense ", t.irregular_dense_calls, ")")
+        println(io, "    orientation detection  : ", round(t.irregular_time_orientation; digits = 3), " s")
+        println(io, "    triangular size reduce : ", round(t.irregular_time_triangular_sr; digits = 3), " s")
+        println(io, "    entry-goal fast exits  : ", t.irregular_triangular_goal_exits)
+        println(io, "    entry U composition    : ", round(t.irregular_time_transform_compose; digits = 3), " s")
+        println(io, "    orientation flips      : ", round(t.irregular_time_flip; digits = 3), " s")
     end
     if t.cond_calls > 0
         println(io, "  CondUnknown calls        : ", t.cond_calls)
@@ -1279,9 +1302,10 @@ Reduction *quality* is what the goal and precision govern.
 
 # Contract
 
-The basis must be square, upper triangular and nonsingular. Reducing a general
-basis means first bringing it to that form, which flatter does in `Irregular`
-and `CondUnknown`; neither is ported here.
+The basis passed directly to this internal driver must be square, upper
+triangular and nonsingular.  General callers should use [`reduce_basis`](@ref),
+whose default heuristic dispatcher ports flatter's `Irregular`/`CondUnknown`
+entry path before handing triangular subproblems to this driver.
 """
 function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                          goal::Union{Nothing, ReductionGoal} = nothing,

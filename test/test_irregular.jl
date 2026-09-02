@@ -95,26 +95,28 @@ end
         end
     end
 
-    @testset "opt-in heuristic dispatcher" begin
-        @testset "triangular input starts in Heuristic2" begin
-            rng = MersenneTwister(0xA212)
-            B0 = rr_triangular_basis(rng, 8; spread = 50)
+    @testset "default heuristic dispatcher" begin
+        @testset "triangular input enters Heuristic2 when the entry goal fails" begin
+            n = 8
+            B0 = zeros(BigInt, n, n)
+            for j in 1:n
+                # Force a steep decreasing profile so the dispatcher cannot
+                # take the entry-goal shortcut.
+                B0[j, j] = big(1) << (20 + 12 * (n - j))
+            end
             telemetry = Flatter.ReductionTelemetry()
 
             reduced, U, info = Flatter.reduce_basis(
-                B0; algorithm = :heuristic, base_cutoff = 4,
+                B0; base_cutoff = 4,
                 max_iterations = 20, telemetry = telemetry)
 
             @test rr_check_exact(B0, reduced, U)
             @test info.path === :triangular
-            # The public dispatcher only needs to enter Heuristic2 here.  This
-            # fixture can already satisfy the RHF goal at H2 entry, in which
-            # case the phase-2 cycle (and hence the phase-3 handoff) is skipped.
-            # Dedicated Heuristic2 tests exercise the full L/R/all cycle.
+            @test telemetry.irregular_triangular_goal_exits == 0
             @test telemetry.h2_calls >= 1
         end
 
-        @testset "entry size reduction precedes Heuristic2" begin
+        @testset "entry-goal fast path preserves size reduction" begin
             # A flat diagonal profile already meets the default heuristic goal,
             # so H2 itself should return immediately.  flatter nevertheless
             # performs triangular size reduction in Irregular before entering
@@ -130,16 +132,24 @@ end
             telemetry = Flatter.ReductionTelemetry()
 
             reduced, U, info = Flatter.reduce_basis(
-                B0; algorithm = :heuristic, base_cutoff = 2,
+                B0; base_cutoff = 2,
                 max_iterations = 20, telemetry = telemetry)
 
             @test rr_check_exact(B0, reduced, U)
             @test reduced == expected
             @test info.goal_met
-            @test telemetry.h2_calls == 1
+            @test telemetry.h2_calls == 0
             @test telemetry.h2_left_steps == 0
             @test telemetry.h2_right_steps == 0
             @test telemetry.h2_all_steps == 0
+            @test telemetry.irregular_calls == 1
+            @test telemetry.irregular_triangular_calls == 1
+            @test telemetry.irregular_triangular_goal_exits == 1
+            @test telemetry.irregular_dense_calls == 0
+            @test telemetry.irregular_time_triangular_sr >= 0
+            # The entry transform is already U_sr; there must be no expensive
+            # full multiplication by an identity H2 transform.
+            @test telemetry.irregular_time_transform_compose == 0.0
         end
 
         @testset "reorientation is transparent to Heuristic2" begin
@@ -149,7 +159,7 @@ end
             telemetry = Flatter.ReductionTelemetry()
 
             reduced, U, info = Flatter.reduce_basis(
-                lower; algorithm = :heuristic, base_cutoff = 4,
+                lower; base_cutoff = 4,
                 max_iterations = 20, telemetry = telemetry)
 
             @test rr_check_exact(lower, reduced, U)
@@ -162,7 +172,7 @@ end
             @test Flatter.triangular_orientation(dense) === nothing
             telemetry = Flatter.ReductionTelemetry()
             reduced, U, info = Flatter.reduce_basis(
-                dense; algorithm = :heuristic, base_cutoff = 2,
+                dense; base_cutoff = 2,
                 max_iterations = 20, telemetry = telemetry)
             @test rr_check_exact(dense, reduced, U)
             @test info.path === :dense
@@ -174,7 +184,7 @@ end
             BigInt[3 1; 0 5]; algorithm = :unknown)
     end
 
-    @testset "dense input" begin
+    @testset "teaching dense input" begin
         @testset "exact contract, n = $n" for n in (4, 6, 8, 12)
             rng = MersenneTwister(hash((n, :dense)))
             triangular = rr_triangular_basis(rng, n; spread = 40)
@@ -183,7 +193,7 @@ end
 
             @test Flatter.triangular_orientation(B0) === nothing   # genuinely dense
 
-            reduced, U, info = Flatter.reduce_basis(B0)
+            reduced, U, info = Flatter.reduce_basis(B0; algorithm = :teaching)
 
             @test rr_check_exact(B0, reduced, U)
             @test info.path === :dense
@@ -199,8 +209,8 @@ end
                 triangular = rr_triangular_basis(rng, n; spread = 30)
                 scrambled = triangular * ir_random_unimodular(rng, n)
 
-                direct, _, _ = Flatter.reduce_basis(triangular)
-                viadense, _, _ = Flatter.reduce_basis(scrambled)
+                direct, _, _ = Flatter.reduce_basis(triangular; algorithm = :teaching)
+                viadense, _, _ = Flatter.reduce_basis(scrambled; algorithm = :teaching)
 
                 # Same lattice, so the determinants agree exactly.
                 @test abs(rr_det(viadense)) == abs(rr_det(direct))
@@ -215,7 +225,7 @@ end
             n = 8
             B0 = rr_triangular_basis(rng, n; spread = 40) * ir_random_unimodular(rng, n)
             for rounds in (1, 2, 6)
-                reduced, U, info = Flatter.reduce_basis(B0; max_rounds = rounds)
+                reduced, U, info = Flatter.reduce_basis(B0; algorithm = :teaching, max_rounds = rounds)
                 @test rr_check_exact(B0, reduced, U)
                 @test info.rounds <= rounds
             end
@@ -225,7 +235,7 @@ end
     # The dense path starts at the QR precision policy rather than the reduction
     # one, and doubles when the factorisation comes back degenerate. Both the
     # cheap start and the recovery need to hold.
-    @testset "dense precision discovery" begin
+    @testset "teaching dense precision discovery" begin
         @testset "starts well below the reduction policy" begin
             rng = MersenneTwister(0x9EC1)
             B = BigInt[rand(rng, -100:100) for _ in 1:128, _ in 1:128]
@@ -343,11 +353,10 @@ end
             singular = BigInt[1 2 3; 2 4 6; 1 1 1]     # row 2 is twice row 1
             @test iszero(rr_det(singular))
             @test_throws ArgumentError Flatter._dense_approximation(singular, 3, 3)
-            @test_throws ArgumentError Flatter.reduce_basis(singular)
+            @test_throws ArgumentError Flatter.reduce_basis(singular; algorithm = :teaching)
 
             reduced, U, info = Flatter.reduce_basis(
-                singular; algorithm = :heuristic, base_cutoff = 2,
-                max_iterations = 20)
+                singular; base_cutoff = 2, max_iterations = 20)
             @test rr_check_exact(singular, reduced, U)
             @test info.rank == 2
             @test all(iszero, reduced[:, 3])

@@ -32,8 +32,8 @@
 #
 # Contract: the input basis must be square, upper triangular, and nonsingular.
 # That is what the recursion produces internally, and what flatter's `Proved2`
-# and `Proved3` require. Bringing a general basis to that form is the job of
-# `Irregular`/`CondUnknown`, which are not ported.
+# and `Proved3` require. General input is handled one level up by `Irregular`;
+# its heuristic dense route now uses the port of `CondUnknown`.
 
 const DEFAULT_REDUCTION_RHF = 1.02
 const DEFAULT_REDUCTION_MAX_ITERATIONS = 120
@@ -297,6 +297,21 @@ Base.@kwdef mutable struct ReductionTelemetry
     h2_time_compress::Float64 = 0.0
     h2_time_apply::Float64 = 0.0
 
+    # CondUnknown precision/rank discovery.  `cond_time_h2` is diagnostic and
+    # overlaps the H2/generic timers below; the other CondUnknown times are
+    # outer-loop work and are disjoint from the recursive driver.
+    cond_calls::Int = 0
+    cond_refinements::Int = 0
+    cond_precision_changes::Int = 0
+    cond_selected_rank::Int = 0
+    cond_max_precision::Int = 0
+    cond_time_extract::Float64 = 0.0
+    cond_time_size_reduce::Float64 = 0.0
+    cond_time_relative::Float64 = 0.0
+    cond_time_h2::Float64 = 0.0
+    cond_time_apply::Float64 = 0.0
+    cond_time_sort::Float64 = 0.0
+
     time_fused::Float64 = 0.0
     time_matmul::Float64 = 0.0
     time_compress::Float64 = 0.0
@@ -348,6 +363,19 @@ function Base.show(io::IO, t::ReductionTelemetry)
                         round(t.fused_split[slot]; digits = 3), " s (",
                         round(100 * t.fused_split[slot] / t.time_fused; digits = 1), "%)")
         end
+    end
+    if t.cond_calls > 0
+        println(io, "  CondUnknown calls        : ", t.cond_calls)
+        println(io, "    refinements            : ", t.cond_refinements,
+                    " (precision changes ", t.cond_precision_changes, ")")
+        println(io, "    selected rank          : ", t.cond_selected_rank)
+        println(io, "    maximum precision      : ", t.cond_max_precision, " bits")
+        println(io, "    extract/select         : ", round(t.cond_time_extract; digits = 3), " s")
+        println(io, "    surrogate size reduce  : ", round(t.cond_time_size_reduce; digits = 3), " s")
+        println(io, "    surrogate relative SR  : ", round(t.cond_time_relative; digits = 3), " s")
+        println(io, "    phase-2 child wall     : ", round(t.cond_time_h2; digits = 3), " s (overlaps H2)")
+        println(io, "    exact transform apply  : ", round(t.cond_time_apply; digits = 3), " s")
+        println(io, "    exact norm sorting     : ", round(t.cond_time_sort; digits = 3), " s")
     end
     if t.h2_calls > 0
         println(io, "  Heuristic2 calls         : ", t.h2_calls)
@@ -1339,8 +1367,13 @@ function lattice_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
             _reduce_two_columns!(B, U, Int(schoenhage_threshold))
             telemetry.time_base += _tock(started)
         end
+        # Gauss/Lagrange reduction returns a general reduced basis, not an
+        # upper-triangular one.  In particular, a column swap can put zeros on
+        # the ordinary matrix diagonal even though the basis is nonsingular.
+        # Report its true Gram-Schmidt profile, just as for the fplll base case.
         return B, U, (iterations = 0, goal_met = true, stopped = :base_case,
-                      profile = [_log2_abs(B[i, i]) for i in 1:n])
+                      profile = _reported_profile(B, aggressive, want_profile,
+                                                  Int(_depth), telemetry))
     end
 
     # --- initialise and compress -------------------------------------------

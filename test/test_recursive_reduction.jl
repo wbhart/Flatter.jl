@@ -205,6 +205,22 @@ end
             @test 2 * abs(inner) <= first_norm
         end
 
+        @testset "two-column info.profile is Gram-Schmidt after a swap" begin
+            # The shorter second column forces Gauss reduction to swap the
+            # columns.  The returned basis is then general (indeed its ordinary
+            # diagonal is zero), so reading B[i,i] as an R diagonal would
+            # incorrectly report -Inf and poison recursive precision selection.
+            B0 = BigInt[100 0; 0 1]
+            B, U, info = Flatter.lattice_reduce(B0; want_profile = true)
+
+            @test rr_check_exact(B0, B, U)
+            @test all(iszero(B[i, i]) for i in 1:2)
+            true_profile = Flatter._basis_profile(B, false)
+            @test all(isfinite, info.profile)
+            @test length(info.profile) == 2
+            @test info.profile ≈ true_profile rtol = 0 atol = 1e-12
+        end
+
         @testset "finds the shortest vector in 2D" begin
             # Gauss reduction is exact in two dimensions: the first output
             # vector is a shortest nonzero lattice vector.

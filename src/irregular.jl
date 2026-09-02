@@ -11,26 +11,22 @@
 #     flipped into upper triangular form, reduced, and flipped back;
 #   * anything else takes the dense path below.
 #
-# THE DENSE PATH DIVERGES FROM FLATTER. flatter sends a non-triangular basis to
-# phase 1, which -- as the comment in `Irregular::solve_rectangular` says -- is
-# deliberately routed to `CondUnknown` because the condition number is unknown.
-# `CondUnknown` is a substantial piece of machinery: column selection by
-# orthogonal component, rank detection, and an iterative precision-doubling
-# loop. None of it is ported.
+# There are now two dense paths.  `algorithm=:heuristic` follows flatter: a
+# non-triangular basis enters phase 1 with unknown condition number and is sent
+# to CondUnknown, which discovers a resolvable independent prefix, drives it
+# through phase 2, and increases precision until every remaining dependency is
+# represented by an exact zero column.  Rank-deficient input is therefore
+# supported on the heuristic path.
 #
-# Instead the dense path uses what this package already has. Any unimodular
-# transform is valid for any basis, so it suffices to find a good one:
+# `algorithm=:teaching` keeps the older QR-and-round route because it is useful
+# as an independent baseline and is substantially simpler to study:
 #
-#   1. QR-factor B and round its R factor to an integer triangular lattice,
-#      which approximates B's Gram-Schmidt structure at a scale chosen so no
-#      diagonal entry vanishes;
+#   1. QR-factor B and round its R factor to an integer triangular lattice;
 #   2. reduce that integer lattice with the recursive driver;
 #   3. apply the resulting unimodular transform to B;
-#   4. repeat, since the second round's factorisation is of an already better
-#      basis and so approximates it more usefully.
+#   4. repeat on the improved exact basis.
 #
-# The cost is that rank-deficient input is detected and reported rather than
-# handled -- that is what `CondUnknown` exists for.
+# The teaching dense path still requires full column rank.
 
 const DEFAULT_DENSE_ROUNDS = 4
 
@@ -329,10 +325,10 @@ together with `rounds` (dense path only) and the fields
 Keyword arguments beyond those of [`lattice_reduce!`](@ref):
 
   * `algorithm`  -- `:teaching` (the existing reducer) or `:heuristic` (flatter's
-                    heuristic phase dispatcher where it has been ported).  The
-                    heuristic path currently accepts triangular/reoriented
-                    bases and starts them in Heuristic2; dense input still needs
-                    `CondUnknown` and is rejected explicitly.
+                    heuristic phase dispatcher).  Triangular/reoriented input
+                    enters Heuristic2 after exact size reduction; dense input
+                    enters CondUnknown and is then handed to Heuristic2 as its
+                    rank/condition information becomes available.
   * `max_rounds` -- iterations of the dense path. Each round re-factorises an
                     already improved basis, so its integer approximation is a
                     better one; the loop stops early when a round produces the
@@ -340,9 +336,9 @@ Keyword arguments beyond those of [`lattice_reduce!`](@ref):
 
 # Rank
 
-The basis must have full column rank. A rank-deficient one is reported rather
-than handled; flatter's `CondUnknown` is what deals with that case and is not
-ported.
+The teaching dense path requires full column rank.  The heuristic dense path
+uses CondUnknown and supports rank-deficient input, moving exact zero
+dependencies to the right of the returned basis.
 """
 function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                        algorithm::Symbol = :teaching,
@@ -402,9 +398,9 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     end
 
     if algorithm === :heuristic
-        throw(ArgumentError(
-            "algorithm=:heuristic currently supports triangular/reoriented bases only; " *
-            "dense input needs CondUnknown, which is not yet ported"))
+        _, _, info = cond_unknown_reduce!(B, U; aggressive = aggressive,
+                                          telemetry = telemetry, kwargs...)
+        return B, U, (; path = :dense, rounds = 0, info...)
     end
 
     return _reduce_dense!(B, U, Int(max_rounds), aggressive, telemetry,

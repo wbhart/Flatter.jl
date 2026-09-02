@@ -260,6 +260,12 @@ function heuristic2_local_time(t)
            t.h2_time_compress + t.h2_time_apply
 end
 
+"CondUnknown outer-loop time disjoint from both H2 and the generic driver."
+function cond_unknown_local_time(t)
+    return t.cond_time_extract + t.cond_time_size_reduce + t.cond_time_relative +
+           t.cond_time_apply + t.cond_time_sort
+end
+
 "Where the time went, as a share of the driver's wall clock."
 function print_time_breakdown(r)
     t = r.telemetry
@@ -272,7 +278,8 @@ function print_time_breakdown(r)
                         t.time_finalise + t.time_dense_qr + t.time_profile +
                         t.time_gc + t.time_setup + t.time_push
     h2_local = heuristic2_local_time(t)
-    accounted = generic_accounted + h2_local
+    cond_local = cond_unknown_local_time(t)
+    accounted = generic_accounted + h2_local + cond_local
     @printf("    fusedQR %5.1f%%  matmul %5.1f%%  compress %5.1f%%  base %5.1f%%  finalise %5.1f%%\n",
             100 * t.time_fused / total, 100 * t.time_matmul / total,
             100 * t.time_compress / total, 100 * t.time_base / total,
@@ -296,19 +303,30 @@ function print_time_breakdown(r)
                 t.profile_calls == 1 ? "" : "s")
     end
     if t.dense_rounds > 0
-        # The dense path's own factorisation, paid once per round and outside
-        # the driver entirely.
-        @printf("    dense path: %d rounds, QR %5.1f%% of total\n",
+        # The teaching dense path's own factorisation, paid once per round and
+        # outside the driver entirely.
+        @printf("    teaching dense path: %d rounds, QR %5.1f%% of total\n",
                 t.dense_rounds, 100 * t.time_dense_qr / total)
+    end
+    if t.cond_calls > 0
+        @printf("    CondUnknown: %d refinement%s, rank %d, maxprec %d; local %5.1f%% (extract %4.1f%%, size-red %4.1f%%, relative %4.1f%%, apply %4.1f%%, sort %4.1f%%)\n",
+                t.cond_refinements, t.cond_refinements == 1 ? "" : "s",
+                t.cond_selected_rank, t.cond_max_precision,
+                100 * cond_local / total,
+                100 * t.cond_time_extract / total,
+                100 * t.cond_time_size_reduce / total,
+                100 * t.cond_time_relative / total,
+                100 * t.cond_time_apply / total,
+                100 * t.cond_time_sort / total)
     end
     # H2's local representation/update kernels are disjoint from the generic
     # recursive-driver timers above.  Include them before calling anything
     # residual; H3 update time is already inside `time_fused` and must not be
     # added again.
-    if t.h2_calls > 0
-        @printf("    H2 local %5.1f%%  accounted %5.1f%% = generic %5.1f%% + H2-local %5.1f%%; residual %5.1f%%\n",
-                100 * h2_local / total, 100 * accounted / total,
-                100 * generic_accounted / total, 100 * h2_local / total,
+    if t.h2_calls > 0 || t.cond_calls > 0
+        @printf("    accounted %5.1f%% = generic %5.1f%% + H2-local %5.1f%% + CondUnknown-local %5.1f%%; residual %5.1f%%\n",
+                100 * accounted / total, 100 * generic_accounted / total,
+                100 * h2_local / total, 100 * cond_local / total,
                 100 * max(0.0, 1 - accounted / total))
     elseif accounted < 0.75 * total
         # Anything unaccounted is worth seeing: it has hidden a dominant cost twice.
@@ -385,6 +403,11 @@ function warm_up(; algorithm::Symbol = :teaching)
                              algorithm = :heuristic, want_profile = false)
         # Also compile the already-upper-triangular entry branch.
         Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
+                             algorithm = :heuristic, want_profile = false)
+        # And the phase-1 CondUnknown path, which is independent of both
+        # triangular entry branches.  A tiny dense case is enough to compile
+        # selection, surrogate reduction and the H2 handoff.
+        Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
                              algorithm = :heuristic, want_profile = false)
     end
     return nothing
@@ -524,30 +547,30 @@ end
 # Running the file directly does the default sweep. Small sizes first: if the
 # driver is going to stall it should do so cheaply.
 
-const HEURISTIC2_STANDARD_FAMILIES =
-    ("random-triangular", "spread", "knapsack", "q-ary")
+const HEURISTIC_STANDARD_FAMILIES = Tuple(f.name for f in Flatter.lattice_families())
 
 """
-    run_heuristic2_standard(; sizes=nothing, seed=1, kwargs...) -> Vector
+    run_heuristic_standard(; sizes=nothing, seed=1, kwargs...) -> Vector
 
-Run the ordinary benchmark harness through the currently ported heuristic
-dispatcher, but only on families whose input can already enter Phase 2 faithfully.
-
-The supported set is `random-triangular`, `spread`, `knapsack` (after automatic
-reorientation), and `q-ary`.  `scrambled` and `ideal` need `CondUnknown`;
-`relation` is rectangular and also needs the general-input path.  Keeping this
-as a separate entry point prevents an incomplete heuristic dispatcher from
-quietly becoming the meaning of the normal `run_all()` benchmark.
+Run the ordinary benchmark harness through the ported heuristic dispatcher.
+Triangular/reorientable families enter Phase 2 directly; genuinely dense and
+rectangular families enter CondUnknown first.  Heuristic1 is still absent, but
+that is not on the default unknown-condition route exercised by these generated
+inputs.
 """
-function run_heuristic2_standard(; sizes = nothing, seed::Integer = 1, kwargs...)
+function run_heuristic_standard(; sizes = nothing, seed::Integer = 1, kwargs...)
     warm_up(; algorithm = :heuristic)
     results = []
-    for name in HEURISTIC2_STANDARD_FAMILIES
+    for name in HEURISTIC_STANDARD_FAMILIES
         append!(results, run_family(name, sizes; seed = seed, algorithm = :heuristic,
                                     warm = false, kwargs...))
     end
     return results
 end
+
+# Backwards-compatible name from the H2-only stage of the port.  Now that
+# CondUnknown exists there is no reason to omit the dense families.
+run_heuristic2_standard(; kwargs...) = run_heuristic_standard(; kwargs...)
 
 """
     precision_tradeoff(; sizes, seed)

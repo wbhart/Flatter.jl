@@ -18,6 +18,7 @@ include("recursive_reduction.jl") # very basic flatter recursion
 include("irregular.jl") # support "irregular" lattices
 include("heuristic3.jl")
 include("heuristic2.jl")
+include("cond_unknown.jl")
 
 include("lattices/generators.jl") # generate lattices of different kinds for benchmarking
 

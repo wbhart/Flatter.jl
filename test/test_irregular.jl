@@ -157,10 +157,17 @@ end
             @test telemetry.h2_calls >= 1
         end
 
-        @testset "dense input waits for CondUnknown" begin
+        @testset "dense input enters CondUnknown" begin
             dense = BigInt[3 1 2; 4 5 6; 7 8 10]
             @test Flatter.triangular_orientation(dense) === nothing
-            @test_throws ArgumentError Flatter.reduce_basis(dense; algorithm = :heuristic)
+            telemetry = Flatter.ReductionTelemetry()
+            reduced, U, info = Flatter.reduce_basis(
+                dense; algorithm = :heuristic, base_cutoff = 2,
+                max_iterations = 20, telemetry = telemetry)
+            @test rr_check_exact(dense, reduced, U)
+            @test info.path === :dense
+            @test info.rank == 3
+            @test telemetry.cond_calls == 1
         end
 
         @test_throws ArgumentError Flatter.reduce_basis(
@@ -332,11 +339,18 @@ end
             @test all(!iszero(approximation[i, i]) for i in 1:n)
         end
 
-        @testset "a rank deficient basis is reported, not looped on" begin
+        @testset "rank deficiency: teaching reports, heuristic resolves" begin
             singular = BigInt[1 2 3; 2 4 6; 1 1 1]     # row 2 is twice row 1
             @test iszero(rr_det(singular))
             @test_throws ArgumentError Flatter._dense_approximation(singular, 3, 3)
             @test_throws ArgumentError Flatter.reduce_basis(singular)
+
+            reduced, U, info = Flatter.reduce_basis(
+                singular; algorithm = :heuristic, base_cutoff = 2,
+                max_iterations = 20)
+            @test rr_check_exact(singular, reduced, U)
+            @test info.rank == 2
+            @test all(iszero, reduced[:, 3])
         end
     end
 

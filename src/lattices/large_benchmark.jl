@@ -56,6 +56,7 @@ const LARGE_CASES = [
     (family = "random-triangular", size = 256),
     (family = "scrambled",         size = 256),
     (family = "knapsack",          size = 255),
+    (family = "h1-known-cond",     size = 256),
     (family = "q-ary",             size = 128),
     (family = "relation",          size = 255),
 ]
@@ -68,6 +69,15 @@ iterating without paying for the full set each time.
 const CHEAP_CASES = [
     (family = "random-triangular", size = 256),
     (family = "knapsack",          size = 255),
+]
+
+# A cheap dedicated phase-1 Heuristic1 probe.  The normal LARGE_CASES include
+# the same construction at dimension 256; this 128-dimensional version remains
+# useful for quick H1-only regression checks.  Unlike the ordinary dense
+# families, it supplies a rigorous positive condition bound and therefore
+# deliberately selects Heuristic1 instead of CondUnknown.
+const HEURISTIC1_CASES = [
+    (family = "h1-known-cond", size = 128),
 ]
 
 # Historical subset used while only H2/H3 were available.  CondUnknown now
@@ -127,6 +137,39 @@ end
 
 "A hash of the basis, so a changed generator invalidates its own cached rows."
 basis_tag(B) = string(hash(B); base = 16)
+
+"""
+    heuristic1_known_condition_lattice(rng, n) -> NamedTuple
+
+A dense square integer basis with an exact, cheap condition-number bound for
+exercising Heuristic1.  Let `v` have random entries in `{+1, -1}` and set
+
+    B = I + v*v'.
+
+`B` is symmetric positive definite.  Its eigenvalues, hence singular values,
+are `1` with multiplicity `n-1` and `n+1` in the direction `v`.  Consequently
+`cond_2(B) = n+1`; for a square QR factorisation `B = Q*R`, orthogonality of `Q`
+gives the same `cond_2(R)`.  The returned `log_cond` is therefore a genuine
+upper bound, nudged upward by one Float64 ulp so rounding cannot turn equality
+into an accidental underestimate.
+
+For `n >= 2` every entry is nonzero, so no row/column reversal can make the
+basis triangular: the public heuristic dispatcher must take its dense phase-1
+route, and the positive bound selects Heuristic1 rather than CondUnknown.
+"""
+function heuristic1_known_condition_lattice(rng, n::Integer)
+    n >= 2 || throw(ArgumentError("Heuristic1 probe needs dimension at least two"))
+    v = BigInt[rand(rng, Bool) ? 1 : -1 for _ in 1:n]
+    basis = Matrix{BigInt}(undef, n, n)
+    for j in 1:n, i in 1:n
+        basis[i, j] = v[i] * v[j] + (i == j ? 1 : 0)
+    end
+
+    log_cond = nextfloat(log2(Float64(n + 1)))
+    return (basis = basis, name = "h1-known-cond", dimension = Int(n),
+            log2_determinant = log2(Float64(n + 1)),
+            planted_norm2 = big(2), log_cond = log_cond)
+end
 
 "Reference kind for one of our reducers.  Legacy `ours` rows are teaching baselines."
 function ours_reference_kind(algorithm::Symbol)
@@ -213,6 +256,18 @@ run_cheap(; verbose::Bool = false, seed::Integer = 1) =
               skip_fplll = true, verbose = verbose, seed = seed)
 
 """
+    run_heuristic1_probe(; kwargs...)
+
+Run the dense known-condition case that deliberately selects Heuristic1.  This
+uses the ordinary large-benchmark reference cache, including fpLLL and
+`ours-heuristic` rows, but is kept separate from the standard large/cheap sets
+until its runtime is known.  Pass `record_baseline = true` after the first run
+looks sensible.
+"""
+run_heuristic1_probe(; kwargs...) =
+    run_large(; cases = HEURISTIC1_CASES, algorithm = :heuristic, kwargs...)
+
+"""
     run_large(; cases, record_baseline = false, force_fplll = false, skip_fplll = false)
 
 Time the large cases, reusing cached reference timings where they exist.
@@ -227,7 +282,7 @@ recorded before the recursive path was warmed).  `find_reference` deliberately
 uses the last matching row, so the refreshed row supersedes the old one without
 editing the TSV by hand.
 """
-function _warm_large_benchmark!(algorithm::Symbol = :heuristic)
+function _warm_large_benchmark!(algorithm::Symbol = :heuristic, warm_h1::Bool = false)
     ours_reference_kind(algorithm)  # validate early
     rng = MersenneTwister(7)
 
@@ -275,6 +330,18 @@ function _warm_large_benchmark!(algorithm::Symbol = :heuristic)
         Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
                              algorithm = :heuristic, telemetry = Flatter.ReductionTelemetry(),
                              want_profile = false)
+
+        if warm_h1
+            # `log_cond` changes the keyword-call specialisation and selects a
+            # wholly different phase-1 implementation, so warm it explicitly
+            # when the requested cases contain the H1 probe.  Dimension 48 is
+            # above the base cutoff and therefore compiles recursive phase 1.
+            h1 = heuristic1_known_condition_lattice(rng, 48)
+            Flatter.reduce_basis(h1.basis; algorithm = :heuristic,
+                                 log_cond = h1.log_cond,
+                                 telemetry = Flatter.ReductionTelemetry(),
+                                 want_profile = false)
+        end
     end
     return nothing
 end
@@ -290,28 +357,51 @@ function run_large(; cases = LARGE_CASES, algorithm::Symbol = :heuristic,
 
     # Compile the base, recursive and dense entry paths before timing anything.
     # In particular, the recursive warm-up must cross DEFAULT_BASE_CUTOFF = 32;
-    # otherwise the first dimension-256 case pays the recursive JIT cost.
-    _warm_large_benchmark!(algorithm)
+    # otherwise the first dimension-256 case pays the recursive JIT cost.  The
+    # H1 probe has an additional `log_cond` keyword specialisation, warmed only
+    # when one of the requested cases actually needs it.
+    warm_h1 = algorithm === :heuristic &&
+              any(case -> case.family == "h1-known-cond", cases)
+    _warm_large_benchmark!(algorithm, warm_h1)
 
-    println("Large cases [", algorithm, "], dimension ~256. Machine: ", machine)
+    println("Large/probe cases [", algorithm, "]. Machine: ", machine)
     println("Cached timings in ", REFERENCE_FILE, "\n")
     @printf("%-18s %5s %11s %11s %9s %11s %s\n",
             "family", "dim", "ours(s)", "fplll(s)", "faster", "baseline(s)", "change")
     println(repeat("-", 84))
 
     for case in cases
-        family = get(families, case.family, nothing)
-        family === nothing && continue
-
-        bundle = family.generate(MersenneTwister(hash((seed, case.family, case.size))),
-                                 case.size)
+        rng = MersenneTwister(hash((seed, case.family, case.size)))
+        bundle = if case.family == "h1-known-cond"
+            heuristic1_known_condition_lattice(rng, case.size)
+        else
+            family = get(families, case.family, nothing)
+            family === nothing && continue
+            family.generate(rng, case.size)
+        end
         tag = basis_tag(bundle.basis)
 
-        # Ours, always: this is the number the run exists to produce.
+        # Ours, always: this is the number the run exists to produce.  Preserve
+        # the old keyword signature for ordinary cases; adding `log_cond = 0`
+        # everywhere would create a new Julia keyword specialisation and revive
+        # the first-run JIT problem this benchmark explicitly avoids.
         GC.gc()
         telemetry = Flatter.ReductionTelemetry()
-        elapsed = @elapsed reduced, _, _ = Flatter.reduce_basis(
-            bundle.basis; algorithm = algorithm, telemetry = telemetry, want_profile = false)
+        if algorithm === :heuristic && hasproperty(bundle, :log_cond)
+            elapsed = @elapsed reduced, _, _ = Flatter.reduce_basis(
+                bundle.basis; algorithm = :heuristic, log_cond = bundle.log_cond,
+                telemetry = telemetry, want_profile = false)
+        else
+            elapsed = @elapsed reduced, _, _ = Flatter.reduce_basis(
+                bundle.basis; algorithm = algorithm, telemetry = telemetry,
+                want_profile = false)
+        end
+        if case.family == "h1-known-cond" && algorithm === :heuristic
+            telemetry.h1_calls > 0 || error(
+                "h1-known-cond probe did not enter Heuristic1")
+            telemetry.cond_calls == 0 || error(
+                "h1-known-cond probe unexpectedly entered CondUnknown")
+        end
         shortest = shortest_norm_log2(reduced)
 
         # fpLLL, only if we have not already paid for it on this machine.
@@ -454,6 +544,12 @@ function print_heuristic3_split(t, total)
     return nothing
 end
 
+function heuristic1_local_time(t)
+    return t.h1_time_qr + t.h1_time_wrapper_qr + t.h1_time_relative +
+           t.h1_time_u2_compose + t.h1_time_top_right + t.h1_time_collect +
+           t.h1_time_compress + t.h1_time_apply
+end
+
 function heuristic2_local_time(t)
     return t.h2_time_qr + t.h2_time_wrapper_qr + t.h2_time_relative +
            t.h2_time_u2_compose + t.h2_time_top_right + t.h2_time_collect +
@@ -506,12 +602,15 @@ function print_large_telemetry(t, total; algorithm::Symbol = :heuristic)
     if algorithm === :heuristic
         print_irregular_entry_split(t, total)
         print_cond_unknown_split(t, total)
+        print_heuristic1_split(t, total)
         print_heuristic2_split(t, total)
         print_heuristic3_split(t, total)
+        h1_local = heuristic1_local_time(t)
         h2_local = heuristic2_local_time(t)
         cond_local = cond_unknown_local_time(t)
-        extra = entry_local + h2_local + cond_local
-        label = cond_local > 0 ? "entry+H2+Cond-local" : "entry+H2-local"
+        extra = entry_local + h1_local + h2_local + cond_local
+        label = h1_local > 0 ? "entry+H1+H2-local" :
+                cond_local > 0 ? "entry+H2+Cond-local" : "entry+H2-local"
         print_fused_split(t, total; extra_accounted = extra, extra_label = label)
         if t.time_recursion > 0
             @printf("        recursive-call wall %.2fs (overlapping parent views; diagnostic only)\n",
@@ -522,6 +621,21 @@ function print_large_telemetry(t, total; algorithm::Symbol = :heuristic)
         print_fused_split(t, total; extra_accounted = entry_local,
                           extra_label = "entry-local")
     end
+    return nothing
+end
+
+function print_heuristic1_split(t, total)
+    t.h1_calls > 0 || return nothing
+    h1_total = heuristic1_local_time(t)
+    @printf("        H1 %d calls, %d/%d/%d L/R/all, %d H3 handoffs, %.2fs measured (%.1f%% wall)\n",
+            t.h1_calls, t.h1_left_steps, t.h1_right_steps, t.h1_all_steps,
+            t.h1_phase3_calls, h1_total, 100 * h1_total / total)
+    @printf("           repQR %.2f  relQR %.2f  relative-B2 %.2f  U2mul %.2f\n",
+            t.h1_time_qr, t.h1_time_wrapper_qr, t.h1_time_relative,
+            t.h1_time_u2_compose)
+    @printf("           topR %.2f  collectU %.2f  compress %.2f  exact-apply %.2f\n",
+            t.h1_time_top_right, t.h1_time_collect,
+            t.h1_time_compress, t.h1_time_apply)
     return nothing
 end
 

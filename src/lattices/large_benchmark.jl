@@ -231,30 +231,50 @@ function _warm_large_benchmark!(algorithm::Symbol = :heuristic)
     ours_reference_kind(algorithm)  # validate early
     rng = MersenneTwister(7)
 
+    # IMPORTANT: keep the keyword signature of these calls identical to the
+    # timed call in `run_large`. Julia specialises keyword-call wrappers on the
+    # keyword NamedTuple type; omitting `telemetry` here leaves the telemetry-
+    # enabled `reduce_basis` path to compile inside the first measured run.
+
     if algorithm === :teaching
         # Exercise the base triangular entry path.
         Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 24).basis;
-                             algorithm = :teaching, want_profile = false)
+                             algorithm = :teaching, telemetry = Flatter.ReductionTelemetry(),
+                             want_profile = false)
 
-        # Dimension 48 is above the default base cutoff of 32.  This is essential:
-        # warming only dimension 24 leaves recursion, the fused update, compression,
-        # transform folding and finalisation cold.
-        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
-                             algorithm = :teaching, want_profile = false)
+        # Cross both the recursive cutoff (32) and the blocked triangular
+        # size-reduction cutoff (64).  Warming at dimension 48 leaves the
+        # blocked kernel cold, so the first dimension-256 triangular timing
+        # otherwise pays several seconds of JIT compilation.
+        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 80).basis;
+                             algorithm = :teaching, telemetry = Flatter.ReductionTelemetry(),
+                             want_profile = false)
 
         # The teaching dense/irregular entry path compiles independently.
         Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
-                             algorithm = :teaching, want_profile = false)
+                             algorithm = :teaching, telemetry = Flatter.ReductionTelemetry(),
+                             want_profile = false)
     else
-        # H2/H3 on a problem above the recursive cutoff.  Random triangular may
-        # legitimately stop at H2 entry, so also warm the CondUnknown path below.
-        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 48).basis;
-                             algorithm = :heuristic, want_profile = false)
+        # An easy triangular basis can satisfy H2's goal at entry and therefore
+        # fail to compile the left/right/all cycle.  Knapsack reliably exercises
+        # reorientation, recursive H2, LatRedRelSR and the H2 -> H3 handoff.
+        Flatter.reduce_basis(Flatter.knapsack_lattice(rng, 48).basis;
+                             algorithm = :heuristic, telemetry = Flatter.ReductionTelemetry(),
+                             want_profile = false)
 
-        # Dense input forces Phase 1 / CondUnknown and then the H2/H3 machinery.
-        # Use dimension 48 so the recursive phase-2 path is compiled as well.
-        Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 48).basis;
-                             algorithm = :heuristic, want_profile = false)
+        # Also compile the already-upper-triangular entry branch.  Dimension 80
+        # is deliberately above the blocked triangular size-reduction cutoff of
+        # 64; dimension 48 only warms the elementary :zz kernel.
+        Flatter.reduce_basis(Flatter.random_triangular_lattice(rng, 80).basis;
+                             algorithm = :heuristic, telemetry = Flatter.ReductionTelemetry(),
+                             want_profile = false)
+
+        # Phase 1 / CondUnknown compiles independently.  The knapsack probe above
+        # has already warmed recursive phase 2, so a small dense case is enough
+        # here to compile selection, surrogate reduction and the H2 handoff.
+        Flatter.reduce_basis(Flatter.scrambled_lattice(rng, 16).basis;
+                             algorithm = :heuristic, telemetry = Flatter.ReductionTelemetry(),
+                             want_profile = false)
     end
     return nothing
 end

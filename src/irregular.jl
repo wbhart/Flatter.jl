@@ -317,7 +317,7 @@ already.
   * `:triangular`  — the basis was already upper triangular;
   * `:reoriented`  — it was triangular in another corner orientation and was
                      flipped into place;
-  * `:dense`       — neither, so the QR-and-round route was used;
+  * `:dense`       — neither, so the dense phase-1 route was used;
 
 together with `rounds` (dense path only) and the fields
 [`lattice_reduce!`](@ref) returns.
@@ -327,8 +327,12 @@ Keyword arguments beyond those of [`lattice_reduce!`](@ref):
   * `algorithm`  -- `:heuristic` (the default, flatter's heuristic phase
                     dispatcher) or `:teaching` (the older independent reducer).  Triangular/reoriented input
                     enters Heuristic2 after exact size reduction; dense input
-                    enters CondUnknown and is then handed to Heuristic2 as its
-                    rank/condition information becomes available.
+                    enters CondUnknown when no condition bound is supplied, or
+                    Heuristic1 when `log_cond > 0`.
+  * `log_cond`   -- a positive estimate of `log2(cond(R))` for dense full-rank
+                    input. With `algorithm = :heuristic`, a positive value
+                    selects Heuristic1, exactly as flatter's phase-1 dispatcher
+                    does; zero (the default) selects CondUnknown.
   * `max_rounds` -- iterations of the `:teaching` dense path. Each round
                     re-factorises an already improved basis, so its integer
                     approximation is a better one; the loop stops early when a
@@ -337,12 +341,14 @@ Keyword arguments beyond those of [`lattice_reduce!`](@ref):
 
 # Rank
 
-The teaching dense path requires full column rank.  The heuristic dense path
-uses CondUnknown and supports rank-deficient input, moving exact zero
-dependencies to the right of the returned basis.
+The teaching dense path requires full column rank. With the heuristic dense
+path, `log_cond = 0` uses CondUnknown and supports rank-deficient input, moving
+exact zero dependencies to the right. A positive `log_cond` selects Heuristic1,
+for which flatter assumes the basis is full column rank.
 """
 function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                        algorithm::Symbol = :heuristic,
+                       log_cond::Real = 0,
                        max_rounds::Integer = DEFAULT_DENSE_ROUNDS,
                        aggressive::Bool = false,
                        telemetry::Union{Nothing, ReductionTelemetry} = nothing,
@@ -352,6 +358,8 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
     m, n = size(B)
     algorithm in (:teaching, :heuristic) || throw(ArgumentError(
         "unknown reduction algorithm $algorithm; expected :teaching or :heuristic"))
+    isfinite(log_cond) && log_cond >= 0 || throw(ArgumentError(
+        "log_cond must be finite and nonnegative"))
     m >= n || throw(DimensionMismatch(
         "expected at least as many rows as columns, got $m x $n"))
     size(U) == (n, n) || throw(DimensionMismatch("U must be $n x $n, got $(size(U))"))
@@ -453,8 +461,14 @@ function reduce_basis!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
 
     telemetry === nothing || (telemetry.irregular_dense_calls += 1)
     if algorithm === :heuristic
-        _, _, info = cond_unknown_reduce!(B, U; aggressive = aggressive,
-                                          telemetry = telemetry, kwargs...)
+        if log_cond > 0
+            _, _, info = heuristic1_reduce!(B, U; log_cond = log_cond,
+                                            aggressive = aggressive,
+                                            telemetry = telemetry, kwargs...)
+        else
+            _, _, info = cond_unknown_reduce!(B, U; aggressive = aggressive,
+                                              telemetry = telemetry, kwargs...)
+        end
         return B, U, (; path = :dense, rounds = 0, info...)
     end
 

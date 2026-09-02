@@ -280,6 +280,24 @@ Base.@kwdef mutable struct ReductionTelemetry
     h3_time_sr_writeback::Float64 = 0.0
     h3_time_sr_propagate::Float64 = 0.0
 
+    # Heuristic1 known-condition phase-1 counters.  H1 walks the same
+    # left/right/all schedule as H2, but keeps a rectangular representation and
+    # carries B2 through the left/all children.
+    h1_calls::Int = 0
+    h1_left_steps::Int = 0
+    h1_right_steps::Int = 0
+    h1_all_steps::Int = 0
+    h1_phase3_calls::Int = 0
+    h1_relative_calls::Int = 0
+    h1_time_qr::Float64 = 0.0
+    h1_time_wrapper_qr::Float64 = 0.0
+    h1_time_relative::Float64 = 0.0
+    h1_time_u2_compose::Float64 = 0.0
+    h1_time_top_right::Float64 = 0.0
+    h1_time_collect::Float64 = 0.0
+    h1_time_compress::Float64 = 0.0
+    h1_time_apply::Float64 = 0.0
+
     # Heuristic2 phase/schedule counters.  H2 is a fixed left/right/all cycle;
     # the all step hands the full window to Heuristic3.
     h2_calls::Int = 0
@@ -399,6 +417,21 @@ function Base.show(io::IO, t::ReductionTelemetry)
         println(io, "    phase-2 child wall     : ", round(t.cond_time_h2; digits = 3), " s (overlaps H2)")
         println(io, "    exact transform apply  : ", round(t.cond_time_apply; digits = 3), " s")
         println(io, "    exact norm sorting     : ", round(t.cond_time_sort; digits = 3), " s")
+    end
+    if t.h1_calls > 0
+        println(io, "  Heuristic1 calls         : ", t.h1_calls)
+        println(io, "    phase-1 steps          : left ", t.h1_left_steps,
+                    ", right ", t.h1_right_steps, ", all ", t.h1_all_steps)
+        println(io, "    phase-3 handoffs       : ", t.h1_phase3_calls)
+        println(io, "    relative-B2 reductions : ", t.h1_relative_calls)
+        println(io, "    representation QR      : ", round(t.h1_time_qr; digits = 3), " s")
+        println(io, "    LatRedRelSR QR         : ", round(t.h1_time_wrapper_qr; digits = 3), " s")
+        println(io, "    relative size reduction: ", round(t.h1_time_relative; digits = 3), " s")
+        println(io, "    U2 composition         : ", round(t.h1_time_u2_compose; digits = 3), " s")
+        println(io, "    top-right product      : ", round(t.h1_time_top_right; digits = 3), " s")
+        println(io, "    structured collect_U   : ", round(t.h1_time_collect; digits = 3), " s")
+        println(io, "    scalar compression     : ", round(t.h1_time_compress; digits = 3), " s")
+        println(io, "    final exact apply      : ", round(t.h1_time_apply; digits = 3), " s")
     end
     if t.h2_calls > 0
         println(io, "  Heuristic2 calls         : ", t.h2_calls)

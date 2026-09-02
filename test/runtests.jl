@@ -15,5 +15,6 @@ using Flatter
     include("test_irregular.jl")
     include("test_heuristic3.jl")
     include("test_heuristic2.jl")
+    include("test_heuristic1.jl")
     include("test_cond_unknown.jl")
 end

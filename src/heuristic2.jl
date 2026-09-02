@@ -551,8 +551,10 @@ The phase-2 schedule is left, right, whole. Partial children remain phase 2; the
 whole-window child is handed to the already-ported phase-3 Heuristic3. Small
 children use the same fplll base case as [`lattice_reduce!`](@ref).
 
-This is intentionally an explicit entry point for now. Once `CondUnknown` and
-Heuristic1 are ported, the public dispatcher can select phase 2 automatically.
+This remains an explicit phase-2 entry point as well as the implementation used
+by the public dispatcher. With CondUnknown and Heuristic1 now ported, the public
+heuristic route reaches phase 2 through the same triangular, known-condition and
+unknown-condition entry routes as flatter.
 """
 function heuristic2_reduce!(B::AbstractMatrix{T}, U::AbstractMatrix{T};
                             goal::Union{Nothing, ReductionGoal} = nothing,

@@ -573,9 +573,10 @@ const HEURISTIC_STANDARD_FAMILIES = Tuple(f.name for f in Flatter.lattice_famili
 
 Run the ordinary benchmark harness through the ported heuristic dispatcher.
 Triangular/reorientable families enter Phase 2 directly; genuinely dense and
-rectangular families enter CondUnknown first.  Heuristic1 is still absent, but
-that is not on the default unknown-condition route exercised by these generated
-inputs.
+rectangular families enter CondUnknown first when no condition bound is supplied.
+Heuristic1 is available through the public `log_cond` keyword; these generated
+inputs do not supply such a bound, so the default benchmark continues to exercise
+the unknown-condition route.
 """
 function run_heuristic_standard(; sizes = nothing, seed::Integer = 1, kwargs...)
     warm_up(; algorithm = :heuristic)

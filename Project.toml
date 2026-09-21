@@ -4,18 +4,19 @@ version = "0.1.0"
 authors = ["William Hart <goodwillhart@googlemail.com>"]
 
 [deps]
-ArbNumerics = "7e558dbc-694d-5a72-987c-6f4ebed21442"
 FPLLL = "03c0f9b8-8f98-4d15-83bb-8707f2d8d9c2"
+FPLLL_jll = "a3a2a55f-686a-5b05-901e-e415bf757ff5"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
-FPLLL = {url = "https://github.com/wbhart/FPLLL.jl.git"}
+FPLLL = {rev = "main", url = "https://github.com/wbhart/FPLLL.jl.git"}
 
 [compat]
-ArbNumerics = "1.6.3"
+FPLLL = "0.2.0"
+FPLLL_jll = "5.5.0"
 LinearAlgebra = "1.12.0"
 Printf = "1.11.0"
 Random = "1.11.0"

@@ -13,6 +13,7 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
 FPLLL = {rev = "main", url = "https://github.com/wbhart/FPLLL.jl.git"}
+FPLLL_jll = {rev = "main", url = "https://github.com/wbhart/FPLLL_jll.jl.git"}
 
 [compat]
 FPLLL = "0.2.0"
